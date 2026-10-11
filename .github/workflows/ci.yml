@@ -752,6 +752,7 @@ jobs:
             system_remote::remote_read_preserves_projection_order_in_json_and_csv \
             system_remote::remote_branch_create_list_merge_flow \
             system_remote::remote_merge_delivery_loss_never_replays_committed_effect \
+            system_remote::remote_blob_write_delivery_loss_never_replays_committed_effect \
             system_remote::remote_merge_statement_delivery_loss_never_replays_committed_effect \
             system_remote::remote_deployment_delivery_loss_preserves_owned_completion \
             system_remote::remote_branch_delete_removes_branch \

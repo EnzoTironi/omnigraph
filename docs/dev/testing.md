@@ -118,7 +118,7 @@ Blob coverage is deliberately split:
 - engine `integration/maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `integration/maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `integration/maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `integration/data_routes.rs`, `integration/auth_policy.rs`, and `integration/openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
-- CLI `integration/cli_data.rs` owns `blob get/stat`; `integration/parity_matrix.rs` compares embedded and remote results.
+- CLI `integration/cli_data.rs` owns `blob get/stat/put/clear`; `integration/parity_matrix.rs` compares embedded and remote results; `integration/system_remote.rs` owns a put's or clear's lost delivery through the fault proxy.
 
 Do not exercise a server promise solely through the engine facade. The complete contract is summarized in [blob.md](blob.md).
 
