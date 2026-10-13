@@ -18,7 +18,7 @@ use crate::logical::{
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
-use crate::source::SideId;
+use crate::source::{FullTextCoverage, SideId};
 use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -35,6 +35,12 @@ pub enum RankKind {
 }
 
 impl RankKind {
+    /// Whether the retrieval's contract is approximate: `nearest` membership
+    /// is, even when a run scores flat; `bm25` matching is exact.
+    pub fn approximate(self) -> bool {
+        self == Self::Nearest
+    }
+
     /// The column Lance appends and the direction the query sorts it by.
     pub fn score(self) -> (&'static str, bool) {
         match self {
@@ -126,6 +132,18 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
+    /// The full-text coverage of every property a ranked scan's eligibility
+    /// placement read, keyed `<table key>.<property>`. A pinned dataset
+    /// version fixes it, so the dataset pins re-establish it on replay.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub full_text: BTreeMap<String, FullTextCoverage>,
+}
+
+impl Assumptions {
+    /// The key a property's full-text coverage is recorded under.
+    pub fn full_text_key(type_key: &str, property: &str) -> String {
+        format!("{type_key}.{property}")
+    }
 }
 
 impl Assumptions {
@@ -176,12 +194,59 @@ pub struct Hop {
 /// ids of `ranked_type` that have every hop in `hops` and ANDs them into the
 /// scans `feeds` names as `id IN (...)`, when the gate policy admits the set.
 /// Empty `hops` admits nothing: the run records the shape fallback and the
-/// scans run as planned.
+/// scans run as planned. Every hop is a required first hop of the query, so
+/// the eligible set holds every row that can survive the traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
+    /// What an empty eligible set decides: the empty answer for a
+    /// standalone `nearest`, the unfiltered plan for a fusion.
+    pub on_empty: EmptyEligible,
+    /// Whether the recorded full-text coverage of every `bm25` scan in
+    /// `feeds` is full, the guard under which prefiltering keeps BM25
+    /// scores; true when it feeds no `bm25` scan.
+    pub coverage_admits: bool,
+}
+
+/// What a pre-pass's empty eligible set decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmptyEligible {
+    /// No row survives the traversal: the answer is empty and no scan runs.
+    ProvenEmpty,
+    /// The scans run unfiltered.
+    Postfilter,
+}
+
+/// The adaptive policy of a `nearest` scan, declared before it runs: what
+/// the scan may do after an attempt leaves it short of `fetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearestPolicy {
+    /// A short scan under a probe cap rescans under the cap times this,
+    /// and uncapped once that reaches the ranked partitions.
+    pub probe_factor: usize,
+    /// Rows the prefilter admitted at `_distance = +inf` (the partition
+    /// search did not reach them) are rescanned flat and exact.
+    pub flat_rescan_on_unreached: bool,
+    /// A short capped scan without Lance's partition counters rescans
+    /// uncapped (fail closed).
+    pub uncapped_on_missing_counters: bool,
+    /// A scan whose eligible set is no larger than `fetch` scores flat from
+    /// its first attempt.
+    pub flat_when_eligible_within_fetch: bool,
+}
+
+impl NearestPolicy {
+    /// The policy the planner declares: probe caps grow fourfold (20 → 80 →
+    /// 320 → none), and every fallback is on.
+    pub const DEFAULT: Self = Self {
+        probe_factor: 4,
+        flat_rescan_on_unreached: true,
+        uncapped_on_missing_counters: true,
+        flat_when_eligible_within_fetch: true,
+    };
 }
 
 impl Prefilter {
@@ -189,6 +254,19 @@ impl Prefilter {
     pub fn admits(&self) -> bool {
         !self.hops.is_empty() && !self.feeds.is_empty()
     }
+}
+
+/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
+/// eligible set and the members of its search predicates): before the index
+/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
+/// score is independent of a filter applied before scoring only when the
+/// property's full-text index covers every fragment; elsewhere eligibility
+/// applies after scoring, so the filter never changes a score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eligibility {
+    BeforeScoring,
+    AfterScoring,
 }
 
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
@@ -250,6 +328,12 @@ pub struct RankedAccess {
     /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
     /// `RankFuse` declares.
     pub prefilter: Option<Prefilter>,
+    /// Where the scan applies its eligibility: always before scoring on a
+    /// `nearest` scan, whose candidate window is drawn from eligible rows;
+    /// on a `bm25` scan before scoring only under recorded full coverage.
+    pub eligibility: Eligibility,
+    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    pub policy: Option<NearestPolicy>,
 }
 
 impl RankedAccess {
@@ -272,8 +356,12 @@ impl RankedAccess {
             "fetch": self.fetch,
             "scope": self.scope,
         });
-        if self.kind == RankKind::Nearest {
-            value["nprobes"] = json!(self.nprobes);
+        match self.kind {
+            RankKind::Nearest => {
+                value["nprobes"] = json!(self.nprobes);
+                value["policy"] = json!(self.policy);
+            }
+            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value
     }
@@ -353,13 +441,65 @@ pub struct StatisticSource {
     pub origin: String,
 }
 
+/// One key of the order a node's output leaves in, typed: the comparator a
+/// sort establishes, the score order a ranking scan produces, or the logical
+/// id order of a diff or merge plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderKey {
+    /// A diff or merge plan's logical column, ascending.
+    Column(String),
+    /// An expression with its direction and null placement.
+    Expr {
+        expr: IRExpr,
+        descending: bool,
+        nulls_first: bool,
+    },
+    /// A binding's identity metadata key (`@id`, or `@type` of a selected
+    /// edge): ascending, nulls first.
+    Identity(ColumnRef),
+    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
+    /// descending.
+    Fused { bindings: Vec<String> },
+}
+
+impl OrderKey {
+    /// A written or score sort key: ascending keys place nulls first,
+    /// descending keys nulls last (RFC 0047, "One total order").
+    pub fn of(ordering: &IROrdering) -> Self {
+        Self::Expr {
+            expr: ordering.expr.clone(),
+            descending: ordering.descending,
+            nulls_first: !ordering.descending,
+        }
+    }
+}
+
+impl std::fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(column) => f.write_str(column),
+            Self::Expr {
+                expr, descending, ..
+            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
+            Self::Identity(column) => write!(f, "${column} asc"),
+            Self::Fused { bindings } => {
+                let targets: Vec<String> = bindings
+                    .iter()
+                    .map(|binding| format!("${binding}"))
+                    .collect();
+                write!(f, "rrf({}) desc", targets.join(", "))
+            }
+        }
+    }
+}
+
 /// The properties a physical node declares: derived after selection,
 /// recomputed when a later pass changes the node, never recomputed by an
 /// executor. Each is a bound the executor adapts within, never above.
 #[derive(Debug, Clone)]
 pub struct Properties {
     pub schema: SchemaRef,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKey>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -370,8 +510,12 @@ impl Properties {
     /// Result nodes declare their typed columns separately. Pipeline schemas
     /// remain conservative input schemas and are omitted for query plans.
     fn to_json(&self, query: bool) -> Value {
+        let ordering: Option<Vec<String>> = self
+            .ordering
+            .as_ref()
+            .map(|keys| keys.iter().map(ToString::to_string).collect());
         let mut value = json!({
-            "ordering": self.ordering,
+            "ordering": ordering,
             "rows": self.rows,
             "work_bytes": self.work_bytes,
             "retained_limit": self.retained_limit,
@@ -577,6 +721,38 @@ pub enum PhysicalNode {
 }
 
 impl PhysicalNode {
+    /// The most rows this node keeps of its input whatever any predicate
+    /// holds: its count cut. Every variant is listed, so a new node kind
+    /// cannot compile without a classification here; a field that gives an
+    /// existing kind a cut still needs its arm changed by hand. Plan
+    /// acceptance justifies every declared cut against the query.
+    pub fn row_cut(&self) -> Option<usize> {
+        match self {
+            Self::Limit { rows, .. } | Self::Page { rows, .. } => Some(*rows),
+            Self::Sort { fetch, .. } => *fetch,
+            Self::Scan { ranked, .. } => ranked.as_ref().and_then(|ranked| ranked.fetch),
+            // A fusion emits every arm row; its `limit` sizes only the
+            // nearest arm's window, which that arm's scan declares as its
+            // fetch.
+            Self::RankFuse { .. }
+            | Self::MetadataCount { .. }
+            | Self::SortMergeJoin { .. }
+            | Self::HashJoin { .. }
+            | Self::HydrateByAddress { .. }
+            | Self::HydrateColumns { .. }
+            | Self::RowCompare { .. }
+            | Self::ClassifyThreeWay { .. }
+            | Self::CrossJoin { .. }
+            | Self::ContainsJoin { .. }
+            | Self::Filter { .. }
+            | Self::Expand { .. }
+            | Self::AntiJoin { .. }
+            | Self::OuterReference { .. }
+            | Self::Projection { .. }
+            | Self::Aggregate { .. } => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Scan { .. } => "Scan",
