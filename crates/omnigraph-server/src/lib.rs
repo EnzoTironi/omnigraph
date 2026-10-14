@@ -2306,6 +2306,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
+            io_scope: None,
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
@@ -2954,11 +2955,30 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        warn!(
-            root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
-            lock_id = %owner.lock_id(),
-            "v2 cluster admission retained after shutdown; establish prior graph/control I/O quiescence before exact-ID force-unlock"
-        );
+        if owner.canonical_root().starts_with("az://") {
+            // Azure keeps its existing stopped-process boundary until its
+            // native clean-release path has independent qualification.
+            warn!("Azure cluster admission retained after logical shutdown");
+            return Ok(());
+        }
+        let scope = owner.io_scope().ok_or_else(|| {
+            eyre!("cluster storage lifetime is untracked; retaining its admission")
+        })?;
+        scope.close();
+        scope.wait_idle().await;
+        if scope.is_uncertain() {
+            return Err(eyre!(
+                "storage completion uncertain; retaining cluster admission"
+            ));
+        }
+        // Axum's connection completion notification can precede destruction
+        // of its Hyper service and AppState. Drain those actual owners too;
+        // the original process watchdog still bounds this wait.
+        owner.wait_for_exclusive_owner().await;
+        owner
+            .release_after_settlement()
+            .await
+            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
 }
@@ -3141,7 +3161,10 @@ async fn prepare_multi_graph_state(
         );
         let uri = cfg.uri.clone();
         match prepare_single_graph(cfg, expected) {
-            Ok(graph) => {
+            Ok(mut graph) => {
+                graph.io_scope = admission
+                    .as_ref()
+                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -3280,6 +3303,7 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    io_scope: Option<omnigraph::storage::StorageIoScope>,
 }
 
 #[cfg(test)]
@@ -3358,6 +3382,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
+        io_scope: None,
     })
 }
 
@@ -3368,6 +3393,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
+        io_scope,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3377,7 +3403,11 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let db = Omnigraph::open(&uri).await.map_err(|err| {
+    let opened = match io_scope {
+        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
+        None => Omnigraph::open(&uri).await,
+    };
+    let db = opened.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
             eyre!(
