@@ -6,12 +6,12 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crate::branch_merge::BranchMergePlan;
+use crate::legacy::case::{ValidatedCase, validate_case};
 use crate::runner::{MeasurementSignals, RunnerError, RunnerResult, execute_rep_signaled};
 use crate::worker_protocol::{
     ChildFrameV1, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerRequestV1, WorkerStageV1,
     digest_worker_executable, read_frame, validate_protocol_version, write_frame,
 };
-use crate::{ValidatedCase, validate_case};
 
 /// Run exactly one repetition over the private stdin/stdout worker protocol.
 ///
@@ -474,13 +474,13 @@ mod tests {
 
     #[test]
     fn worker_refuses_identity_mismatch_before_opening_a_store() {
-        let case: crate::CaseV1 = serde_yaml::from_str(
+        let case: crate::legacy::case::CaseV1 = yaml_serde::from_str(
             r#"
 version: 1
 id: worker-identity-test
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 3, seed: 0 }
   data: { provenance: synthetic, tables: 2, rows_per_table: 12, payload_bytes: 8, column_shape: scalars, topology_skew: uniform }
   state: { aging: bulk-loaded, indexes: [], deletion_history: none, compaction_recency: not-optimized, history_depth: 6 }
 workload: { delta_rows_per_side: 6, diverged_tables: 1, arrival: unscheduled-single-shot, clients: 1, read_write_mix: write-heavy, contention: distinct-key }

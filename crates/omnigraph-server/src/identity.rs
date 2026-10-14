@@ -1,7 +1,7 @@
 //! Server-resolved identities for static credentials and RFC 0053 offline
 //! signed data credentials. Both use the cluster registry (`tenant_id: None`).
-//! Signed identities retain exact graph/action grants; the selected graph
-//! narrows those grants before the existing Cedar policy gate.
+//! Signed identities carry no permission grants; current Cedar policy
+//! authorizes each operation.
 
 use std::fmt;
 use std::sync::Arc;
@@ -137,14 +137,15 @@ impl fmt::Display for GraphKey {
 }
 
 /// Authorization shape. Static credentials use Cedar without an additional
-/// grant ceiling; signed data credentials retain their exact grants.
+/// grant ceiling; signed credentials authenticate identity for applied policy
+/// evaluation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Scope {
     /// Static credential authority, subject to Cedar policy.
     Full,
-    /// Exact graph/action ceilings are retained in the authenticated claims.
-    DataToken,
+    /// Cluster-bound identity; graph permissions come only from applied policy.
+    IdentityToken,
 }
 
 /// How the server authenticated the actor.
@@ -157,25 +158,16 @@ pub enum AuthSource {
     SignedData,
 }
 
-/// Server-resolved actor identity. Replaces the previous
-/// `AuthenticatedActor(Arc<str>)` from `lib.rs`.
-///
-/// The fields are populated by `authenticate_bearer_token` after a successful
-/// static hash match or signed credential verification.
-/// **Clients cannot set any of these fields directly**
-/// — this is the MR-731 invariant. See `authorize_request` in `lib.rs` for the
-/// chokepoint that overwrites any client-supplied actor identity.
-///
-/// The static constructor uses `Scope::Full`; the data-token verifier attaches
-/// validated claims and uses `Scope::DataToken`.
+/// Public identity projection for embedders. Its legacy fields remain
+/// constructible; this record alone is never authenticated request authority.
+/// The server uses [`AuthenticatedActor`] internally, populated only after a
+/// static credential match or signed credential verification.
 #[derive(Debug, Clone)]
 pub struct ResolvedActor {
     pub actor_id: Arc<str>,
     pub tenant_id: Option<TenantId>,
     pub scopes: Vec<Scope>,
     pub source: AuthSource,
-    pub(crate) data_token: Option<Arc<crate::data_tokens::DataTokenClaims>>,
-    pub(crate) selected_graph: Option<GraphId>,
 }
 
 impl ResolvedActor {
@@ -187,8 +179,6 @@ impl ResolvedActor {
             tenant_id: None,
             scopes: vec![Scope::Full],
             source: AuthSource::Static,
-            data_token: None,
-            selected_graph: None,
         }
     }
 
@@ -197,52 +187,84 @@ impl ResolvedActor {
     pub fn actor_id_str(&self) -> &str {
         &self.actor_id
     }
+}
 
-    /// Authenticated signed claims, excluding the original bearer plaintext.
-    pub fn data_claims(&self) -> Option<&crate::data_tokens::DataTokenClaims> {
-        self.data_token.as_deref()
+/// Verified request identity and its immutable signed credential profile.
+///
+/// Public identity fields are exposed only through a shared projection. There
+/// is no public constructor or mutable projection: a caller-created
+/// [`ResolvedActor`] cannot manufacture or widen request authority.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedActor {
+    actor: ResolvedActor,
+    data_token: Option<VerifiedDataToken>,
+}
+
+#[derive(Debug, Clone)]
+enum VerifiedDataToken {
+    Identity(Arc<crate::data_tokens::IdentityTokenClaims>),
+    Oidc,
+}
+
+impl std::ops::Deref for AuthenticatedActor {
+    type Target = ResolvedActor;
+
+    fn deref(&self) -> &Self::Target {
+        self.actor()
+    }
+}
+
+impl AuthenticatedActor {
+    pub(crate) fn oidc_identity(claims: crate::oidc_identity::VerifiedIdentity) -> Self {
+        Self {
+            actor: ResolvedActor {
+                actor_id: Arc::from(format!("principal:{}", claims.principal_id)),
+                tenant_id: None,
+                scopes: vec![Scope::IdentityToken],
+                source: AuthSource::SignedData,
+            },
+            data_token: Some(VerifiedDataToken::Oidc),
+        }
     }
 
-    pub(crate) fn select_graph(&mut self, graph_id: &GraphId) -> bool {
-        if self.source == AuthSource::Static {
-            return true;
+    /// An admitted identity profile carries no graph-action ceiling. Applied
+    /// policy still authorizes each graph operation independently.
+    pub(crate) fn is_identity(&self) -> bool {
+        matches!(
+            self.data_token,
+            Some(VerifiedDataToken::Identity(_) | VerifiedDataToken::Oidc)
+        )
+    }
+    pub(crate) fn cluster_static(actor_id: Arc<str>) -> Self {
+        Self {
+            actor: ResolvedActor::cluster_static(actor_id),
+            data_token: None,
         }
-        if self.data_token.as_ref().is_some_and(|claims| {
-            claims
-                .grants
-                .iter()
-                .any(|grant| grant.graph_id == *graph_id)
-        }) {
-            self.selected_graph = Some(graph_id.clone());
-            return true;
-        }
-        false
     }
 
-    pub(crate) fn permits_action(&self, action: omnigraph_policy::PolicyAction) -> bool {
-        if self.source == AuthSource::Static {
-            return true;
+    pub(crate) fn signed_identity(claims: crate::data_tokens::IdentityTokenClaims) -> Self {
+        Self {
+            actor: ResolvedActor {
+                actor_id: Arc::from(format!("principal:{}", claims.sub)),
+                tenant_id: None,
+                scopes: vec![Scope::IdentityToken],
+                source: AuthSource::SignedData,
+            },
+            data_token: Some(VerifiedDataToken::Identity(Arc::new(claims))),
         }
-        self.data_token.as_ref().is_some_and(|claims| {
-            claims.grants.iter().any(|grant| {
-                (self.selected_graph.as_ref() == Some(&grant.graph_id)
-                    || (self.selected_graph.is_none()
-                        && action == omnigraph_policy::PolicyAction::GraphList))
-                    && grant.actions.contains(&action)
-            })
-        })
     }
 
-    pub(crate) fn permits_graph_listing(&self, graph_id: &str) -> bool {
-        self.source == AuthSource::Static
-            || self.data_token.as_ref().is_some_and(|claims| {
-                claims.grants.iter().any(|grant| {
-                    grant.graph_id.as_str() == graph_id
-                        && grant
-                            .actions
-                            .contains(&omnigraph_policy::PolicyAction::GraphList)
-                })
-            })
+    /// Identity metadata, without mutable access to the authenticated state.
+    pub fn actor(&self) -> &ResolvedActor {
+        &self.actor
+    }
+
+    /// Authenticated version 2 identity metadata, never graph permission grants.
+    pub fn identity_claims(&self) -> Option<&crate::data_tokens::IdentityTokenClaims> {
+        match &self.data_token {
+            Some(VerifiedDataToken::Identity(claims)) => Some(claims),
+            _ => None,
+        }
     }
 }
 

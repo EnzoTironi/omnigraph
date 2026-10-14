@@ -1,7 +1,6 @@
 # CLI reference
 
-This page is a map of the `omnigraph` command surface. The installed binary is
-the exact reference:
+This page maps the CLI; the installed binary is the exact reference:
 
 ```bash
 omnigraph --help
@@ -17,7 +16,7 @@ Most graph commands accept one of these scopes:
 |---|---|
 | positional URI | Direct access for commands whose positional slot is not used by another value |
 | `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph |
-| `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server |
+| `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
 | `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
 | `--profile <NAME>` | A named scope from operator config |
 
@@ -33,106 +32,86 @@ Common global flags:
 | `--yes` | Non-interactive consent for destructive writes to non-local storage |
 | `--quiet` | Suppress the resolved write target printed to stderr |
 
-Served writes ignore `--as`: the server derives the actor from the bearer
-token.
+A served write refuses `--as` ("`--as` is not allowed on a served write"): the
+server resolves the actor from the bearer token. Drop it, or use `--store <uri>`.
 
 ## Commands
 
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query | direct or served |
-| `mutate` | Run an insert/update/delete query | direct or served |
+| `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
-| `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
-| `branch create/list/delete/merge` | Manage graph branches | direct or served |
-| `snapshot` | Show a branch snapshot | direct or served |
-| `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
+| `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
+| `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
+| `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
-| `schema show` | Read customer source and discover accepted system types | direct or served |
+| `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
+| `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
+| `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
-| `repair` | Preview or publish classified storage drift | direct |
-| `cleanup` | Delete old versions under an explicit retention policy | direct |
-| `graphs list` | List graphs on a server | served |
+| `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
+| `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
+| `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
+| `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
+| `cluster <command> --managed` | Operate a managed service cluster | managed API and folder context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
 | `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
-| `version` | Print build and storage-format information | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` prints `version`, `http_contract` and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
-The [CLI guide](index.md) gives end-to-end examples. Maintenance safety is
-covered in [Maintenance](../operations/maintenance.md).
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
 see the [rebuild procedure](../operations/maintenance.md#rebuild-full-text-indexes).
 
-## Schema and actor provenance
-
-`init`, `schema plan`, and `schema apply` accept
-`--actor-provenance true|false`. New graphs default to `true`; plan and apply
-preserve an existing graph's accepted setting when the flag is omitted.
-Changing only the flag still produces a schema migration:
-
-```bash
-omnigraph init graph.omni --schema graph.pg --actor-provenance false
-omnigraph schema plan graph.omni --schema graph.pg --actor-provenance true
-omnigraph schema apply graph.omni --schema graph.pg --actor-provenance true
-omnigraph schema show graph.omni --json
-```
-
-Disabling retains an established `OmniActor` type, rows, and history. See
-[Actor provenance](../schema/index.md) for identity and write rules.
-
-`schema show --json` and `GET /schema` return unchanged customer `.pg` text
-in `schema_source`, and accepted structured types and binding in
-`accepted_schema` (absent on older servers). Write only `schema_source` back
-to desired `.pg` files. Human output labels source and system types separately.
-
-Use `lint --store graph.omni --query actors.gq` for accepted types;
-`lint --schema current.pg` validates only customer source.
-
 ## Query inputs and output
 
-For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`. When the
-source contains multiple declarations, the positional name selects one. For a
-stored server query, omit the source and pass its registry name.
-
-Parameters can be supplied inline or from a file:
-
-```bash
---params '{"name":"Ada"}'
---params-file params.json
-```
+For ad-hoc source, pass `--query <FILE>` or `-e/--query-string <GQ>`; with
+multiple declarations the positional name selects one. A stored server query is
+its registry name alone. Parameters come inline, `--params '{"name":"Ada"}'`,
+or from a file, `--params-file params.json`. `--set NAME=VALUE`, repeatable,
+gives a [session setting](index.md#session-settings) a value for the run of
+`query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, and `load`.
+The source may instead be one branch statement, `mutate -e
+'branch create b0'` or `query -e 'branch list'` (writes through `mutate`, the
+listing through `query`; no `--branch`, `--snapshot`, `--if-commit`, name, or
+params; see [Work with branches](index.md#work-with-branches)), or one
+`explain` statement, `query -e 'explain query q() { … }'`, answering the plan
+as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
-cells come from the JSON spelling in
-[JSON result spelling](../queries/index.md#json-result-spelling); `table`,
-`csv`, and `kv` print strings unquoted. `--format json` prints the envelope
-pretty and the `rows` array compact, verbatim.
+cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
+`table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
+envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions
 
-When the read snapshot has an effective graph head, `omnigraph query --json`
-returns its `graph_commit_id` in the complete read envelope. The id and rows
-come from the same pinned snapshot; use that id when a later mutation must be
-conditional on the state that was read.
+`query --json` returns `graph_commit_id` when its read snapshot has a graph
+head. The id and rows share one pinned snapshot; use that id for a later
+conditional mutation.
 
-Successful `mutate --json`, `load --json`, and compatibility
-`ingest --json` responses include `commit`, the exact commit published by
+Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `graph_manifest_version`, optional parent and merged-parent ids, optional
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
 that changes no entities returns `"commit": null`.
+
+`--json` and read `--format json` preserve structured errors on stdout. Data-write failures
+report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands).
+Verified HTTP conditional mismatches exit 4; embedded mismatches exit 1 because writable open can complete earlier work.
 
 ### Conditional mutations
 
@@ -145,8 +124,30 @@ omnigraph mutate update_person --query queries.gq --store graph.omni \
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4; JSON output includes `precondition_failure` with `expected` and optional
+4 against a server, 1 on an embedded `--store` run; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
+
+## Storage upgrade
+
+```bash
+omnigraph upgrade ./graph.omni --check --json
+omnigraph upgrade ./graph.omni --json
+omnigraph schema upgrade-system-columns ./graph.omni --check --json
+```
+
+`--store` is an alternative to the positional storage URI. `omnigraph upgrade`
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v16, offline and
+in place, keeping branches and commit history, and stamps a v14 or v15 graph
+to v16 with one metadata-only commit per live branch; stop every process using
+the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 16 only. `check_passed`, `already_current` (a
+v16 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 16, `unsupported_target`)
+and `recovery_required` (a pending attempt, finished as `recovery.action` says,
+or leftover recovery files) exit 1. The report names the formats, the route,
+the `work` counts, findings and the recovery action. Server and cluster
+addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-upgrade).
+`schema upgrade-system-columns` is a separate operation on a served graph: [system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 
@@ -162,19 +163,25 @@ when it changed unrelated data. A mismatch has no effect and exits with code
 missing branch from an explicit base. Overwrite is destructive and may require
 `--yes` for non-local storage.
 
-Change-feed commands, cursor checkpointing, and baseline recovery are described
-in [Changes and Change Feeds](../branching/changes.md).
+In a selected managed folder, implicit `load --graph <ID>` uses the separate
+cached data credential. It requires `change`, plus `branch_create` when
+`--from` is present. Managed loads bound input to 32 MiB, responses to 8 MiB,
+and one request to 300 seconds; uncertain writes are never automatically
+retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
+permissions, ordinary addressing, and reconciliation.
+
+Diffs, branch review and change feeds: [Changes, Diffs and Change Feeds](../branching/changes.md).
 
 ## Blob commands
 
 ```text
-omnigraph blob get  <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
-omnigraph blob stat <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
+omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
 ```
 
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
-`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`.
-See [Blob values](../blobs.md).
+`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
+reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
+`--if-match <TAG>`, `--json` and, on `--store`, `--as`. See [Blob values](../blobs.md).
 
 ## Operator configuration
 
@@ -199,14 +206,9 @@ clusters:
     root: s3://company-data/omnigraph
 
 profiles:
-  prod-knowledge:
-    server: prod
-    default_graph: knowledge
-  company-admin:
-    cluster: company
-    default_graph: knowledge
-  local-dev:
-    store: file:///tmp/dev.omni
+  prod-knowledge: {server: prod, default_graph: knowledge}
+  company-admin: {cluster: company, default_graph: knowledge}
+  local-dev: {store: file:///tmp/dev.omni}
 
 aliases:
   experts:
@@ -219,9 +221,8 @@ aliases:
     format: table
 ```
 
-Each profile binds exactly one of `server`, `cluster`, or `store`. Select it
-with `--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled
-by a profile.
+Each profile binds exactly one of `server`, `cluster`, or `store`. Select it with
+`--profile` or `OMNIGRAPH_PROFILE`. Explicit flags override values filled by a profile.
 
 Bearer tokens never belong in `config.yaml`. Store a token with
 `omnigraph login <server>` or provide `OMNIGRAPH_BEARER_TOKEN` for the current
@@ -229,21 +230,23 @@ invocation.
 
 ## Managed cluster commands
 
-`omnigraph login --api ORIGIN` prints a verification URL and user code to
-stderr. Complete the browser login while the CLI polls. The resulting opaque
-service session is stored in the OS keychain under the canonical API origin:
-macOS Keychain, Windows Credential Manager, or encrypted Secret Service on
-Linux and BSD. There is no plaintext fallback. Sessions expire within 15
-minutes, and the CLI stores no refresh token; run login again after expiry.
-An unavailable keychain refuses the operation. Login JSON includes identity
-and expiry, never a token or device secret.
+Add `--managed` to select the managed service explicitly. Without it, `cluster`
+uses self-hosted configuration or an explicit server/root and ignores managed
+folder context. The flag can appear before or after the subcommand.
 
-`omnigraph logout --api ORIGIN` revokes that session and removes only that
-origin's local entry. If revocation fails, the local entry is still removed
-and the error reports `revocation_confirmed: false`; the remote session
-remains subject to its expiry. Accepted runs continue after logout.
-The existing `login SERVER --token` and `logout SERVER` commands retain their
-named-server credential behavior.
+`omnigraph login --api ORIGIN` reuses valid cached access or prints a WorkOS
+AuthKit verification URL and user code. The OS keychain holds provider-bound
+access and rotating refresh credentials; old opaque sessions are not reused.
+Access lasts at most 15 minutes; silent renewal ends eight hours after sign-in.
+Normal commands never open browser login. Login JSON reports identity and
+expiry metadata, never credentials. Temporary errors preserve cached access;
+an uncertain refresh is never replayed and may require explicit login.
+See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+for binding, coordination and refresh bounds.
+
+`omnigraph logout --api ORIGIN` requests provider-session revocation and clears
+local credentials. Its `provider_revocation_confirmed` result reports whether
+revocation succeeded. Accepted runs continue. Named-server login is unchanged.
 
 `omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
 to the cluster, then atomically writes `DIR/.omnigraph/context`:
@@ -254,34 +257,36 @@ cluster: CLUSTER_ID
 api: https://control.example
 ```
 
-The context contains no secret and is read only from the selected `--config`
-directory, which defaults to `.`. Parent directories are not searched.
+The context contains no secret. Managed commands read it only from the selected
+`--config` directory, which defaults to `.`. Parent directories are not searched.
 Unknown fields, versions, malformed files, symbolic links, and files over
 16 KiB are refused. API addresses must be origins without credentials, path,
 query, or fragment. HTTPS is required except for exact localhost,
 127.0.0.1, and `[::1]` API hosts used for local integration.
 
-| Command with managed context | Behavior |
+| Managed command | Behavior |
 |---|---|
-| `cluster plan [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
-| `cluster apply --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
-| `cluster status [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
-| `cluster history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
-| `cluster cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+| `cluster plan --managed [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
+| `cluster apply --managed --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
+| `cluster status --managed [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
+| `cluster history --managed [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
+| `cluster cancel --managed RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+
+See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
 
 All accept `--config DIR` and `--json`. Managed plan and apply accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. Without a
-supplied key, plan or apply generates one
-and prints it to stderr before submission. Reuse that key with the same body
+supplied key, plan or apply generates one and prints it to stderr before
+submission. Reuse that key with the same body
 to recover from an uncertain response; changing the body under a key is
 refused by the API. Retry cancellation or abandonment using the same run id.
-The CLI does not upload local files or infer a revision
-from uncommitted changes. A saved plan retains the service's change lease
+Plan and apply do not upload local files or infer a revision from uncommitted
+changes; `cluster push --managed` explicitly prepares managed source. A saved plan retains the service's change lease
 until it is applied, abandoned, or expires under the API's rules.
 
 Plan and apply normally poll every two seconds for up to 300 seconds.
 `--timeout` accepts 1–3600 seconds. Reaching the deadline stops only the local
-wait; inspect `cluster status RUN_ID` to continue following the run.
+wait; inspect `cluster status --managed RUN_ID` to continue following the run.
 `--no-wait` prints the accepted run and exits 0. Every HTTP request has a
 10-second deadline and an 8 MiB response limit; redirects are refused.
 `--json` prints one API envelope to stdout with its provenance and
@@ -310,41 +315,36 @@ its API origin together:
 ```bash
 export OMNIGRAPH_CONTROL_API=https://control.example
 # Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
-omnigraph cluster apply --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
+omnigraph cluster apply --managed --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
 ```
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
 separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
 
-Without a context, existing direct cluster commands behave as before.
-`--direct` explicitly selects that path, ignoring even a malformed context;
-`cluster.yaml` still owns the storage root. Managed-only arguments with
-`--direct` or without a context refuse. Other cluster verbs, including
-`approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
-context is present. API failures never trigger direct execution.
+`--managed` requires its own context, except creation and explicit-origin
+operation lookup; `--direct` is rejected. Managed API failures never trigger
+local deployment. Service-only `create`, `push`, `delete`, `undo-delete`, `token`,
+`operation`, `history`, and `cancel` require `--managed`. Local `validate`,
+`observe`, `force-unlock`, and `upgrade-ledger` reject it. Managed `plan` takes
+`--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
+be combined with them.
+Use `cluster operation --managed OPERATION_ID [--wait]` for service lifecycle observation;
+`cluster status --managed [RUN_ID]` reads cluster projections or a managed run. Self-hosted
+`cluster status --deployment-id ID` addresses a separate deployment receipt.
 
 ## Managed data access
 
-Use `cluster token` to cache scoped data authority, then `query` or `mutate`
-with `--graph` from the managed folder. See [managed data access](managed-data.md)
-for permissions, offline behavior, expiry, and local credential clearing.
+After login and cluster selection, use `graphs list` to discover graphs, then
+`query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
+Missing or expired identity credentials are acquired before the operation;
+applied Cedar policy decides permissions. See [managed data access](managed-data.md)
+for offline behavior, identity binding,
+discovery and credential clearing.
 
 ## Confirmation rules
 
 `cleanup` changes nothing until `--confirm` is present. Destructive operations
 against non-local storage also require interactive confirmation or `--yes`; in
 non-interactive and JSON modes they fail closed. The same non-local consent
-rule applies to overwrite loads and branch deletion.
-
-## Compatibility aliases
-
-| Old name | Canonical name |
-|---|---|
-| `read` | `query` |
-| `change` | `mutate` |
-| `check` and `query lint` | `lint` |
-| `ingest` | `load` |
-
-These aliases are compatibility-only. Use the canonical names in new
-automation.
+rule applies to overwrite loads and branch deletion, verb or statement.

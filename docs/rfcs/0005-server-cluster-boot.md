@@ -3,11 +3,11 @@ rfc: "0005"
 title: "Server boot from cluster state"
 track: maintainer
 status: accepted
-implementation: complete
+implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-10
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,16 @@ blocked_on: []
 ---
 
 # RFC 0005: Server boot from cluster state
+
+> **Later-RFC disposition:** three accepted RFCs changed this one.
+> [RFC 0006](0006-object-storage-cluster-roots.md): `--cluster` accepts
+> object-storage roots, not only a local directory (Non-Goals).
+> [RFC 0008](0008-retire-omnigraph-yaml.md): `omnigraph.yaml` server boot is
+> removed (Non-Goals, the `--config` exclusivity in D1, D6).
+> [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md):
+> activation is online, boot takes cluster admission, and `cluster import` /
+> `cluster refresh` are removed (Non-Goals, D2, D4, D7). Current: `--cluster`
+> boot, serving the applied revision, and the serving metadata of D3.
 
 **Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses. (5) Graph-attributed startup failures quarantine that graph by default; operators can restore all-or-nothing boot with `--require-all-graphs` / `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
 **Builds on:** Phase 4 complete ([RFC 0004](0004-cluster-graph-schema-apply.md)): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Current normative context: [cluster control plane](../dev/control-plane.md).
@@ -95,6 +105,8 @@ Cluster-global failures are fail-fast, matching the server's existing stance (ba
 | Condition | Behavior |
 |---|---|
 | `state.json` missing / unparseable / unsupported version | boot error |
+| zero applied graphs with no applied config digest, positive state revision or state CAS | boot error (`cluster_not_applied`) |
+| an actual applied zero-graph revision with valid config digest, positive state revision, state CAS and canonical root | boot an empty registry; readiness witnesses that exact revision; no graph is created |
 | invalid/unreadable/unattributable recovery sidecars | boot error (run any state-mutating cluster command to sweep or inspect) |
 | valid graph-attributed recovery sidecars | quarantine that graph; strict mode boot error |
 | recorded graph root missing or unopenable | quarantine that graph; strict mode boot error |
@@ -102,7 +114,7 @@ Cluster-global failures are fail-fast, matching the server's existing stance (ba
 | policy entry without `applies_to` metadata | boot error ("re-run cluster apply", D3) |
 | stored query fails parse/type-check against the live schema | quarantine that graph; strict mode boot error |
 | embedding provider configuration for one graph cannot resolve | quarantine that graph; strict mode boot error |
-| every applied graph is quarantined or fails startup | boot error (`cluster_no_healthy_graphs`) |
+| a nonempty applied graph set is entirely quarantined or fails startup | boot error (`cluster_no_healthy_graphs`) |
 | state lock held | **not** an error — boot takes no lock; it reads a point-in-time snapshot of an immutable-once-written state file (the CAS discipline means a concurrent apply produces a *new* file atomically; the server reads whichever was current at open) |
 
 ### D5. The `mcp.expose` bridge in cluster mode
@@ -153,3 +165,21 @@ Answers implementation-spec exit criterion 7 (server startup + migration path) i
 - [RFC 0004](0004-cluster-graph-schema-apply.md) — the convergence machinery this serves
 - [Cluster control plane](../dev/control-plane.md) — current applied-state and serving contract
 - `crates/omnigraph-server/src/lib.rs` (`load_server_settings`, `ServerConfigMode`, `GraphRegistry`) — the boot pipeline this extends without forking
+
+## Decision log
+
+2026-09-06: Accepted the narrow empty-cluster serving amendment to D4 before
+implementation. Applying an empty definition or deleting the final graph may
+produce a valid serving revision with zero graphs. The loader requires the
+same actual ledger CAS and canonical root, a positive state revision, and a
+64-character lowercase SHA256 applied config digest. Missing, unapplied or
+invalid state still refuses; an empty desired definition is not sufficient.
+The server opens no graph and creates no default graph. Existing credential
+and policy requirements, including exact canonical-root validation of public
+data-token trust, remain mandatory before listening. Readiness reports the
+real revision with zero served and quarantined counts; an authorized graph
+inventory is empty and requests for absent graphs still refuse. A nonempty
+applied set whose graphs all fail startup still cannot serve. There is no
+reload, writer takeover, fencing or failover change. Tests must cover actual
+apply, config-directory and storage-root reads, process HTTP readiness,
+inventory/absent-graph behavior and the preserved startup refusals.

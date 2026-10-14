@@ -13,30 +13,35 @@
 //! participates in change detection.
 
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 
 use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use datafusion::prelude::{Expr, col, lit};
-use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
-use lance_core::datatypes::BlobHandling;
 use lance_table::format::Fragment;
+
+use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
 
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
-use crate::db::{STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values};
+use crate::db::{
+    LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, row_blob_values,
+};
 use crate::error::{OmniError, Result};
-use crate::table_store::TableStore;
+use crate::ordered_cursor::{KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject};
 
 /// Fingerprint of one table's user-visible schema for the schema-compatibility
 /// proof both change surfaces rely on: per field, its Arrow type, nullability,
 /// stable property identity marker, and whether it is a Blob. Name-keyed map
 /// comparison is order-insensitive, so a physical column reorder is not a false
-/// boundary. Shared by the per-commit enumerator (parent→child gate) and the
-/// cross-branch net diff so the two cannot drift.
+/// boundary. The system roles are keyed by role (`@id`, `@src`, `@dst`), not
+/// by the spelling `system_columns` resolved for this image, so the two
+/// vintages of one table fingerprint equal. The upgrade belongs to RFC 0040
+/// Rollout step 3. Shared by the per-commit enumerator (parent→child
+/// gate) and the cross-branch net diff so the two cannot drift.
 pub(crate) fn user_schema_fingerprint(
     dataset: &Dataset,
+    system_columns: SystemColumns,
+    is_edge: bool,
 ) -> HashMap<String, (String, bool, Option<String>, bool)> {
     dataset
         .schema()
@@ -45,7 +50,8 @@ pub(crate) fn user_schema_fingerprint(
         .filter(|field| !is_reserved_storage_system_column(&field.name))
         .map(|field| {
             (
-                field.name.clone(),
+                column_name_at_vintage(&field.name, system_columns, SYSTEM_COLUMNS_META, is_edge)
+                    .to_string(),
                 (
                     format!("{:?}", field.data_type()),
                     field.nullable,
@@ -142,8 +148,9 @@ impl RawRow {
         dataset: &Dataset,
         batch: &RecordBatch,
         row_index: usize,
+        id_col: &str,
     ) -> Result<RawRow> {
-        let mut cursor = BatchCursor::try_new(dataset, batch.clone())?;
+        let mut cursor = BatchCursor::try_new(dataset, batch.clone(), id_col)?;
         cursor.next_row = row_index;
         cursor.next(dataset)?.ok_or_else(|| {
             OmniError::manifest_internal("single-row batch produced no comparison row")
@@ -172,10 +179,10 @@ struct BatchCursor {
 }
 
 impl BatchCursor {
-    fn try_new(dataset: &Dataset, batch: RecordBatch) -> Result<Self> {
+    fn try_new(dataset: &Dataset, batch: RecordBatch, id_col: &str) -> Result<Self> {
         let id_index = batch
             .schema_ref()
-            .index_of("id")
+            .index_of(id_col)
             .map_err(|_| OmniError::manifest_internal("change row is missing string id"))?;
         batch
             .column(id_index)
@@ -281,15 +288,19 @@ impl BatchCursor {
                 .downcast_ref::<StructArray>()
                 .expect("Blob descriptor shape was validated when the batch arrived");
             let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
-            let fragment_id = row_addresses
-                .expect("Blob batches carry row addresses")
-                .value(row)
-                >> 32;
-            let data_file_path =
-                data_file_path_for_field(dataset.fragments(), fragment_id, blob_column.field_id)?;
+            // Only a managed descriptor names a data file. A fragment written
+            // before this Blob column was added has none for it, and its
+            // descriptor is the null Lance reads there.
+            let identity = decoder.physical_identity(row, || {
+                let fragment_id = row_addresses
+                    .expect("Blob batches carry row addresses")
+                    .value(row)
+                    >> 32;
+                data_file_path_for_field(dataset.fragments(), fragment_id, blob_column.field_id)
+            })?;
             blob_signatures.push(BlobColumnSig {
                 name: blob_column.name.clone(),
-                identity: decoder.physical_identity(row, data_file_path)?,
+                identity,
                 managed: matches!(decoder.classify(row)?, BlobDescriptor::Managed { .. }),
             });
         }
@@ -303,19 +314,36 @@ impl BatchCursor {
     }
 }
 
-/// An `id`-ordered stream of one dataset snapshot's rows, filled lazily one Lance
-/// batch at a time. Both endpoints of a diff are walked in lockstep so the
-/// merge stays streaming and never buffers a delta-wide row set.
+/// An `id`-ordered stream of one dataset snapshot's rows, walked through the
+/// shared two-phase cursor (keys sorted, rows hydrated in bounded chunks), so
+/// no payload column reaches the sort. Both endpoints of a diff are walked in
+/// lockstep so the merge stays streaming and never buffers a delta-wide row
+/// set.
 pub(crate) struct OrderedRows {
     dataset: Dataset,
-    stream: Option<Pin<Box<DatasetRecordBatchStream>>>,
-    batch: Option<BatchCursor>,
+    rows: OrderedRowCursor,
+    /// The hydrated batch the current row came from, keyed by its
+    /// `(chunk, batch_index)` and prepared once for every row it holds.
+    batch: Option<((u64, usize), BatchCursor)>,
     pending: Option<RawRow>,
+    id_col: &'static str,
 }
 
 impl OrderedRows {
-    pub(crate) async fn open(dataset: Dataset, after_id: Option<&str>) -> Result<Self> {
-        Self::open_scan(dataset, after_id, None, None, ScanTargets::default()).await
+    pub(crate) async fn open(
+        dataset: Dataset,
+        after_id: Option<&str>,
+        id_col: &'static str,
+    ) -> Result<Self> {
+        Self::open_scan(
+            dataset,
+            after_id,
+            None,
+            None,
+            ScanTargets::default(),
+            id_col,
+        )
+        .await
     }
 
     /// The full scan surface. `fragments` scopes the scan to exactly those
@@ -328,62 +356,43 @@ impl OrderedRows {
         extra_filter: Option<Expr>,
         fragments: Option<Vec<Fragment>>,
         targets: ScanTargets,
+        id_col: &'static str,
     ) -> Result<Self> {
-        if fragments.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Self {
-                dataset,
-                stream: None,
-                batch: None,
-                pending: None,
-            });
-        }
-        let after_id = after_id.map(str::to_string);
-        let stream = Box::pin(
-            TableStore::scan_stream_with(
-                &dataset,
-                None,
-                None,
-                Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
-                true,
-                move |scanner| {
-                    if let Some(fragments) = fragments {
-                        scanner.with_fragments(fragments);
-                    }
-                    let resume = after_id.map(|after_id| col("id").gt(lit(after_id)));
-                    if let Some(filter) = match (resume, extra_filter) {
-                        (Some(resume), Some(extra)) => Some(resume.and(extra)),
-                        (Some(resume), None) => Some(resume),
-                        (None, Some(extra)) => Some(extra),
-                        (None, None) => None,
-                    } {
-                        scanner.filter_expr(filter);
-                    }
-                    // Descriptor-sized batches bounded by rows AND bytes, the
-                    // same shape as every other production ordered-by-id scan.
-                    // strict_batch_size is deliberately absent: Lance's strict
-                    // stream coalesces to a row count the environment can
-                    // override and ignores the byte target while accumulating.
-                    scanner.batch_size(targets.rows);
-                    scanner.batch_size_bytes(targets.bytes);
-                    scanner.blob_handling(BlobHandling::BlobsDescriptions);
-                    // Managed Blob descriptors are file-relative, so `BatchCursor`
-                    // maps the row's fragment (high 32 bits of `_rowaddr`) to the
-                    // owning data file's immutable UUID path — the qualifier that
-                    // tells an unchanged row from a same-length Blob-only update
-                    // (which lands in a new data file) across relocation,
-                    // Overwrite, and branches. `with_row_id` above stays on for
-                    // the payload tie-break's stable-id `take_blobs`.
-                    scanner.with_row_address();
-                    Ok(())
-                },
-            )
-            .await?,
-        );
+        let resume = after_id.map(|after_id| col(id_col).gt(lit(after_id.to_string())));
+        let filter = match (resume, extra_filter) {
+            (Some(resume), Some(extra)) => Some(resume.and(extra)),
+            (Some(resume), None) => Some(resume),
+            (None, Some(extra)) => Some(extra),
+            (None, None) => None,
+        };
+        // Key and chunk targets both come from the page budget, so a
+        // one-change page never prepares an 8,192-row batch. Lance treats
+        // them as targets; the hard page bound remains the serialized-change
+        // accounting in `enumerate`.
+        let rows = OrderedRowCursor::open(
+            Some(dataset.clone()),
+            KeyOrder {
+                fragments,
+                filter: filter.map(KeyFilter::Expr),
+                key_batch_rows: targets.rows,
+                key_batch_bytes: targets.bytes,
+                chunk_rows: targets.rows,
+                chunk_bytes: targets.bytes,
+            },
+            WalkSubject {
+                operation: "change",
+                table: dataset.uri().to_string(),
+                role: "change",
+            },
+            id_col,
+        )
+        .await?;
         Ok(Self {
             dataset,
-            stream: Some(stream),
+            rows,
             batch: None,
             pending: None,
+            id_col,
         })
     }
 
@@ -398,26 +407,22 @@ impl OrderedRows {
     }
 
     async fn fill(&mut self) -> Result<()> {
-        while self.pending.is_none() {
-            if let Some(batch) = self.batch.as_mut() {
-                if let Some(row) = batch.next(&self.dataset)? {
-                    self.pending = Some(row);
-                    return Ok(());
-                }
-                self.batch = None;
-            }
-            let Some(stream) = self.stream.as_mut() else {
-                return Ok(());
-            };
-            match stream.try_next().await {
-                Ok(Some(batch)) => self.batch = Some(BatchCursor::try_new(&self.dataset, batch)?),
-                Ok(None) => {
-                    self.stream = None;
-                    return Ok(());
-                }
-                Err(error) => return Err(TableStore::ordered_scan_error(error)),
-            }
+        if self.pending.is_some() {
+            return Ok(());
         }
+        let Some(row) = self.rows.next().await? else {
+            return Ok(());
+        };
+        let key = (row.chunk, row.batch_index);
+        let cursor = match &mut self.batch {
+            Some((prepared, cursor)) if *prepared == key => cursor,
+            slot => {
+                let cursor = BatchCursor::try_new(&self.dataset, row.batch, self.id_col)?;
+                &mut slot.insert((key, cursor)).1
+            }
+        };
+        cursor.next_row = row.row_index;
+        self.pending = cursor.next(&self.dataset)?;
         Ok(())
     }
 
@@ -428,7 +433,9 @@ impl OrderedRows {
 
 /// Resolve the immutable data-file path that holds `field_id` in the fragment
 /// owning a row — the stable UUID qualifier for a managed-Blob identity. Reads
-/// only the in-memory manifest.
+/// only the in-memory manifest. Called for managed descriptors only, so a
+/// fragment without a data file for the field is an integrity failure: the
+/// descriptor claims bytes nothing stores.
 fn data_file_path_for_field(
     fragments: &[lance_table::format::Fragment],
     fragment_id: u64,
@@ -483,6 +490,48 @@ pub(crate) async fn rows_equal(
     to_dataset: &Dataset,
     right: &RawRow,
 ) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| name).await
+}
+
+pub(crate) async fn rows_equal_across_vintages(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> Result<bool> {
+    rows_equal_by_column(from_dataset, left, to_dataset, right, |name| {
+        column_name_at_vintage(name, from_columns, to_columns, is_edge)
+    })
+    .await
+}
+
+pub(crate) fn column_name_at_vintage(
+    name: &str,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
+) -> &str {
+    if name == from_columns.id {
+        to_columns.id
+    } else if is_edge && name == from_columns.src {
+        to_columns.src
+    } else if is_edge && name == from_columns.dst {
+        to_columns.dst
+    } else {
+        name
+    }
+}
+
+async fn rows_equal_by_column(
+    from_dataset: &Dataset,
+    left: &RawRow,
+    to_dataset: &Dataset,
+    right: &RawRow,
+    right_name: impl Fn(&str) -> &str,
+) -> Result<bool> {
     let blob_columns: HashSet<&str> = left
         .blob_signatures
         .iter()
@@ -499,11 +548,14 @@ pub(crate) async fn rows_equal(
         if is_reserved_storage_system_column(name) || blob_columns.contains(name.as_str()) {
             continue;
         }
-        let other = right.slice.column_by_name(name).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "schema-gated change row is missing column '{name}'"
-            ))
-        })?;
+        let other = right
+            .slice
+            .column_by_name(right_name(name))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "schema-gated change row is missing column '{name}'"
+                ))
+            })?;
         if column.to_data() != other.to_data() {
             return Ok(false);
         }
@@ -545,17 +597,26 @@ pub(crate) async fn rows_equal(
     Ok(left_values == right_values)
 }
 
-/// Logical Blob values (managed bytes, external URI, or null) for one row's
-/// selected columns, read through the same helper export uses.
+/// Managed Blob bytes for one row's selected columns, read through the same
+/// batched reader export uses. Only columns managed on both sides reach this:
+/// external and null cells are decided by descriptor identity in
+/// [`rows_equal_by_column`].
 async fn blob_values_for(
     dataset: &Dataset,
     slice: &RecordBatch,
     columns: &HashSet<String>,
-) -> Result<HashMap<String, Vec<Option<String>>>> {
+) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
     let row_id = slice
         .column_by_name("_rowid")
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
         .value(0);
-    export_blob_values(dataset, slice, &[row_id], columns).await
+    row_blob_values(
+        dataset,
+        slice,
+        row_id,
+        columns,
+        RangedExternalBlobs::Describe,
+    )
+    .await
 }

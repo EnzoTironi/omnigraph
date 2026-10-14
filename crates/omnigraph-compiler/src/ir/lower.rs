@@ -1,10 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
-use crate::error::Result;
+use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemColumns};
+use crate::error::{CompilerError, Result};
 use crate::query::ast::*;
-use crate::query::typecheck::{BoundVariable, TypeContext};
-use crate::types::{Direction, PropType, ScalarType};
+use crate::query::typecheck::{
+    BoundVariable, CheckedBinding, CheckedBlock, CheckedBlockAggregate, CheckedClause,
+    CheckedMutationOp, CheckedMutationQuery, CheckedParam, CheckedReadQuery, CheckedScope,
+    MutationTarget, ResolvedTraversal, ResolvedType, TypedExpr,
+};
+use crate::traversal::{EDGE_TYPE_COLUMN, EDGE_TYPE_META};
+use crate::types::{PropType, ScalarType};
 
 use super::*;
 
@@ -19,77 +25,210 @@ struct FreshNames {
     temp: usize,
 }
 
+const ANON_PREFIX: &str = "__anon_";
+const TEMP_PREFIX: &str = "__temp_";
+
 impl FreshNames {
     fn anon(&mut self) -> String {
         self.anon += 1;
-        format!("__anon_{}", self.anon)
+        format!("{ANON_PREFIX}{}", self.anon)
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        format!("__temp_{}_{}", dst, self.temp)
+        format!("{TEMP_PREFIX}{}_{}", dst, self.temp)
     }
 }
 
-pub fn lower_query(
-    catalog: &Catalog,
-    query: &QueryDecl,
-    type_ctx: &TypeContext,
-) -> Result<QueryIR> {
-    if !query.mutations.is_empty() {
-        return Err(crate::error::CompilerError::Plan(
-            "cannot lower mutation query with read-query lowerer".to_string(),
-        ));
-    }
-    let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
-    // Param types were validated during typecheck; unknown names simply
-    // don't participate in `contains` overload resolution below.
-    let param_types: HashMap<String, PropType> = query
-        .params
-        .iter()
-        .filter_map(|p| {
-            PropType::from_param_type_name(&p.type_name, p.nullable).map(|t| (p.name.clone(), t))
-        })
-        .collect();
+/// Whether `variable` is a name the lowering made up: an anonymous `_`
+/// endpoint or a cycle-closing or renamed temp. The query declares no such
+/// binding, so its identity orders nothing a reader can see.
+pub fn is_fresh_variable(variable: &str) -> bool {
+    variable.starts_with(ANON_PREFIX) || variable.starts_with(TEMP_PREFIX)
+}
 
+/// What every expression site shares: the physical column spellings and
+/// the bindings a variable names. Every emitted expression lowers through
+/// one, so `contains` resolution and `fold` apply everywhere.
+struct LowerCtx<'a> {
+    catalog: &'a Catalog,
+    bindings: Bindings<'a>,
+}
+
+/// The binding a variable names.
+enum Bindings<'a> {
+    /// Bindings visible in this lexical read scope.
+    Read(&'a HashMap<String, BoundVariable>),
+    /// A mutation: the target type, whose bare name stands where a read has
+    /// a binding variable (`Expr::mutation_property`).
+    Mutation(BoundVariable),
+}
+
+impl LowerCtx<'_> {
+    fn system_columns(&self) -> SystemColumns {
+        self.catalog.system_columns
+    }
+
+    fn binding(&self, variable: &str) -> Option<&BoundVariable> {
+        match &self.bindings {
+            Bindings::Read(bindings) => bindings.get(variable),
+            Bindings::Mutation(target) => match target {
+                BoundVariable::Node { type_name } => (variable == type_name).then_some(target),
+                BoundVariable::Edge { type_names } => type_names
+                    .iter()
+                    .any(|name| variable == name)
+                    .then_some(target),
+            },
+        }
+    }
+
+    /// The physical column a property leaf reads: `@id` through
+    /// `physical_property` as a read does, a mutation target edge's `from`
+    /// and `to` to the system endpoint columns.
+    fn physical_column(&self, variable: &str, property: &str) -> String {
+        let system_columns = self.system_columns();
+        if let Some(BoundVariable::Edge { .. }) = self.binding(variable)
+            && matches!(self.bindings, Bindings::Mutation(_))
+        {
+            match property {
+                "from" => return system_columns.src.to_string(),
+                "to" => return system_columns.dst.to_string(),
+                _ => {}
+            }
+        }
+        physical_property(property, system_columns)
+    }
+
+    /// `left <op> right`: `contains` over a scalar String left operand becomes
+    /// `StringContains`, so execution dispatches on the IR op alone and never
+    /// re-derives operand types; a literal-only node folds.
+    fn binary(&self, left: IRExpr, op: BinaryOp, right: IRExpr) -> Result<IRExpr> {
+        coerce::binary(left, op, right)
+    }
+}
+
+/// Lower a checked read to typed IR. Every type comes from the checked
+/// tree; lowering adds physical columns, traversal scheduling, fresh names,
+/// score columns, comparison casts and folding, and validates what it emitted.
+///
+/// A mutation cannot reach this door: [`CheckedReadQuery`] is only ever the
+/// read half of [`crate::query::typecheck::CheckedQuery`].
+///
+/// ```compile_fail
+/// let checked: omnigraph_compiler::query::typecheck::CheckedMutationQuery = unimplemented!();
+/// let catalog: omnigraph_compiler::catalog::Catalog = unimplemented!();
+/// let _ = omnigraph_compiler::lower_query(&catalog, &checked);
+/// ```
+fn typed_contains_aggregate(expr: &TypedExpr) -> bool {
+    match expr {
+        TypedExpr::Aggregate { .. } => true,
+        TypedExpr::Binary { left, right, .. }
+        | TypedExpr::In {
+            needle: left,
+            list: right,
+            ..
+        } => typed_contains_aggregate(left) || typed_contains_aggregate(right),
+        TypedExpr::Not { inner, .. } | TypedExpr::IsNull { inner, .. } => {
+            typed_contains_aggregate(inner)
+        }
+        _ => false,
+    }
+}
+
+pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryIR> {
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
     let mut fresh = FreshNames::default();
 
     lower_clauses(
         catalog,
-        &query.match_clause,
-        type_ctx,
+        &query.scope,
         &mut pipeline,
         &mut bound_vars,
-        &param_names,
-        &param_types,
+        &HashSet::new(),
         &mut fresh,
     )?;
 
+    let ctx = LowerCtx {
+        catalog,
+        bindings: Bindings::Read(&query.scope.bindings),
+    };
     let return_exprs: Vec<IRProjection> = query
-        .return_clause
+        .returns
         .iter()
-        .map(|p| IRProjection {
-            expr: lower_expr(&p.expr, &param_names),
-            alias: p.alias.clone(),
+        .map(|item| {
+            Ok(IRProjection {
+                expr: lower_projection(&item.expr, &ctx)?,
+                alias: item
+                    .alias
+                    .clone()
+                    .or_else(|| item.expr.meta_field_result_key()),
+                column: item.executed_column.clone(),
+                ty: item.expr.expr_type(),
+            })
         })
+        .collect::<Result<_>>()?;
+
+    let has_aggregates = query
+        .returns
+        .iter()
+        .any(|item| typed_contains_aggregate(&item.expr));
+    let aggregate_meta_columns: HashSet<String> = query
+        .returns
+        .iter()
+        .filter(|item| has_aggregates && item.alias.is_none())
+        .filter_map(|item| item.expr.meta_field_result_key())
         .collect();
 
     let order_by: Vec<IROrdering> = query
-        .order_clause
+        .orders
         .iter()
-        .map(|o| IROrdering {
-            expr: lower_expr(&o.expr, &param_names),
-            descending: o.descending,
+        .enumerate()
+        .map(|(index, order)| {
+            let expr = order
+                .expr
+                .meta_field_result_key()
+                .filter(|_| matches!(&order.expr, TypedExpr::PropAccess { .. }))
+                .filter(|name| aggregate_meta_columns.contains(name))
+                .map(|name| {
+                    let ty = return_exprs
+                        .iter()
+                        .find(|projection| projection.column == name)
+                        .expect("aggregate meta-column has a projection")
+                        .ty
+                        .clone();
+                    IRExpr::AliasRef(name, ty)
+                })
+                .map_or_else(
+                    || {
+                        if index == 0
+                            && matches!(
+                                &order.expr,
+                                TypedExpr::Nearest { .. }
+                                    | TypedExpr::Bm25 { .. }
+                                    | TypedExpr::Rrf { .. }
+                            )
+                        {
+                            lower_expr(&order.expr, &ctx)
+                        } else {
+                            lower_projection(&order.expr, &ctx)
+                        }
+                    },
+                    Ok,
+                )?;
+            Ok(IROrdering {
+                expr,
+                descending: order.descending,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let ir = QueryIR {
         name: query.name.clone(),
-        params: query.params.clone(),
+        params: lower_params(&query.params),
         pipeline,
         return_exprs,
+        distinct: query.distinct,
         order_by,
         limit: query.limit,
     };
@@ -97,94 +236,124 @@ pub fn lower_query(
     Ok(ir)
 }
 
-pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
-    if query.mutations.is_empty() {
-        return Err(crate::error::CompilerError::Plan(
-            "query does not contain a mutation body".to_string(),
-        ));
-    }
-    let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
-
+/// Lower a checked mutation to typed IR: each checked statement with its
+/// target namespace, its typed assignments and its typed predicate.
+///
+/// Only the checker constructs a [`CheckedMutationQuery`]; its fields are
+/// private, so no caller can hand this door a statement list and a target
+/// list that disagree.
+///
+/// ```compile_fail
+/// let checked = omnigraph_compiler::query::typecheck::CheckedMutationQuery {
+///     name: String::new(),
+///     params: Vec::new(),
+///     ops: Vec::new(),
+/// };
+/// ```
+pub fn lower_mutation_query(catalog: &Catalog, query: &CheckedMutationQuery) -> Result<MutationIR> {
     let ops = query
-        .mutations
+        .ops
         .iter()
-        .map(|m| lower_single_mutation(m, &param_names))
+        .map(|op| lower_single_mutation(catalog, op))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(MutationIR {
         name: query.name.clone(),
-        params: query.params.clone(),
+        params: lower_params(&query.params),
         ops,
+        write_mode: query.write_mode.clone(),
     })
 }
 
-fn lower_single_mutation(
-    mutation: &Mutation,
-    param_names: &HashSet<String>,
-) -> Result<MutationOpIR> {
-    match mutation {
-        Mutation::Insert(insert) => Ok(MutationOpIR::Insert {
-            type_name: insert.type_name.clone(),
-            assignments: insert
-                .assignments
-                .iter()
-                .map(|a| IRAssignment {
-                    property: a.property.clone(),
-                    value: lower_match_value(&a.value, param_names),
+fn lower_params(params: &[CheckedParam]) -> Vec<IRParam> {
+    params
+        .iter()
+        .map(|param| IRParam {
+            declaration: param.declaration.clone(),
+            ty: ExprType::from_prop(&param.ty),
+        })
+        .collect()
+}
+
+/// Lower one checked mutation statement in its target namespace.
+fn lower_single_mutation(catalog: &Catalog, op: &CheckedMutationOp) -> Result<MutationOpIR> {
+    let binding = match op.target() {
+        MutationTarget::Node { type_name } => BoundVariable::Node {
+            type_name: type_name.clone(),
+        },
+        MutationTarget::Edge { type_name } => BoundVariable::Edge {
+            type_names: vec![type_name.clone()],
+        },
+    };
+    let ctx = LowerCtx {
+        catalog,
+        bindings: Bindings::Mutation(binding),
+    };
+    let no_bindings = HashMap::new();
+    let assignment_ctx = LowerCtx {
+        catalog,
+        bindings: Bindings::Read(&no_bindings),
+    };
+    let lower_assignments = |assignments: &[crate::query::typecheck::CheckedAssignment]| {
+        assignments
+            .iter()
+            .map(|assignment| {
+                Ok(IRAssignment {
+                    property: assignment.property.clone(),
+                    value: lower_expr(&assignment.value, &assignment_ctx)?,
                 })
-                .collect(),
+            })
+            .collect::<Result<_>>()
+    };
+    match op {
+        CheckedMutationOp::Insert {
+            target,
+            assignments,
+        } => Ok(MutationOpIR::Insert {
+            target: target.clone(),
+            assignments: lower_assignments(assignments)?,
         }),
-        Mutation::Update(update) => Ok(MutationOpIR::Update {
-            type_name: update.type_name.clone(),
-            assignments: update
-                .assignments
-                .iter()
-                .map(|a| IRAssignment {
-                    property: a.property.clone(),
-                    value: lower_match_value(&a.value, param_names),
-                })
-                .collect(),
-            predicate: IRMutationPredicate {
-                property: update.predicate.property.clone(),
-                op: update.predicate.op,
-                value: lower_match_value(&update.predicate.value, param_names),
-            },
+        CheckedMutationOp::Update {
+            target,
+            assignments,
+            predicate,
+        } => Ok(MutationOpIR::Update {
+            target: target.clone(),
+            assignments: lower_assignments(assignments)?,
+            predicate: lower_expr(predicate, &ctx)?,
         }),
-        Mutation::Delete(delete) => Ok(MutationOpIR::Delete {
-            type_name: delete.type_name.clone(),
-            predicate: IRMutationPredicate {
-                property: delete.predicate.property.clone(),
-                op: delete.predicate.op,
-                value: lower_match_value(&delete.predicate.value, param_names),
-            },
+        CheckedMutationOp::Delete { target, predicate } => Ok(MutationOpIR::Delete {
+            target: target.clone(),
+            predicate: lower_expr(predicate, &ctx)?,
         }),
     }
 }
 
 fn lower_clauses(
     catalog: &Catalog,
-    clauses: &[Clause],
-    type_ctx: &TypeContext,
+    scope: &CheckedScope,
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
-    param_names: &HashSet<String>,
-    param_types: &HashMap<String, PropType>,
+    outer_physical_names: &HashSet<String>,
     fresh: &mut FreshNames,
 ) -> Result<()> {
-    // Separate clause types for ordering: bindings first, then traversals, then filters
-    let mut bindings = Vec::new();
-    let mut traversals = Vec::new();
-    let mut filters = Vec::new();
-    let mut negations = Vec::new();
+    let mut bindings: Vec<&CheckedBinding> = Vec::new();
+    let mut traversals: Vec<&ResolvedTraversal> = Vec::new();
+    let mut filters: Vec<&TypedExpr> = Vec::new();
+    let mut blocks: Vec<&CheckedBlock> = Vec::new();
 
-    for clause in clauses {
+    for clause in &scope.clauses {
         match clause {
-            Clause::Binding(b) => bindings.push(b),
-            Clause::Traversal(t) => traversals.push(t),
-            Clause::Filter(f) => filters.push(f),
-            Clause::Negation(inner) => negations.push(inner),
+            CheckedClause::Binding(binding) => bindings.push(binding),
+            CheckedClause::Traversal(traversal) => traversals.push(traversal),
+            CheckedClause::Filter(filter) => filters.push(filter),
+            CheckedClause::Block(block) => blocks.push(block),
         }
     }
+    let ctx = LowerCtx {
+        catalog,
+        bindings: Bindings::Read(&scope.bindings),
+    };
 
     // ── Determine which bindings are "deferred" ─────────────────────────
     //
@@ -218,6 +387,10 @@ fn lower_clauses(
     // Walk components to find deferred binding variables
     let mut deferred_set: HashSet<String> = HashSet::new();
     let mut component_visited: HashSet<&str> = HashSet::new();
+    let searched: HashSet<&str> = filters
+        .iter()
+        .filter_map(|f| f.text_search_subject())
+        .collect();
 
     for binding in &bindings {
         if component_visited.contains(binding.variable.as_str()) {
@@ -227,11 +400,13 @@ fn lower_clauses(
         let mut queue = VecDeque::new();
         queue.push_back(binding.variable.as_str());
         let mut component_bindings: Vec<&str> = Vec::new();
+        let mut component_vars: Vec<&str> = Vec::new();
 
         while let Some(var) = queue.pop_front() {
             if !component_visited.insert(var) {
                 continue;
             }
+            component_vars.push(var);
             if binding_set.contains(var) {
                 component_bindings.push(var);
             }
@@ -244,29 +419,32 @@ fn lower_clauses(
             }
         }
 
-        // First binding in the component is the root; defer the rest.
-        for var in component_bindings.into_iter().skip(1) {
-            deferred_set.insert(var.to_string());
+        let reaches_outer = component_vars.iter().any(|var| bound_vars.contains(*var));
+        let inner_bindings: Vec<&str> = component_bindings
+            .iter()
+            .copied()
+            .filter(|var| !bound_vars.contains(*var))
+            .collect();
+        let root = scan_root(&inner_bindings, reaches_outer, &searched);
+        for (index, var) in inner_bindings.into_iter().enumerate() {
+            if Some(index) != root {
+                deferred_set.insert(var.to_string());
+            }
         }
     }
 
     // Build deferred filters map for variables introduced by traversals
-    let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+    let mut deferred_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
 
     // A variable bound again after its first binding (`$p: Person` twice in
     // one match, or inside `not { }` over an outer `$p`): the typechecker
     // admits it as the same type, so it is a constraint on the existing
     // rows, not a second scan. Its inline filters become plain Filter ops.
-    let mut rebind_filters: Vec<IRFilter> = Vec::new();
+    let mut rebind_filters: Vec<IRExpr> = Vec::new();
 
     // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
-        let node_type = catalog
-            .node_types
-            .get(&binding.type_name)
-            .expect("binding type was validated during typecheck");
-
-        let binding_filters = build_binding_filters(binding, node_type, param_names);
+        let binding_filters = build_binding_filters(binding, &ctx)?;
 
         // A variable the outer pattern already bound (a negation's inner
         // clauses run over the outer batch) is never deferred, whatever its
@@ -305,52 +483,16 @@ fn lower_clauses(
     // bound until a prior traversal introduces it.  Each pass processes
     // every traversal that has at least one bound endpoint; this repeats
     // until all traversals are consumed.
-    let mut remaining: Vec<&Traversal> = traversals.to_vec();
+    let mut remaining: Vec<&ResolvedTraversal> = traversals.clone();
     while !remaining.is_empty() {
         let mut next_remaining = Vec::new();
         for traversal in &remaining {
-            let src_bound = bound_vars.contains(&traversal.src);
-            let dst_bound = bound_vars.contains(&traversal.dst);
+            let src_bound = traversal.src != "_" && bound_vars.contains(&traversal.src);
+            let dst_bound = traversal.dst != "_" && bound_vars.contains(&traversal.dst);
             if !src_bound && !dst_bound {
                 next_remaining.push(*traversal);
                 continue;
             }
-
-            let edge = catalog
-                .lookup_edge_by_name(&traversal.edge_name)
-                .ok_or_else(|| {
-                    crate::error::CompilerError::Plan(format!(
-                        "lowering traversal referenced missing edge '{}' after typecheck",
-                        traversal.edge_name
-                    ))
-                })?;
-
-            // Undirected is carried on the AST node itself — negation inners
-            // are typechecked into a discarded context clone, so the
-            // ResolvedTraversal lookup below cannot see their direction; the
-            // syntax is the source of truth for Both.
-            let direction = if traversal.undirected {
-                Direction::Both
-            } else {
-                type_ctx
-                    .traversals
-                    .iter()
-                    .find(|rt| {
-                        rt.src == traversal.src
-                            && rt.dst == traversal.dst
-                            && rt.edge_type == edge.name
-                    })
-                    .map(|rt| rt.direction)
-                    .unwrap_or(Direction::Out)
-            };
-
-            let dst_type = match direction {
-                Direction::Out => edge.to_type.clone(),
-                Direction::In => edge.from_type.clone(),
-                // Undirected requires from_type == to_type (typecheck rule),
-                // so either endpoint type is correct.
-                Direction::Both => edge.to_type.clone(),
-            };
 
             if src_bound && dst_bound {
                 // Cycle closing: expand to a temp var, then filter temp.id = dst.id
@@ -359,9 +501,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
                     dst_var: temp_var.clone(),
-                    edge_type: edge.name.clone(),
-                    direction,
-                    dst_type,
+                    edges: traversal.edges.clone(),
+                    src_type: traversal.src_type.clone(),
+                    dst_type: traversal.dst_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: vec![],
@@ -371,30 +513,21 @@ fn lower_clauses(
                         .filter(|binding| *binding != "_")
                         .map(str::to_string),
                 });
-                pipeline.push(IROp::Filter(IRFilter {
-                    left: IRExpr::PropAccess {
+                pipeline.push(IROp::Filter(coerce::binary(
+                    IRExpr::PropAccess {
                         variable: temp_var,
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
+                        ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
                     },
-                    op: CompOp::Eq,
-                    right: IRExpr::PropAccess {
+                    BinaryOp::Compare(CompOp::Eq),
+                    IRExpr::PropAccess {
                         variable: traversal.dst.clone(),
-                        property: "id".to_string(),
+                        property: catalog.system_columns.id.to_string(),
+                        ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
                     },
-                }));
+                )?));
             } else if !src_bound && dst_bound {
                 // Reverse expand: dst is bound, src is not.
-                let reverse_dir = match direction {
-                    Direction::Out => Direction::In,
-                    Direction::In => Direction::Out,
-                    // Symmetric: reversing an undirected expand is a no-op.
-                    Direction::Both => Direction::Both,
-                };
-                let src_type = match direction {
-                    Direction::Out => edge.from_type.clone(),
-                    Direction::In => edge.to_type.clone(),
-                    Direction::Both => edge.from_type.clone(),
-                };
                 let introduced_filters =
                     deferred_filters.remove(&traversal.src).unwrap_or_default();
                 let dst_var = if traversal.src == "_" {
@@ -405,9 +538,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.dst.clone(),
                     dst_var,
-                    edge_type: edge.name.clone(),
-                    direction: reverse_dir,
-                    dst_type: src_type,
+                    edges: traversal.edges.reversed(),
+                    src_type: traversal.dst_type.clone(),
+                    dst_type: traversal.src_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
@@ -433,9 +566,9 @@ fn lower_clauses(
                 pipeline.push(IROp::Expand {
                     src_var: traversal.src.clone(),
                     dst_var,
-                    edge_type: edge.name.clone(),
-                    direction,
-                    dst_type,
+                    edges: traversal.edges.clone(),
+                    src_type: traversal.src_type.clone(),
+                    dst_type: traversal.dst_type.clone(),
                     min_hops: traversal.min_hops,
                     max_hops: traversal.max_hops,
                     dst_filters: introduced_filters,
@@ -451,48 +584,11 @@ fn lower_clauses(
             }
         }
         if next_remaining.len() == remaining.len() {
-            break;
+            return Err(CompilerError::Plan(
+                "typechecked traversal has no executable endpoint binding".to_string(),
+            ));
         }
         remaining = next_remaining;
-    }
-
-    // Clause-local variable types for filter-op resolution: negation inners
-    // are typechecked into a discarded context clone (same asymmetry the
-    // `direction` fallback above documents), so `type_ctx` alone cannot
-    // resolve variables introduced inside `not { }`. Bindings declare their
-    // type; traversal endpoints take the edge's declared endpoint types
-    // (bindings win when both name a variable).
-    let mut local_bindings: HashMap<&str, BoundVariable> = HashMap::new();
-    for t in &traversals {
-        if let Some(edge) = catalog.lookup_edge_by_name(&t.edge_name) {
-            local_bindings
-                .entry(t.src.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.from_type.clone(),
-                });
-            local_bindings
-                .entry(t.dst.as_str())
-                .or_insert_with(|| BoundVariable::Node {
-                    type_name: edge.to_type.clone(),
-                });
-            // An edge binding (`$p $w:knows $f`) names the edge type, whose
-            // String properties are addressable in filters (`$w.note contains …`).
-            if let Some(eb) = &t.edge_binding {
-                local_bindings
-                    .entry(eb.as_str())
-                    .or_insert_with(|| BoundVariable::Edge {
-                        type_name: edge.name.clone(),
-                    });
-            }
-        }
-    }
-    for b in &bindings {
-        local_bindings.insert(
-            b.variable.as_str(),
-            BoundVariable::Node {
-                type_name: b.type_name.clone(),
-            },
-        );
     }
 
     // Re-binding filters run after every variable is introduced, like the
@@ -502,136 +598,281 @@ fn lower_clauses(
 
     // Lower explicit filters
     for filter in &filters {
-        pipeline.push(IROp::Filter(IRFilter {
-            left: lower_expr(&filter.left, param_names),
-            op: resolve_filter_op(catalog, type_ctx, param_types, &local_bindings, filter),
-            right: lower_expr(&filter.right, param_names),
-        }));
+        pipeline.push(IROp::Filter(lower_expr(filter, &ctx)?));
     }
 
-    // Lower negations into AntiJoin ops
-    for neg_clauses in &negations {
-        // Find outer-bound variable referenced in the negation
-        let outer_var = find_outer_var(neg_clauses, bound_vars);
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut physical_names = outer_physical_names.clone();
+    for op in pipeline.iter() {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name: _,
+                filters: _,
+            } => {
+                physical_names.insert(variable.clone());
+            }
+            IROp::Expand {
+                src_var: _,
+                dst_var,
+                edges: _,
+                src_type: _,
+                dst_type: _,
+                min_hops: _,
+                max_hops: _,
+                dst_filters: _,
+                edge_binding,
+            } => {
+                physical_names.insert(dst_var.clone());
+                physical_names.extend(edge_binding.iter().cloned());
+            }
+            IROp::Filter(_)
+            | IROp::AntiJoin {
+                outer_var: _,
+                inner: _,
+                predicate: _,
+            } => {}
+        }
+    }
 
+    for block in blocks {
+        let visible_outer: HashSet<_> = bound_vars
+            .iter()
+            .filter(|name| block.outer_bindings.contains_key(*name))
+            .cloned()
+            .collect();
+        let outer_var = find_outer_var(&block.inner.clauses, &visible_outer);
+        let mut collisions: Vec<_> = block
+            .inner
+            .bindings
+            .keys()
+            .filter(|name| {
+                !block.outer_bindings.contains_key(*name) && physical_names.contains(*name)
+            })
+            .collect();
+        collisions.sort();
+        let renames: HashMap<_, _> = collisions
+            .into_iter()
+            .map(|name| (name.clone(), fresh.temp(name)))
+            .collect();
         let mut inner_pipeline = Vec::new();
-        let mut inner_bound = bound_vars.clone();
+        let mut inner_bound = visible_outer;
         lower_clauses(
             catalog,
-            neg_clauses,
-            type_ctx,
+            &block.inner,
             &mut inner_pipeline,
             &mut inner_bound,
-            param_names,
-            param_types,
+            &physical_names,
             fresh,
         )?;
+
+        let inner_ctx = LowerCtx {
+            catalog,
+            bindings: Bindings::Read(&block.inner.bindings),
+        };
+        let outer_ctx = LowerCtx {
+            catalog,
+            bindings: Bindings::Read(&block.outer_bindings),
+        };
+        let mut left = match &block.aggregate {
+            CheckedBlockAggregate::RowCount => BlockAggregateExpr::count_rows(),
+            CheckedBlockAggregate::Aggregate {
+                func,
+                arg,
+                signature,
+            } => BlockAggregateExpr::Aggregate {
+                func: *func,
+                arg: Box::new(lower_expr(arg, &inner_ctx)?),
+                signature: signature.clone(),
+            },
+        };
+        rename_inner_bindings(&mut inner_pipeline, left.arg_mut(), &renames);
+        let predicate = coerce::block(left, block.op, lower_expr(&block.right, &outer_ctx)?)?;
 
         pipeline.push(IROp::AntiJoin {
             outer_var: outer_var.unwrap_or_default(),
             inner: inner_pipeline,
+            predicate,
         });
     }
 
     Ok(())
 }
 
-/// Whether `binding.property` is a non-list scalar String. Node and edge type
-/// namespaces are independent, so the binding discriminant selects the one
-/// catalog namespace that may define the property.
-fn is_scalar_string_property(catalog: &Catalog, binding: &BoundVariable, property: &str) -> bool {
-    match binding {
-        BoundVariable::Node { type_name } => catalog
-            .node_types
-            .get(type_name)
-            .and_then(|nt| nt.properties.get(property)),
-        BoundVariable::Edge { type_name } => catalog
-            .lookup_edge_by_name(type_name)
-            .and_then(|et| et.properties.get(property)),
+fn rename_inner_bindings<'a>(
+    pipeline: &'a mut [IROp],
+    argument: Option<&'a mut IRExpr>,
+    renames: &HashMap<String, String>,
+) {
+    if renames.is_empty() {
+        return;
     }
-    .is_some_and(|p| !p.list && matches!(p.scalar, ScalarType::String))
-}
-
-/// Resolve the overloaded `contains` keyword to its String-substring form
-/// (`StringContains`) when the left operand is a scalar String, so execution
-/// dispatches on the IR op alone and never re-derives operand types.
-///
-/// Variable bindings come from `local_bindings` (this clause list's node and
-/// edge bindings + traversal endpoints) first, then the outer `TypeContext`
-/// — negation inners never reach the outer context, while outer variables
-/// referenced inside a negation only exist there.
-fn resolve_filter_op(
-    catalog: &Catalog,
-    type_ctx: &TypeContext,
-    param_types: &HashMap<String, PropType>,
-    local_bindings: &HashMap<&str, BoundVariable>,
-    filter: &Filter,
-) -> CompOp {
-    if filter.op != CompOp::Contains {
-        return filter.op;
-    }
-    let left_is_scalar_string = match &filter.left {
-        Expr::PropAccess { variable, property } => local_bindings
-            .get(variable.as_str())
-            .or_else(|| type_ctx.bindings.get(variable))
-            .is_some_and(|binding| is_scalar_string_property(catalog, binding, property)),
-        Expr::Literal(Literal::String(_)) => true,
-        Expr::Variable(v) => param_types
-            .get(v)
-            .is_some_and(|t| !t.list && matches!(t.scalar, ScalarType::String)),
-        _ => false,
+    let rename = |variable: &mut String| {
+        if let Some(name) = renames.get(variable) {
+            *variable = name.clone();
+        }
     };
-    if left_is_scalar_string {
-        CompOp::StringContains
-    } else {
-        CompOp::Contains
+    let mut expressions: Vec<&mut IRExpr> = argument.into_iter().collect();
+    let mut pending: Vec<_> = pipeline.iter_mut().collect();
+    while let Some(op) = pending.pop() {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name: _,
+                filters,
+            } => {
+                rename(variable);
+                expressions.extend(filters);
+            }
+            IROp::Expand {
+                src_var,
+                dst_var,
+                edges: _,
+                src_type: _,
+                dst_type: _,
+                min_hops: _,
+                max_hops: _,
+                dst_filters,
+                edge_binding,
+            } => {
+                rename(src_var);
+                rename(dst_var);
+                if let Some(binding) = edge_binding {
+                    rename(binding);
+                }
+                expressions.extend(dst_filters);
+            }
+            IROp::Filter(expr) => expressions.push(expr),
+            IROp::AntiJoin {
+                outer_var,
+                inner,
+                predicate,
+            } => {
+                rename(outer_var);
+                expressions.extend(predicate.left.arg_mut());
+                expressions.push(&mut predicate.right);
+                pending.extend(inner);
+            }
+        }
+    }
+    while let Some(expr) = expressions.pop() {
+        match expr {
+            IRExpr::PropAccess {
+                variable,
+                property: _,
+                ty: _,
+            }
+            | IRExpr::Variable(variable, _) => rename(variable),
+            IRExpr::Nearest {
+                variable,
+                property: _,
+                query,
+                ty: _,
+            } => {
+                rename(variable);
+                expressions.push(query);
+            }
+            IRExpr::Search {
+                field,
+                query,
+                ty: _,
+            }
+            | IRExpr::MatchText {
+                field,
+                query,
+                ty: _,
+            }
+            | IRExpr::Bm25 {
+                field,
+                query,
+                ty: _,
+            } => expressions.extend([field.as_mut(), query.as_mut()]),
+            IRExpr::Fuzzy {
+                field,
+                query,
+                max_edits,
+                ty: _,
+            } => {
+                expressions.extend([field.as_mut(), query.as_mut()]);
+                expressions.extend(max_edits.as_deref_mut());
+            }
+            IRExpr::Rrf {
+                primary,
+                secondary,
+                k,
+                ty: _,
+            } => {
+                expressions.extend([primary.as_mut(), secondary.as_mut()]);
+                expressions.extend(k.as_deref_mut());
+            }
+            IRExpr::Aggregate {
+                func: _,
+                distinct: _,
+                arg,
+                signature: _,
+            }
+            | IRExpr::Not(arg, _)
+            | IRExpr::IsNull {
+                expr: arg,
+                negated: _,
+                ty: _,
+            }
+            | IRExpr::Cast { expr: arg, ty: _ } => expressions.push(arg),
+            IRExpr::Binary {
+                left,
+                op: _,
+                right,
+                ty: _,
+            } => expressions.extend([left.as_mut(), right.as_mut()]),
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::AliasRef(_, _) => {}
+        }
     }
 }
 
-/// Build IR filters from a binding's inline property matches.
-fn build_binding_filters(
-    binding: &Binding,
-    node_type: &crate::catalog::NodeType,
-    param_names: &HashSet<String>,
-) -> Vec<IRFilter> {
+/// Build IR filters from a binding's inline property matches: a list
+/// property matches by membership, every other by equality.
+fn build_binding_filters(binding: &CheckedBinding, ctx: &LowerCtx<'_>) -> Result<Vec<IRExpr>> {
     let mut filters = Vec::new();
-    for pm in &binding.prop_matches {
-        let prop = node_type
-            .properties
-            .get(&pm.prop_name)
-            .expect("binding property was validated during typecheck");
-        let op = if prop.list {
+    for pm in &binding.matches {
+        let op = if pm.prop_type.list {
             CompOp::Contains
         } else {
             CompOp::Eq
         };
-        let right = match &pm.value {
-            MatchValue::Literal(lit) => IRExpr::Literal(lit.clone()),
-            MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-            MatchValue::Variable(v) => {
-                if param_names.contains(v) {
-                    IRExpr::Param(v.clone())
-                } else {
-                    IRExpr::Variable(v.clone())
-                }
-            }
-        };
-        filters.push(IRFilter {
-            left: IRExpr::PropAccess {
+        filters.push(ctx.binary(
+            IRExpr::PropAccess {
                 variable: binding.variable.clone(),
-                property: pm.prop_name.clone(),
+                property: pm.property.clone(),
+                ty: ExprType::from_prop(&pm.prop_type),
             },
-            op,
-            right,
-        });
+            BinaryOp::Compare(op),
+            lower_expr(&pm.value, ctx)?,
+        )?);
     }
-    filters
+    Ok(filters)
 }
 
-fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<String> {
+/// The index of the component binding that keeps its `NodeScan`: the first one, or,
+/// when the component reaches an outer-bound variable (#763), a searched binding
+/// only, since every other binding is expanded from the outer row.
+fn scan_root(
+    inner_bindings: &[&str],
+    reaches_outer: bool,
+    searched: &HashSet<&str>,
+) -> Option<usize> {
+    if reaches_outer {
+        inner_bindings.iter().position(|var| searched.contains(var))
+    } else {
+        inner_bindings.first().map(|_| 0)
+    }
+}
+
+fn find_outer_var(clauses: &[CheckedClause], outer_bound: &HashSet<String>) -> Option<String> {
     for clause in clauses {
         match clause {
-            Clause::Traversal(t) => {
+            CheckedClause::Traversal(t) => {
                 if outer_bound.contains(&t.src) {
                     return Some(t.src.clone());
                 }
@@ -639,132 +880,189 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
                     return Some(t.dst.clone());
                 }
             }
-            Clause::Filter(f) => {
-                if let Some(v) = expr_var(&f.left)
-                    && outer_bound.contains(&v)
-                {
-                    return Some(v);
-                }
-                if let Some(v) = expr_var(&f.right)
-                    && outer_bound.contains(&v)
-                {
+            CheckedClause::Filter(f) => {
+                if let Some(v) = outer_var_in_expr(f, outer_bound) {
                     return Some(v);
                 }
             }
-            Clause::Binding(b) if outer_bound.contains(&b.variable) => {
+            CheckedClause::Binding(b) if outer_bound.contains(&b.variable) => {
                 return Some(b.variable.clone());
             }
-            _ => {}
+            CheckedClause::Binding(_) | CheckedClause::Block(_) => {}
         }
     }
     None
 }
 
-fn expr_var(expr: &Expr) -> Option<String> {
+/// The first outer-bound variable an expression's leaves read, operand by
+/// operand in written order.
+fn outer_var_in_expr(expr: &TypedExpr, outer_bound: &HashSet<String>) -> Option<String> {
     match expr {
-        Expr::Now => None,
-        Expr::PropAccess { variable, .. } => Some(variable.clone()),
-        Expr::Variable(v) => Some(v.clone()),
-        Expr::Nearest { variable, .. } => Some(variable.clone()),
-        Expr::Search { field, query } => expr_var(field).or_else(|| expr_var(query)),
-        Expr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => expr_var(field)
-            .or_else(|| expr_var(query))
-            .or_else(|| max_edits.as_deref().and_then(expr_var)),
-        Expr::MatchText { field, query } => expr_var(field).or_else(|| expr_var(query)),
-        Expr::Bm25 { field, query } => expr_var(field).or_else(|| expr_var(query)),
-        Expr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => expr_var(primary)
-            .or_else(|| expr_var(secondary))
-            .or_else(|| k.as_deref().and_then(expr_var)),
-        Expr::Aggregate { arg, .. } => expr_var(arg),
-        _ => None,
+        TypedExpr::Binary { left, right, .. }
+        | TypedExpr::In {
+            needle: left,
+            list: right,
+            ..
+        } => outer_var_in_expr(left, outer_bound).or_else(|| outer_var_in_expr(right, outer_bound)),
+        TypedExpr::Not { inner, .. } | TypedExpr::IsNull { inner, .. } => {
+            outer_var_in_expr(inner, outer_bound)
+        }
+        leaf => leaf
+            .first_variable()
+            .filter(|v| outer_bound.contains(*v))
+            .map(str::to_string),
     }
 }
 
-fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
-    match expr {
-        Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-        Expr::PropAccess { variable, property } => IRExpr::PropAccess {
-            variable: variable.clone(),
-            property: property.clone(),
+/// A rank expression in a projection or secondary order key, at the root or
+/// inside Boolean structure (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
+/// retrieval appends (`TypedExpr::score_column`); T33 required `order` to execute it.
+fn lower_projection(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
+    let mut lowered = match expr {
+        TypedExpr::Binary {
+            left, op, right, ..
+        } => ctx.binary(
+            lower_projection(left, ctx)?,
+            *op,
+            lower_projection(right, ctx)?,
+        )?,
+        TypedExpr::Not { inner, .. } => fold::not(lower_projection(inner, ctx)?),
+        TypedExpr::IsNull { inner, negated, .. } => {
+            fold::is_null(lower_projection(inner, ctx)?, *negated)
+        }
+        TypedExpr::In { needle, list, .. } => {
+            coerce::in_list(lower_projection(list, ctx)?, lower_projection(needle, ctx)?)?
+        }
+        _ => match expr.score_column() {
+            Some((variable, property)) => IRExpr::PropAccess {
+                variable: variable.to_string(),
+                property: property.to_string(),
+                ty: ExprType::from_prop(&PropType::scalar(expr.score_type(), false)),
+            },
+            None => lower_expr(expr, ctx)?,
         },
-        Expr::Nearest {
+    };
+    if let IRExpr::Literal(_, ty) = &mut lowered {
+        *ty = expr.expr_type();
+    }
+    Ok(lowered)
+}
+
+/// Lower a query meta-field to the graph's physical spelling.
+/// Bare names remain user properties.
+fn physical_property(property: &str, system_columns: SystemColumns) -> String {
+    match property {
+        EDGE_TYPE_META => EDGE_TYPE_COLUMN.to_string(),
+        name if name == SYSTEM_COLUMNS_META.id => system_columns.id.to_string(),
+        name if name == SYSTEM_COLUMNS_META.src => system_columns.src.to_string(),
+        name if name == SYSTEM_COLUMNS_META.dst => system_columns.dst.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Every expression the compiler emits lowers through here: property leaves
+/// on their physical columns (`LowerCtx::physical_column`), comparisons and
+/// Boolean nodes through `LowerCtx::binary` and `fold`.
+fn lower_expr(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
+    let lower = |expr: &TypedExpr| lower_expr(expr, ctx);
+    let mut lowered = match expr {
+        TypedExpr::Now { .. } => IRExpr::Param(NOW_PARAM_NAME.to_string(), expr.expr_type()),
+        TypedExpr::PropAccess {
+            variable, property, ..
+        } => {
+            if property == EDGE_TYPE_META
+                && let Some(BoundVariable::Edge { type_names }) = ctx.binding(variable)
+                && let [name] = type_names.as_slice()
+            {
+                return Ok(IRExpr::Literal(
+                    Literal::String(name.clone()),
+                    expr.expr_type(),
+                ));
+            }
+            IRExpr::PropAccess {
+                variable: variable.clone(),
+                property: ctx.physical_column(variable, property),
+                ty: expr.expr_type(),
+            }
+        }
+        TypedExpr::Nearest {
             variable,
             property,
             query,
+            ..
         } => IRExpr::Nearest {
             variable: variable.clone(),
             property: property.clone(),
-            query: Box::new(lower_expr(query, param_names)),
+            query: Box::new(lower(query)?),
+            ty: expr.expr_type(),
         },
-        Expr::Search { field, query } => IRExpr::Search {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+        TypedExpr::Search { field, query, .. } => IRExpr::Search {
+            field: Box::new(lower(field)?),
+            query: Box::new(lower(query)?),
+            ty: expr.expr_type(),
         },
-        Expr::Fuzzy {
+        TypedExpr::Fuzzy {
             field,
             query,
             max_edits,
+            ..
         } => IRExpr::Fuzzy {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
-            max_edits: max_edits
-                .as_ref()
-                .map(|expr| Box::new(lower_expr(expr, param_names))),
+            field: Box::new(lower(field)?),
+            query: Box::new(lower(query)?),
+            max_edits: max_edits.as_deref().map(lower).transpose()?.map(Box::new),
+            ty: expr.expr_type(),
         },
-        Expr::MatchText { field, query } => IRExpr::MatchText {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+        TypedExpr::MatchText { field, query, .. } => IRExpr::MatchText {
+            field: Box::new(lower(field)?),
+            query: Box::new(lower(query)?),
+            ty: expr.expr_type(),
         },
-        Expr::Bm25 { field, query } => IRExpr::Bm25 {
-            field: Box::new(lower_expr(field, param_names)),
-            query: Box::new(lower_expr(query, param_names)),
+        TypedExpr::Bm25 { field, query, .. } => IRExpr::Bm25 {
+            field: Box::new(lower(field)?),
+            query: Box::new(lower(query)?),
+            ty: expr.expr_type(),
         },
-        Expr::Rrf {
+        TypedExpr::Rrf {
             primary,
             secondary,
             k,
+            ..
         } => IRExpr::Rrf {
-            primary: Box::new(lower_expr(primary, param_names)),
-            secondary: Box::new(lower_expr(secondary, param_names)),
-            k: k.as_ref()
-                .map(|expr| Box::new(lower_expr(expr, param_names))),
+            primary: Box::new(lower(primary)?),
+            secondary: Box::new(lower(secondary)?),
+            k: k.as_deref().map(lower).transpose()?.map(Box::new),
+            ty: expr.expr_type(),
         },
-        Expr::Variable(v) => {
-            if param_names.contains(v) {
-                IRExpr::Param(v.clone())
-            } else {
-                IRExpr::Variable(v.clone())
+        TypedExpr::Variable { name, ty } => match ty {
+            ResolvedType::Scalar(_) => IRExpr::Param(name.clone(), expr.expr_type()),
+            ResolvedType::Node(_) | ResolvedType::Aggregate(_) | ResolvedType::ForwardAlias => {
+                IRExpr::Variable(name.clone(), expr.expr_type())
             }
-        }
-        Expr::Literal(l) => IRExpr::Literal(l.clone()),
-        Expr::Aggregate { func, arg } => IRExpr::Aggregate {
+        },
+        TypedExpr::Literal { literal, .. } => IRExpr::Literal(literal.clone(), expr.expr_type()),
+        TypedExpr::Aggregate {
+            func,
+            distinct,
+            arg,
+            signature,
+        } => IRExpr::Aggregate {
             func: *func,
-            arg: Box::new(lower_expr(arg, param_names)),
+            distinct: *distinct,
+            arg: Box::new(lower(arg)?),
+            signature: signature.clone(),
         },
-        Expr::AliasRef(name) => IRExpr::AliasRef(name.clone()),
+        TypedExpr::AliasRef { name, .. } => IRExpr::AliasRef(name.clone(), expr.expr_type()),
+        TypedExpr::Binary {
+            left, op, right, ..
+        } => ctx.binary(lower(left)?, *op, lower(right)?)?,
+        TypedExpr::Not { inner, .. } => fold::not(lower(inner)?),
+        TypedExpr::IsNull { inner, negated, .. } => fold::is_null(lower(inner)?, *negated),
+        TypedExpr::In { needle, list, .. } => coerce::in_list(lower(list)?, lower(needle)?)?,
+    };
+    if let IRExpr::Literal(_, ty) = &mut lowered {
+        *ty = expr.expr_type();
     }
-}
-
-fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExpr {
-    match value {
-        MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
-        MatchValue::Literal(l) => IRExpr::Literal(l.clone()),
-        MatchValue::Variable(v) => {
-            if param_names.contains(v) {
-                IRExpr::Param(v.clone())
-            } else {
-                IRExpr::Variable(v.clone())
-            }
-        }
-    }
+    Ok(lowered)
 }
 
 #[cfg(test)]

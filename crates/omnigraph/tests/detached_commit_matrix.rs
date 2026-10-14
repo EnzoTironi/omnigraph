@@ -1,0 +1,1208 @@
+//! The RFC 0067 failure-window matrix: writer × window × fault × recovery
+//! actor, one oracle over every cell.
+//!
+//! The windows are the seams a detached write crosses (after each table's
+//! detached effect, and before publication); the
+//! faults are an error return in this process, a process kill while parked,
+//! and a parked writer raced by a concurrent insert from this process; the
+//! recovery actors are the next write on the same handle, on a fresh handle,
+//! in another process, a cleanup, and nobody. The oracle checks the row
+//! model, no duplicate keys, every pin a detached version, the linear head
+//! never moving, every retained pin opening, no recovery
+//! sidecar, and a fresh handle agreeing with the writer's.
+//!
+//! The default run covers every writer × window × fault with the
+//! fresh-handle, read-only, and same-handle actors — same-handle is the
+//! generalized liveness check: after a failed write the writer's own live
+//! handle writes again once the fault stops, without reopening.
+//! `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors, and
+//! `OMNIGRAPH_MATRIX_WRITERS=Insert,…` narrows the writers. Seams are
+//! process-global, so every writer × window point is one serial `#[test]`,
+//! which nextest runs as its own process.
+#![cfg(feature = "failpoints")]
+
+mod helpers;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bytes::Bytes;
+use helpers::recovery::sidecar_operation_ids;
+use helpers::{
+    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load,
+    init_and_load_with_schema, mixed_params, mutate_main, read_table,
+};
+use omnigraph::BlobCell;
+use omnigraph::db::{
+    CleanupPolicyOptions, Omnigraph, PreparedSchemaApply, ReadTarget, SystemColumnUpgradeOptions,
+    SystemColumnUpgradeOutcome,
+};
+use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::loader::LoadMode;
+use omnigraph::seams::FailScenario;
+use omnigraph::seams::catalog;
+use omnigraph_core::graph_commit_id::intent_nonce;
+use serial_test::serial;
+
+const CHILD_ENV: &str = "OMNIGRAPH_RFC0067_CHILD";
+const URI_ENV: &str = "OMNIGRAPH_RFC0067_URI";
+const BARRIER_ENV: &str = "OMNIGRAPH_RFC0067_BARRIER";
+const NAME_ENV: &str = "OMNIGRAPH_RFC0067_NAME";
+/// The seam the child parks at (a catalog name) or `none`.
+const PARK_ENV: &str = "OMNIGRAPH_RFC0067_PARK";
+/// Park on the n-th crossing of that seam (1-based).
+const PARK_HIT_ENV: &str = "OMNIGRAPH_RFC0067_PARK_HIT";
+const PREPARED_SCHEMA_FILE: &str = "matrix-prepared-schema.json";
+/// What the child runs: one of the `Writer::child_op` strings (`insert`,
+/// `insert_and_friend`, `cleanup`, `ensure_indices`, `merge`, `schema_apply`,
+/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`,
+/// `blob_put`, `blob_clear`).
+const OP_ENV: &str = "OMNIGRAPH_RFC0067_OP";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Writer {
+    Insert,
+    MultiTable,
+    Cleanup,
+    /// The index writer: one detached `CreateIndex` on Person, no row change.
+    EnsureIndices,
+    /// A fast-forward merge of a branch holding one Person insert into main:
+    /// a pointer switch with no table effect, so only its pre-publish window.
+    Merge,
+    /// Schema apply evolving two tables by metadata-only commits, no row
+    /// change, the contract row published atomically: Knows renames `since`
+    /// and adds `weight` (a Project, then a Merge chained on it), and Person
+    /// adds `city` (one Merge).
+    SchemaApply,
+    /// The same evolution through an intent persisted before invocation and
+    /// deserialized by the child; recovery never reruns that original intent.
+    PreparedSchemaApply,
+    /// Optimize over a Person table with four small fragments: one detached
+    /// compaction rewrite, no row change, published with an exact CAS on the
+    /// pin it was planned from.
+    Optimize,
+    /// A two-row JSONL append through the loader's staging (the loader
+    /// crosses the same mutation seams; its fork/first-touch route is owned
+    /// by the DST load family).
+    Load,
+    /// An explicit full-text rebuild over a Person `String @index` property:
+    /// replaces the segments from rows through the index-maintenance
+    /// machinery, so it parks on the ensure-indices seams.
+    FtsRebuild,
+    /// The system-column upgrade (RFC 0040) on a graph born with the legacy
+    /// spellings: one rename-only detached Project per table, staged and
+    /// published through the schema-apply seams.
+    SystemColumnUpgrade,
+    /// A Blob put replacing Alice's `photo` by exact id: one detached upsert
+    /// of the carried row through the mutation seams.
+    BlobPut,
+    /// A Blob clear of Alice's seeded `photo`: the same single-row upsert
+    /// carrying a null value.
+    BlobClear,
+}
+
+fn photo_schema() -> String {
+    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    photo: Blob?")
+}
+
+/// The Blob cell the Blob writers replace.
+fn alice_photo() -> BlobCell {
+    helpers::node_blob_cell("Person", "Alice", "photo")
+}
+
+/// The bytes a Blob put by `name` stores.
+fn photo_bytes(name: &str) -> Bytes {
+    Bytes::from(format!("{name}-photo").into_bytes())
+}
+
+fn city_schema() -> String {
+    helpers::TEST_SCHEMA
+        .replace("age: I32?", "age: I32?\n    city: String?")
+        .replace(
+            "since: Date?",
+            "met: Date? @rename_from(\"since\")\n    weight: I32?",
+        )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Window {
+    /// After the n-th table's detached effect (1-based), before publication.
+    PostDetached(usize),
+    /// After every detached effect, before publication.
+    PrePublish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// The seam returns an error in this process.
+    Return,
+    /// A child process parks at the window and is killed there.
+    Kill,
+    /// A child process parks at the window, this process inserts a row on the
+    /// same table meanwhile, then the child is released.
+    Race,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+    SameHandle,
+    FreshHandle,
+    OtherProcess,
+    Cleanup,
+    ReadOnly,
+}
+
+impl Writer {
+    fn windows(self) -> Vec<Window> {
+        use Window::*;
+        match self {
+            Writer::Insert => vec![PostDetached(1), PrePublish],
+            Writer::MultiTable => vec![PostDetached(1), PostDetached(2), PrePublish],
+            Writer::Cleanup => vec![],
+            Writer::EnsureIndices => vec![PostDetached(1), PrePublish],
+            Writer::Merge => vec![PrePublish],
+            // Knows' Project and Merge, then Person's Merge: park inside
+            // Knows' chain, after it, and before publication.
+            Writer::SchemaApply | Writer::PreparedSchemaApply => {
+                vec![PostDetached(1), PostDetached(2), PrePublish]
+            }
+            Writer::Optimize => vec![PostDetached(1), PrePublish],
+            Writer::Load => vec![PostDetached(1), PrePublish],
+            Writer::FtsRebuild => vec![PostDetached(1), PrePublish],
+            // The upgrade stages one detached commit per table; park after
+            // the first and the second to leave a half-staged tail.
+            Writer::SystemColumnUpgrade => vec![PostDetached(1), PostDetached(2), PrePublish],
+            Writer::BlobPut | Writer::BlobClear => vec![PostDetached(1), PrePublish],
+        }
+    }
+
+    fn child_op(self) -> &'static str {
+        match self {
+            Writer::Insert => "insert",
+            Writer::MultiTable => "insert_and_friend",
+            Writer::Cleanup => "cleanup",
+            Writer::EnsureIndices => "ensure_indices",
+            Writer::Merge => "merge",
+            Writer::SchemaApply => "schema_apply",
+            Writer::PreparedSchemaApply => "prepared_schema_apply",
+            Writer::Optimize => "optimize",
+            Writer::Load => "load",
+            Writer::FtsRebuild => "fts_rebuild",
+            Writer::SystemColumnUpgrade => "system_column_upgrade",
+            Writer::BlobPut => "blob_put",
+            Writer::BlobClear => "blob_clear",
+        }
+    }
+}
+
+impl Window {
+    /// The seam and the crossing to park on or return at.
+    fn seam(self, writer: Writer) -> (&'static str, u64) {
+        let index = matches!(writer, Writer::EnsureIndices | Writer::FtsRebuild);
+        let merge = writer == Writer::Merge;
+        let schema = matches!(
+            writer,
+            Writer::SchemaApply | Writer::PreparedSchemaApply | Writer::SystemColumnUpgrade
+        );
+        let optimize = writer == Writer::Optimize;
+        match self {
+            Window::PostDetached(n) if optimize => {
+                (catalog::OPTIMIZE_POST_TABLE_EFFECT.name(), n as u64)
+            }
+            Window::PrePublish if optimize => {
+                (catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(), 1)
+            }
+            Window::PostDetached(n) if schema => {
+                (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
+            }
+            Window::PrePublish if schema => (catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.name(), 1),
+            Window::PrePublish if merge => (
+                catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+                1,
+            ),
+            Window::PostDetached(n) if index => {
+                (catalog::ENSURE_INDICES_POST_TABLE_EFFECT.name(), n as u64)
+            }
+            Window::PrePublish if index => (
+                catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+                1,
+            ),
+            Window::PostDetached(n) => (catalog::MUTATION_POST_TABLE_COMMIT.name(), n as u64),
+            Window::PrePublish => (catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.name(), 1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowModel {
+    names: std::collections::BTreeSet<String>,
+    knows: usize,
+}
+
+async fn person_names(db: &Omnigraph) -> Vec<String> {
+    collect_column_strings(&read_table(db, "node:Person").await, "name")
+}
+
+async fn observe_model(db: &Omnigraph) -> (RowModel, bool) {
+    let names = person_names(db).await;
+    let unique: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+    let duplicates = unique.len() != names.len();
+    (
+        RowModel {
+            names: unique,
+            knows: count_rows(db, "edge:Knows").await,
+        },
+        duplicates,
+    )
+}
+
+async fn table_uri(db: &Omnigraph, table_key: &str) -> String {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let path = &snapshot.dataset(table_key).unwrap().dataset_path;
+    format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+async fn table_pin(db: &Omnigraph, table_key: &str) -> u64 {
+    helpers::pinned_version(db, "main", table_key).await
+}
+
+async fn linear_head(uri: &str) -> u64 {
+    helpers::open_dataset_head(uri, None)
+        .await
+        .version()
+        .version
+}
+
+/// A converging run leaves the Person pin a detached version that opens and
+/// the linear HEAD where the cell found it.
+async fn assert_pin_detached_and_head_unmoved(
+    cell: &str,
+    db: &Omnigraph,
+    person_uri: &str,
+    head_before: u64,
+) {
+    let pin = table_pin(db, "node:Person").await;
+    assert!(
+        helpers::is_detached_version(pin),
+        "{cell}: Person pin {pin} is not a detached version"
+    );
+    assert_eq!(
+        linear_head(person_uri).await,
+        head_before,
+        "{cell}: Person linear head moved"
+    );
+}
+
+async fn insert(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    mutate_main(
+        db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", name)], &[("$age", 30)]),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn insert_and_friend(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    mutate_main(
+        db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", name), ("$friend", "Alice")], &[("$age", 30)]),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The BlobPut writer's op: replace Alice's photo with `name`'s bytes.
+async fn put_photo(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    db.put_blob_at_as("main", alice_photo(), photo_bytes(name), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// The BlobClear writer's op.
+async fn clear_photo(db: &Session) -> omnigraph::error::Result<()> {
+    db.clear_blob_at_as("main", alice_photo(), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// Alice's photo, `None` when the cell is null.
+async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
+    match db
+        .read_blob_at(ReadTarget::branch("main"), alice_photo())
+        .await
+    {
+        Ok(_) => Some(
+            helpers::read_managed_blob_bytes(db, ReadTarget::branch("main"), alice_photo()).await,
+        ),
+        Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound => None,
+        Err(error) => panic!("reading Alice's photo failed: {error}"),
+    }
+}
+
+/// The Load writer's op: two fresh rows through the loader's staging.
+async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    let payload = format!(
+        "{{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_a\", \"age\": 30}}}}\n\
+         {{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_b\", \"age\": 31}}}}"
+    );
+    db.load_jsonl(&payload, LoadMode::Append).await.map(|_| ())
+}
+
+fn upgrade_execute() -> SystemColumnUpgradeOptions {
+    SystemColumnUpgradeOptions { check: false }
+}
+
+fn reclaim_everything() -> CleanupPolicyOptions {
+    CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    }
+}
+
+/// Subprocess half of the matrix: not `serial`, the parent waits for it.
+#[test]
+#[ignore = "subprocess helper; exercised by the rfc_0067_failure_window_matrix_* points"]
+fn rfc0067_matrix_child_process() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        return;
+    }
+    let uri = std::env::var(URI_ENV).unwrap();
+    let barrier = std::path::PathBuf::from(std::env::var(BARRIER_ENV).unwrap());
+    let name = std::env::var(NAME_ENV).unwrap();
+    let _scenario = FailScenario::setup();
+    let ready = barrier.join(format!("ready.{name}"));
+    let go = barrier.join("go");
+    let park_hit: usize = std::env::var(PARK_HIT_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let park_at_barrier = move || {
+        let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+        if hit != park_hit {
+            return;
+        }
+        std::fs::write(&ready, b"1").unwrap();
+        let started = std::time::Instant::now();
+        while !go.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "barrier release timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    let park = std::env::var(PARK_ENV).unwrap_or_else(|_| "none".to_string());
+    let _parked = (park != "none").then(|| {
+        catalog::decide(&park)
+            .unwrap_or_else(|| panic!("unknown seam '{park}'"))
+            .observe(park_at_barrier)
+    });
+    let op = std::env::var(OP_ENV).unwrap_or_else(|_| "insert".to_string());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+            let outcome: omnigraph::error::Result<()> = match op.as_str() {
+                "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
+                "cleanup_keep" => db
+                    .cleanup(CleanupPolicyOptions {
+                        keep_versions: Some(1),
+                        older_than: None,
+                    })
+                    .await
+                    .map(|_| ()),
+                "ensure_indices" => db.ensure_indices().await.map(|_| ()),
+                "merge" => db
+                    .branch_merge(&format!("src_{name}"), "main")
+                    .await
+                    .map(|_| ()),
+                "insert_and_friend" => insert_and_friend(&db, &name).await,
+                "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
+                "prepared_schema_apply" => {
+                    let intent: PreparedSchemaApply = serde_json::from_slice(
+                        &std::fs::read(std::path::Path::new(&uri).join(PREPARED_SCHEMA_FILE))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    db.apply_prepared_schema_as(&intent, None).await.map(|_| ())
+                }
+                "optimize" => db.optimize().await.map(|_| ()),
+                "load" => load_two(&db, &name).await,
+                "fts_rebuild" => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                "system_column_upgrade" => db
+                    .upgrade_system_columns(upgrade_execute())
+                    .await
+                    .map(|_| ()),
+                "blob_put" => put_photo(&db, &name).await,
+                "blob_clear" => clear_photo(&db).await,
+                _ => insert(&db, &name).await,
+            };
+            if let Err(error) = outcome {
+                println!("CHILD_ERR {error}");
+                std::process::exit(2);
+            }
+        });
+    println!("CHILD_OK");
+}
+
+fn spawn_child(
+    root: &str,
+    barrier: &std::path::Path,
+    name: &str,
+    op: &str,
+    park: &str,
+    hit: u64,
+) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "rfc0067_matrix_child_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(URI_ENV, root)
+        .env(BARRIER_ENV, barrier)
+        .env(NAME_ENV, name)
+        .env(PARK_ENV, park)
+        .env(PARK_HIT_ENV, hit.to_string())
+        .env(OP_ENV, op)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn finish_cleanup_child(mut child: std::process::Child) {
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "cleanup child failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(45) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("cleanup child timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// GQT cannot run another process while a branch's detached table commit is unpublished.
+#[tokio::test]
+#[serial]
+async fn cleanup_retains_live_branch_staging_until_owner_recreation() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(
+        Omnigraph::init(&root, "node Person { name: String @key age: I32? }\n")
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    let person_uri = table_uri(&db, "node:Person").await;
+    let child_root = root.clone();
+    let child_barrier = dir.path().to_path_buf();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let observer_hits = hits.clone();
+    let seam = catalog::MUTATION_POST_TABLE_COMMIT.observe(move || {
+        observer_hits.fetch_add(1, Ordering::SeqCst);
+        finish_cleanup_child(spawn_child(
+            &child_root,
+            &child_barrier,
+            "staging_cleanup",
+            "cleanup_keep",
+            "none",
+            1,
+        ));
+    });
+    let outcome = db
+        .load_as(
+            "feature",
+            None,
+            r#"{"type":"Person","data":{"name":"Grace","age":37}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await;
+    drop(seam);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    outcome.expect("cleanup must preserve the unpublished branch staging");
+    drop(db);
+
+    let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+    let snapshot = fresh
+        .snapshot_of(ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let entry = snapshot.dataset("node:Person").unwrap();
+    assert_eq!(entry.native_dataset_branch, None);
+    assert_eq!(
+        entry.dataset_path,
+        fresh
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .dataset_path,
+        "the branch write stages on the inherited location"
+    );
+    let former_pin = helpers::pinned_version(&fresh, "feature", "node:Person").await;
+    assert!(helpers::is_detached_version(former_pin), "{former_pin}");
+    assert_eq!(
+        snapshot
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        2,
+    );
+    drop(snapshot);
+    fresh.branch_delete("feature").await.unwrap();
+    fresh.branch_create("feature").await.unwrap();
+    finish_cleanup_child(spawn_child(
+        &root,
+        dir.path(),
+        "recreated_owner_cleanup",
+        "cleanup_keep",
+        "none",
+        1,
+    ));
+    assert!(
+        !helpers::collector::detached_versions(&person_uri)
+            .await
+            .contains(&former_pin),
+        "a recreated logical owner must not retain its predecessor's pin",
+    );
+    let reopened = helpers::session(Omnigraph::open(&root).await.unwrap());
+    assert_eq!(
+        reopened
+            .snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .open_dataset("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        1,
+    );
+}
+
+/// Run one cell; returns a one-line report. Panics with the cell named on
+/// any oracle violation.
+async fn run_cell(
+    index: usize,
+    writer: Writer,
+    window: Window,
+    fault: Fault,
+    recovery: Recovery,
+) -> String {
+    let cell = format!("cell {index}: {writer:?} {window:?} {fault:?} {recovery:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    // The upgrade writer needs a graph born with the legacy system-column
+    // spellings; every other writer starts from the standard fixture.
+    let db = if writer == Writer::SystemColumnUpgrade {
+        let db = helpers::session(
+            Omnigraph::init_with_legacy_system_columns_for_tests(&root, helpers::TEST_SCHEMA)
+                .await
+                .unwrap(),
+        );
+        db.load_jsonl(helpers::TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db
+    } else if matches!(writer, Writer::BlobPut | Writer::BlobClear) {
+        init_and_load_with_schema(&dir, &photo_schema()).await
+    } else {
+        init_and_load(&dir).await
+    };
+    let person_uri = table_uri(&db, "node:Person").await;
+    let knows_uri = table_uri(&db, "edge:Knows").await;
+    let write_name = format!("m{index}_w");
+
+    // An index cell needs index work: a declared BTREE the schema apply
+    // records and leaves unbuilt.
+    if writer == Writer::EnsureIndices {
+        db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+            .await
+            .unwrap();
+    }
+    // A merge cell merges a branch that holds the row under test.
+    if writer == Writer::Merge {
+        let branch = format!("src_{write_name}");
+        db.branch_create(&branch).await.unwrap();
+        db.mutate(
+            &branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", write_name.as_str())], &[("$age", 30)]),
+        )
+        .await
+        .unwrap();
+    }
+    // An optimize cell needs compaction work: three more single-row commits
+    // leave Person with four small fragments.
+    if writer == Writer::Optimize {
+        for seed in 0..3 {
+            insert(&db, &format!("m{index}_seed{seed}")).await.unwrap();
+        }
+    }
+    // A full-text rebuild cell needs a built full-text index with rows
+    // behind it: a `String @index` Person property, one row carrying text,
+    // and the initial build.
+    if writer == Writer::FtsRebuild {
+        db.apply_schema(
+            &helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String? @index"),
+        )
+        .await
+        .unwrap();
+        db.load_jsonl(
+            &format!(
+                "{{\"type\": \"Person\", \"data\": {{\"name\": \"m{index}_fts\", \"city\": \"machine learning\"}}}}"
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+        db.ensure_indices().await.unwrap();
+    }
+    // A clear cell clears a photo a put stored first.
+    if writer == Writer::BlobClear {
+        put_photo(&db, &format!("m{index}_seed")).await.unwrap();
+    }
+    let blob_writer = matches!(writer, Writer::BlobPut | Writer::BlobClear);
+    let photo_before = if blob_writer {
+        observe_photo(&db).await
+    } else {
+        None
+    };
+    let (mut model, _) = observe_model(&db).await;
+    let head_before = linear_head(&person_uri).await;
+    let knows_head_before = linear_head(&knows_uri).await;
+    let prepared = if writer == Writer::PreparedSchemaApply {
+        let intent = db
+            .prepare_schema_apply_as(&city_schema(), None)
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path().join(PREPARED_SCHEMA_FILE),
+            serde_json::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        Some(intent)
+    } else {
+        None
+    };
+
+    // The writer under the fault.
+    let (seam, hit) = window.seam(writer);
+    let mut acknowledged = false;
+    let mut note = String::new();
+    match fault {
+        Fault::Return => {
+            let _fault = catalog::decide(seam).unwrap().fail_once_at(hit);
+            let outcome: omnigraph::error::Result<()> = match writer {
+                Writer::Insert => insert(&db, &write_name).await,
+                Writer::MultiTable => insert_and_friend(&db, &write_name).await,
+                Writer::Cleanup => Box::pin(db.cleanup(reclaim_everything())).await.map(|_| ()),
+                Writer::EnsureIndices => db.ensure_indices().await.map(|_| ()),
+                Writer::Merge => db
+                    .branch_merge(&format!("src_{write_name}"), "main")
+                    .await
+                    .map(|_| ()),
+                Writer::SchemaApply => db.apply_schema(&city_schema()).await.map(|_| ()),
+                Writer::PreparedSchemaApply => db
+                    .apply_prepared_schema_as(prepared.as_ref().unwrap(), None)
+                    .await
+                    .map(|_| ()),
+                Writer::Optimize => db.optimize().await.map(|_| ()),
+                Writer::Load => load_two(&db, &write_name).await,
+                Writer::FtsRebuild => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                Writer::SystemColumnUpgrade => db
+                    .upgrade_system_columns(upgrade_execute())
+                    .await
+                    .map(|_| ()),
+                Writer::BlobPut => put_photo(&db, &write_name).await,
+                Writer::BlobClear => clear_photo(&db).await,
+            };
+            acknowledged = outcome.is_ok();
+            if let Err(error) = outcome {
+                note = format!("err: {}", error.to_string().lines().next().unwrap_or(""));
+            }
+        }
+        Fault::Kill | Fault::Race => {
+            let barrier = dir.path().join(format!("barrier{index}"));
+            std::fs::create_dir_all(&barrier).unwrap();
+            let mut child = spawn_child(&root, &barrier, &write_name, writer.child_op(), seam, hit);
+            let ready = barrier.join(format!("ready.{write_name}"));
+            let started = std::time::Instant::now();
+            while !ready.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let out = child.wait_with_output().unwrap();
+                    panic!(
+                        "{cell}: child finished ({status}) before reaching the window\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(60),
+                    "{cell}: the window never fired"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            if fault == Fault::Race {
+                let race_name = format!("m{index}_race");
+                insert(&db, &race_name).await.unwrap();
+                model.names.insert(race_name);
+                std::fs::write(barrier.join("go"), b"1").unwrap();
+                let out = child.wait_with_output().unwrap();
+                acknowledged = out.status.success();
+                if matches!(
+                    writer,
+                    Writer::SchemaApply | Writer::PreparedSchemaApply | Writer::SystemColumnUpgrade
+                ) {
+                    assert!(
+                        !acknowledged,
+                        "{cell}: the schema writer must lose to the concurrent publication"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&out.stdout).contains("write authority"),
+                        "{cell}: expected a stale graph-head refusal, stdout: {}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
+
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                if let Some(err) = stdout.lines().find(|line| line.starts_with("CHILD_ERR")) {
+                    note = err.chars().take(90).collect();
+                }
+            } else {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                note = "killed".to_string();
+            }
+        }
+    }
+    let visible = acknowledged;
+    match writer {
+        Writer::Insert | Writer::Merge if visible => {
+            model.names.insert(write_name.clone());
+        }
+        Writer::MultiTable if visible => {
+            model.names.insert(write_name.clone());
+            model.knows += 1;
+        }
+        Writer::Load if visible => {
+            model.names.insert(format!("{write_name}_a"));
+            model.names.insert(format!("{write_name}_b"));
+        }
+        _ => {}
+    }
+
+    // The recovery actor.
+    let recovery_name = format!("m{index}_rec");
+    match recovery {
+        Recovery::SameHandle => {
+            insert(&db, &recovery_name).await.unwrap();
+            model.names.insert(recovery_name.clone());
+        }
+        Recovery::FreshHandle => {
+            let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+            insert(&fresh, &recovery_name).await.unwrap();
+            model.names.insert(recovery_name.clone());
+        }
+        Recovery::OtherProcess => {
+            let barrier = dir.path().join(format!("rec{index}"));
+            std::fs::create_dir_all(&barrier).unwrap();
+            let child = spawn_child(&root, &barrier, &recovery_name, "insert", "none", 1);
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{cell}: recovery write in another process failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            model.names.insert(recovery_name.clone());
+        }
+        Recovery::Cleanup => {
+            let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+            Box::pin(fresh.cleanup(reclaim_everything()))
+                .await
+                .unwrap_or_else(|error| panic!("{cell}: recovery cleanup failed: {error}"));
+        }
+        Recovery::ReadOnly => {}
+    }
+
+    // The oracle.
+    let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+    let (observed, duplicates) = observe_model(&fresh).await;
+    assert!(!duplicates, "{cell}: duplicate Person keys");
+    assert_eq!(observed, model, "{cell}: row model");
+    if matches!(writer, Writer::SchemaApply | Writer::PreparedSchemaApply) {
+        assert_eq!(
+            fresh.schema_source().contains("city: String?"),
+            visible,
+            "{cell}: the schema contract follows the publication"
+        );
+        for staging in [
+            "_schema.pg.staging",
+            "_schema.ir.json.staging",
+            "__schema_state.json.staging",
+        ] {
+            assert!(
+                !dir.path().join(staging).exists(),
+                "{cell}: the open retires {staging}"
+            );
+        }
+    }
+    if let Some(intent) = &prepared {
+        assert_eq!(
+            serde_json::from_slice::<PreparedSchemaApply>(
+                &std::fs::read(dir.path().join(PREPARED_SCHEMA_FILE)).unwrap(),
+            )
+            .unwrap(),
+            *intent,
+            "{cell}: recovery replaced the original intent"
+        );
+        assert!(
+            fresh
+                .list_commits(Some("main"))
+                .await
+                .unwrap()
+                .iter()
+                .all(|commit| {
+                    intent_nonce(&commit.graph_commit_id).ok().as_deref()
+                        != intent.graph_commit_id()
+                }),
+            "{cell}: the interrupted original was published or replayed during recovery"
+        );
+    }
+    let (same_handle, _) = observe_model(&db).await;
+    assert_eq!(
+        same_handle, model,
+        "{cell}: the writer's handle disagrees with a fresh one"
+    );
+    if blob_writer {
+        // The cell holds the written value exactly when the write was
+        // acknowledged, on a fresh handle and on the writer's own.
+        let expected = match writer {
+            Writer::BlobPut if visible => Some(photo_bytes(&write_name).to_vec()),
+            Writer::BlobClear if visible => None,
+            _ => photo_before.clone(),
+        };
+        assert_eq!(observe_photo(&fresh).await, expected, "{cell}: photo");
+        assert_eq!(
+            observe_photo(&db).await,
+            expected,
+            "{cell}: the writer's handle reads a different photo"
+        );
+    }
+    let person_pin = table_pin(&fresh, "node:Person").await;
+    let knows_pin = table_pin(&fresh, "edge:Knows").await;
+    let person_head = linear_head(&person_uri).await;
+    let knows_head = linear_head(&knows_uri).await;
+    assert!(
+        helpers::is_detached_version(person_pin),
+        "{cell}: Person pin {person_pin} is not a detached version"
+    );
+    assert!(
+        helpers::is_detached_version(knows_pin),
+        "{cell}: Knows pin {knows_pin} is not a detached version"
+    );
+    assert_eq!(person_head, head_before, "{cell}: Person linear head moved");
+    assert_eq!(
+        knows_head, knows_head_before,
+        "{cell}: Knows linear head moved"
+    );
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "{cell}: a recovery sidecar was written"
+    );
+    if writer == Writer::Optimize && recovery != Recovery::ReadOnly {
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+        for run in 1..=2 {
+            fresh.optimize().await.unwrap_or_else(|error| {
+                panic!("{cell}: optimize run {run} after recovery failed: {error}")
+            });
+            assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
+        }
+        drop(fresh);
+    }
+    if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+        fresh
+            .ensure_indices()
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: index pass after recovery failed: {error}"));
+        assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
+        fresh
+            .ensure_indices()
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: second index pass failed: {error}"));
+        drop(fresh);
+    }
+    if writer == Writer::FtsRebuild && recovery != Recovery::ReadOnly {
+        let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
+        for run in 1..=2 {
+            let rebuilt = fresh
+                .rebuild_full_text_indices_on("main")
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{cell}: full-text rebuild run {run} after recovery failed: {error}")
+                });
+            assert!(
+                rebuilt
+                    .rebuilt_indexes
+                    .iter()
+                    .any(|index| index.type_key == "node:Person" && index.property == "city"),
+                "{cell}: rebuild run {run} named no Person/city full-text index: {:?}",
+                rebuilt.rebuilt_indexes
+            );
+            assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
+        }
+        drop(fresh);
+    }
+    if writer == Writer::SystemColumnUpgrade {
+        // The check preflight names the graph's vintage: AlreadyCurrent
+        // exactly when the upgrade's publication became visible.
+        let check = fresh
+            .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
+            .await
+            .unwrap_or_else(|error| panic!("{cell}: upgrade check failed: {error}"));
+        assert_eq!(
+            check.outcome == SystemColumnUpgradeOutcome::AlreadyCurrent,
+            visible,
+            "{cell}: check outcome {:?} vs visible={visible}",
+            check.outcome
+        );
+        if recovery != Recovery::ReadOnly {
+            // Whatever the window left, a fresh execute converges to the
+            // current vintage and a second check finds nothing to do.
+            let converge = helpers::session(Omnigraph::open(&root).await.unwrap());
+            let executed = converge
+                .upgrade_system_columns(upgrade_execute())
+                .await
+                .unwrap_or_else(|error| panic!("{cell}: upgrade after recovery failed: {error}"));
+            assert!(
+                matches!(
+                    executed.outcome,
+                    SystemColumnUpgradeOutcome::Completed
+                        | SystemColumnUpgradeOutcome::AlreadyCurrent
+                ),
+                "{cell}: converging upgrade outcome {:?}",
+                executed.outcome
+            );
+            let again = converge
+                .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
+                .await
+                .unwrap_or_else(|error| panic!("{cell}: post-converge check failed: {error}"));
+            assert_eq!(
+                again.outcome,
+                SystemColumnUpgradeOutcome::AlreadyCurrent,
+                "{cell}: the converged graph must be current"
+            );
+            drop(converge);
+        }
+    }
+    format!(
+        "{cell}: ack={acknowledged} visible={visible} person pin {person_pin} head {person_head}, knows pin {knows_pin} head {knows_head} {note}"
+    )
+}
+
+impl Recovery {
+    /// A same-handle recovery after a kill or race is the parent's handle,
+    /// which never ran the writer; it applies to Return only.
+    fn applies(self, fault: Fault) -> bool {
+        self != Recovery::SameHandle || fault == Fault::Return
+    }
+}
+
+/// One matrix point, run outside libtest's 2-MiB thread: every cell chains a
+/// graph init, the faulted writer, a recovery actor and the oracle.
+fn run_point(writer: Writer, window: Window, faults: &'static [Fault]) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_matrix(writer, window, faults));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+const ALL_FAULTS: &[Fault] = &[Fault::Return, Fault::Kill, Fault::Race];
+
+/// One `#[test]` per writer × window point; `POINTS` lists them for the
+/// coverage guard.
+macro_rules! matrix_points {
+    ($($name:ident: $writer:ident, $window:expr, $faults:expr;)+) => {
+        const POINTS: &[(Writer, Window, &[Fault])] =
+            &[$((Writer::$writer, $window, $faults),)+];
+        $(
+            #[test]
+            #[serial]
+            fn $name() {
+                run_point(Writer::$writer, $window, $faults);
+            }
+        )+
+    };
+}
+
+matrix_points! {
+    rfc_0067_failure_window_matrix_insert_post_detached_1: Insert, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_insert_pre_publish: Insert, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_1: MultiTable, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_2: MultiTable, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_pre_publish: MultiTable, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_post_detached_1: EnsureIndices, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_pre_publish: EnsureIndices, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_merge_pre_publish: Merge, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_1: SchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_2: SchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_pre_publish: SchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_1: PreparedSchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_2: PreparedSchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_pre_publish: PreparedSchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_post_detached_1: Optimize, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_pre_publish: Optimize, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_post_detached_1: Load, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_pre_publish: Load, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_post_detached_1: FtsRebuild, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_pre_publish: FtsRebuild, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_1: SystemColumnUpgrade, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_2: SystemColumnUpgrade, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_pre_publish: SystemColumnUpgrade, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_put_post_detached_1: BlobPut, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_put_pre_publish: BlobPut, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_clear_post_detached_1: BlobClear, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_clear_pre_publish: BlobClear, Window::PrePublish, ALL_FAULTS;
+}
+
+/// Every window of every writer is one point of `POINTS`, each fault exactly
+/// once, so a new window or writer cannot miss the matrix.
+#[test]
+fn every_writer_window_is_a_matrix_point() {
+    let writers = [
+        Writer::Insert,
+        Writer::MultiTable,
+        Writer::Cleanup,
+        Writer::EnsureIndices,
+        Writer::Merge,
+        Writer::SchemaApply,
+        Writer::PreparedSchemaApply,
+        Writer::Optimize,
+        Writer::Load,
+        Writer::FtsRebuild,
+        Writer::SystemColumnUpgrade,
+        Writer::BlobPut,
+        Writer::BlobClear,
+    ];
+    let mut covered: Vec<(Writer, Window, Fault)> = POINTS
+        .iter()
+        .flat_map(|(writer, window, faults)| {
+            faults.iter().map(move |fault| (*writer, *window, *fault))
+        })
+        .collect();
+    let mut expected: Vec<(Writer, Window, Fault)> = writers
+        .into_iter()
+        .flat_map(|writer| {
+            writer.windows().into_iter().flat_map(move |window| {
+                ALL_FAULTS.iter().map(move |fault| (writer, window, *fault))
+            })
+        })
+        .collect();
+    covered.sort_by_key(|cell| format!("{cell:?}"));
+    expected.sort_by_key(|cell| format!("{cell:?}"));
+    assert_eq!(covered, expected);
+}
+
+async fn run_matrix(writer: Writer, window: Window, faults: &[Fault]) {
+    let _scenario = FailScenario::setup();
+    let full = std::env::var("OMNIGRAPH_MATRIX").is_ok_and(|value| value == "full");
+    // SameHandle is a DEFAULT actor: it is the generalized liveness check —
+    // the writer's own live handle must write again after the fault, without
+    // reopening. (It applies to Return cells only; after Kill/Race the
+    // parent's handle never ran the writer.)
+    let recoveries: Vec<Recovery> = if full {
+        vec![
+            Recovery::FreshHandle,
+            Recovery::ReadOnly,
+            Recovery::SameHandle,
+            Recovery::OtherProcess,
+            Recovery::Cleanup,
+        ]
+    } else {
+        vec![
+            Recovery::FreshHandle,
+            Recovery::ReadOnly,
+            Recovery::SameHandle,
+        ]
+    };
+    let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {
+        list.split(',')
+            .map(|writer| writer.trim().to_string())
+            .collect()
+    });
+    if only
+        .as_ref()
+        .is_some_and(|list| !list.iter().any(|name| *name == format!("{writer:?}")))
+    {
+        return;
+    }
+    let mut index = 0usize;
+    let mut reports = Vec::new();
+    let started = std::time::Instant::now();
+    for fault in faults {
+        for recovery in &recoveries {
+            if !recovery.applies(*fault) {
+                continue;
+            }
+            index += 1;
+            let report = Box::pin(run_cell(index, writer, window, *fault, *recovery)).await;
+            eprintln!("MATRIX {report}");
+            reports.push(report);
+        }
+    }
+    eprintln!(
+        "MATRIX SUMMARY: {writer:?} {window:?} {faults:?}: {} cells passed the oracle in {:.1}s",
+        reports.len(),
+        started.elapsed().as_secs_f64()
+    );
+}

@@ -19,6 +19,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
+use omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS;
 use omnigraph_compiler::types::{PropType, ScalarType};
 
 /// One loaded stored query. `source` is the full `.gq` file text — the
@@ -84,6 +85,7 @@ pub struct LoadError {
     /// The offending query name, when the failure is entry-scoped.
     pub query: Option<String>,
     pub message: String,
+    pub diagnostic: Option<Box<omnigraph_compiler::QueryDiagnostic>>,
 }
 
 impl std::fmt::Display for LoadError {
@@ -105,8 +107,26 @@ impl QueryRegistry {
         let mut errors = Vec::new();
 
         for spec in specs {
-            match parse_query(&spec.source) {
-                Ok(file) => match file.queries.into_iter().find(|q| q.name == spec.name) {
+            let declarations = parse_query(&spec.source)
+                .map_err(|err| LoadError {
+                    query: Some(spec.name.clone()),
+                    message: err.to_string(),
+                    diagnostic: err.diagnostic().cloned().map(Box::new),
+                })
+                .and_then(|file| {
+                    if file.settings.is_empty() {
+                        file.into_declarations()
+                    } else {
+                        Err(STORED_QUERY_CARRIES_NO_SETTINGS.to_string())
+                    }
+                    .map_err(|message| LoadError {
+                        query: Some(spec.name.clone()),
+                        message,
+                        diagnostic: None,
+                    })
+                });
+            match declarations {
+                Ok(queries) => match queries.into_iter().find(|q| q.name == spec.name) {
                     Some(decl) => {
                         by_name.insert(
                             spec.name.clone(),
@@ -126,12 +146,10 @@ impl QueryRegistry {
                                  (the registry key must match the query symbol)",
                             spec.name
                         ),
+                        diagnostic: None,
                     }),
                 },
-                Err(err) => errors.push(LoadError {
-                    query: Some(spec.name),
-                    message: format!("parse error: {err}"),
-                }),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -153,6 +171,7 @@ impl QueryRegistry {
                         message: format!(
                             "MCP tool name '{tool}' already claimed by exposed query '{winner}'"
                         ),
+                        diagnostic: None,
                     });
                 }
             }
@@ -191,6 +210,9 @@ impl QueryRegistry {
 pub struct Breakage {
     pub query: String,
     pub message: String,
+    /// The compiler's diagnostic (code, stage, expectation, fix) behind the
+    /// message, when the refusal carries one.
+    pub diagnostic: Option<omnigraph_compiler::QueryDiagnostic>,
 }
 
 /// A non-blocking advisory found during validation. Logged at boot;
@@ -244,6 +266,7 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
             report.breakages.push(Breakage {
                 query: query.name.clone(),
                 message: err.to_string(),
+                diagnostic: err.diagnostic().cloned(),
             });
         }
         if query.expose {
@@ -421,11 +444,34 @@ mod tests {
 
     #[test]
     fn parse_error_surfaces_per_entry() {
-        let errors =
-            QueryRegistry::from_specs(vec![spec("broken", "query broken( {{ not valid", false)])
-                .unwrap_err();
+        let source = "query broken { match { $u: User } return { $u.name } }";
+        let errors = QueryRegistry::from_specs(vec![spec("broken", source, false)]).unwrap_err();
         assert_eq!(errors[0].query.as_deref(), Some("broken"));
-        assert!(errors[0].message.contains("parse error"));
+        let message = &errors[0].message;
+        assert!(message.starts_with("parse error: "), "{message}");
+        assert_eq!(message.matches("parse error:").count(), 1, "{message}");
+        let diagnostic = errors[0].diagnostic.as_deref().unwrap();
+        assert_eq!(
+            diagnostic,
+            parse_query(source).unwrap_err().diagnostic().unwrap()
+        );
+        assert_eq!(diagnostic.code.as_str(), "Q002");
+        assert_eq!(
+            diagnostic.suggestion.as_ref().unwrap().edits[0].replacement,
+            "()"
+        );
+    }
+
+    #[test]
+    fn branch_statement_is_refused_per_entry() {
+        let errors =
+            QueryRegistry::from_specs(vec![spec("b0", "branch create b0", false)]).unwrap_err();
+        assert_eq!(errors[0].query.as_deref(), Some("b0"));
+        assert!(
+            errors[0].message.contains("branch statement"),
+            "{}",
+            errors[0].message
+        );
     }
 
     #[test]

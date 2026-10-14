@@ -23,6 +23,13 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
+    /// Publish an unpublished graph commit onto its recorded target branch
+    /// (`commit publish "<id>"`). Target-branch scoped like `branch_merge`:
+    /// the scope is the branch the commit lands on.
+    CommitPublish,
+    /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
+    /// scoped: the branch the proposal would have landed on.
+    CommitDrop,
     /// Reserved for **policy-management** surfaces. Per MR-724 Option A,
     /// this gates operator actions like hot-reloading policy / tokens
     /// (MR-726), querying the audit log (MR-732), and listing /
@@ -71,6 +78,10 @@ pub enum PolicyAction {
     /// is double-gated: `invoke_query` to reach the tool, plus `change` for
     /// the write itself.
     InvokeQuery,
+    /// Change the cluster's configuration, including policy membership,
+    /// graph creation, and the initial schema of a newly created graph.
+    /// Existing graph schema changes additionally require `schema_apply`.
+    ConfigManage,
 }
 
 impl PolicyAction {
@@ -83,9 +94,12 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
+            Self::CommitPublish => "commit_publish",
+            Self::CommitDrop => "commit_drop",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
+            Self::ConfigManage => "config_manage",
         }
     }
 
@@ -96,7 +110,12 @@ impl PolicyAction {
     fn uses_target_branch_scope(self) -> bool {
         matches!(
             self,
-            Self::BranchCreate | Self::SchemaApply | Self::BranchDelete | Self::BranchMerge
+            Self::BranchCreate
+                | Self::SchemaApply
+                | Self::BranchDelete
+                | Self::BranchMerge
+                | Self::CommitPublish
+                | Self::CommitDrop
         )
     }
 
@@ -108,6 +127,7 @@ impl PolicyAction {
     pub fn resource_kind(self) -> PolicyResourceKind {
         match self {
             Self::GraphList => PolicyResourceKind::Server,
+            Self::ConfigManage => PolicyResourceKind::Cluster,
             Self::Read
             | Self::Export
             | Self::Change
@@ -115,6 +135,8 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
+            | Self::CommitPublish
+            | Self::CommitDrop
             | Self::Admin
             | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
@@ -130,6 +152,8 @@ pub enum PolicyResourceKind {
     Graph,
     /// `Omnigraph::Server::"root"` — management actions.
     Server,
+    /// `Omnigraph::Cluster::"root"` — applied cluster configuration.
+    Cluster,
 }
 
 /// Which kind of policy file the caller is loading. Drives the
@@ -150,6 +174,9 @@ pub enum PolicyEngineKind {
     /// actions whose `resource_kind()` is `PolicyResourceKind::Server`
     /// are allowed.
     Server,
+    /// The cluster-bound bundle: cluster configuration and server inventory
+    /// rules, each still bound to its own resource kind.
+    Cluster,
 }
 
 impl fmt::Display for PolicyAction {
@@ -170,9 +197,12 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
+            "commit_publish" => Ok(Self::CommitPublish),
+            "commit_drop" => Ok(Self::CommitDrop),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
+            "config_manage" => Ok(Self::ConfigManage),
             other => bail!("unknown policy action '{other}'"),
         }
     }
@@ -290,7 +320,7 @@ impl PolicyConfig {
     /// `load` for callers whose policies don't live on the local filesystem
     /// (e.g. a cluster catalog on object storage).
     pub fn from_source(source: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(source)?;
+        let config: Self = yaml_serde::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
@@ -375,16 +405,24 @@ impl PolicyConfig {
             // a specific resource kind).
             let mut server_scoped = false;
             let mut graph_scoped = false;
+            let mut cluster_scoped = false;
             for action in &rule.allow.actions {
                 match action.resource_kind() {
                     PolicyResourceKind::Server => server_scoped = true,
                     PolicyResourceKind::Graph => graph_scoped = true,
+                    PolicyResourceKind::Cluster => cluster_scoped = true,
                 }
             }
             if server_scoped && graph_scoped {
                 bail!(
                     "policy rule '{}' mixes the server-scoped action `graph_list` \
                      with per-graph actions; split into separate rules",
+                    rule.id
+                );
+            }
+            if cluster_scoped && (graph_scoped || server_scoped) {
+                bail!(
+                    "policy rule '{}' mixes cluster configuration actions with other resource kinds; split into separate rules",
                     rule.id
                 );
             }
@@ -405,7 +443,7 @@ impl PolicyConfig {
 
 impl PolicyTestConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        let config: Self = yaml_serde::from_str(&fs::read_to_string(path)?)?;
         if config.version != 1 {
             bail!("policy test version must be 1");
         }
@@ -507,6 +545,18 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, SERVER_RESOURCE_ID)
     }
 
+    /// Load the bundle bound to `cluster` in cluster configuration.
+    /// Configuration and server-inventory actions use distinct Cedar resources.
+    pub fn load_cluster(path: &Path) -> Result<Self> {
+        Self::load_cluster_from_source(&fs::read_to_string(path)?)
+    }
+
+    pub fn load_cluster_from_source(source: &str) -> Result<Self> {
+        let config = PolicyConfig::from_source(source)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Cluster)?;
+        PolicyCompiler::compile(&config, CLUSTER_RESOURCE_ID)
+    }
+
     /// Evaluate a request. `actor_id` is supplied as a separate
     /// argument (not inside `PolicyRequest`) so the type system enforces
     /// the "server-authoritative actor identity" invariant — clients
@@ -532,6 +582,7 @@ impl PolicyEngine {
         let resource = match request.action.resource_kind() {
             PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
             PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
+            PolicyResourceKind::Cluster => entity_uid("Cluster", CLUSTER_RESOURCE_ID)?,
         };
         let context_value = json!({
             "has_branch": request.branch.is_some(),
@@ -643,16 +694,21 @@ impl PolicyEngine {
 /// a server file fails at load time instead of compiling cleanly
 /// and never matching a request.
 fn validate_kind_alignment(config: &PolicyConfig, kind: PolicyEngineKind) -> Result<()> {
-    let required = match kind {
-        PolicyEngineKind::Graph => PolicyResourceKind::Graph,
-        PolicyEngineKind::Server => PolicyResourceKind::Server,
-    };
     for rule in &config.rules {
         for action in &rule.allow.actions {
-            if action.resource_kind() != required {
+            let allowed = match kind {
+                PolicyEngineKind::Graph => action.resource_kind() == PolicyResourceKind::Graph,
+                PolicyEngineKind::Server => action.resource_kind() == PolicyResourceKind::Server,
+                PolicyEngineKind::Cluster => matches!(
+                    action.resource_kind(),
+                    PolicyResourceKind::Cluster | PolicyResourceKind::Server
+                ),
+            };
+            if !allowed {
                 let (got, expected_file) = match action.resource_kind() {
                     PolicyResourceKind::Server => ("server-scoped", "server policy file"),
                     PolicyResourceKind::Graph => ("per-graph", "per-graph policy file"),
+                    PolicyResourceKind::Cluster => ("cluster-scoped", "cluster policy file"),
                 };
                 bail!(
                     "policy rule '{}' uses {} action '{}' in a {:?} policy file; \
@@ -731,6 +787,17 @@ fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> R
             HashSet::<EntityUid>::new(),
         )?);
     }
+    if config
+        .rules
+        .iter()
+        .any(|rule| rule.allow.actions.contains(&PolicyAction::ConfigManage))
+    {
+        entities.push(Entity::new(
+            entity_uid("Cluster", CLUSTER_RESOURCE_ID)?,
+            HashMap::new(),
+            HashSet::<EntityUid>::new(),
+        )?);
+    }
 
     Ok(Entities::from_entities(entities, Some(schema))?)
 }
@@ -780,6 +847,9 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
         }
         PolicyResourceKind::Server => {
             format!("Omnigraph::Server::{}", cedar_literal(SERVER_RESOURCE_ID))
+        }
+        PolicyResourceKind::Cluster => {
+            format!("Omnigraph::Cluster::{}", cedar_literal(CLUSTER_RESOURCE_ID))
         }
     };
 
@@ -841,6 +911,7 @@ namespace Omnigraph {
     entity Group;
     entity Graph;
     entity Server;
+    entity Cluster;
 
     action "read" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "export" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
@@ -849,10 +920,13 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
     action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
+    action "config_manage" appliesTo { principal: Actor, resource: Cluster, context: RequestContext };
 }
 "#
 }
@@ -861,6 +935,7 @@ namespace Omnigraph {
 /// (the running server); the id is fixed at `"root"` so Cedar rules can
 /// reference it unambiguously: `resource == Omnigraph::Server::"root"`.
 const SERVER_RESOURCE_ID: &str = "root";
+const CLUSTER_RESOURCE_ID: &str = "root";
 
 fn entity_uid(entity_type: &str, id: &str) -> Result<EntityUid> {
     let typename = EntityTypeName::from_str(&format!("Omnigraph::{entity_type}"))?;
@@ -1096,12 +1171,12 @@ rules:
     }
     use super::{
         PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
-        PolicyTestCase, PolicyTestConfig,
+        PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
     fn rejects_duplicate_rule_ids() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1127,7 +1202,7 @@ rules:
 
     #[test]
     fn rejects_unknown_group_references() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1148,7 +1223,7 @@ rules:
 
     #[test]
     fn rejects_invalid_scope_action_combinations() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1169,7 +1244,7 @@ rules:
 
     #[test]
     fn compiles_and_authorizes_branch_and_target_rules() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1238,7 +1313,7 @@ rules:
 
     #[test]
     fn policy_tests_enforce_expected_outcomes() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1281,7 +1356,7 @@ rules:
 
     #[test]
     fn schema_apply_uses_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1323,11 +1398,74 @@ rules:
         assert!(!deny.allowed);
     }
 
+    #[test]
+    fn commit_publish_and_drop_use_target_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: reviewers-publish
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        for action in [PolicyAction::CommitPublish, PolicyAction::CommitDrop] {
+            let allow = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("main".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(allow.allowed, "{action:?} onto main");
+
+            let deny = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("feature".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(!deny.allowed, "{action:?} onto feature");
+        }
+
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+rules:
+  - id: bad
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish]
+      branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let err = branch_scoped.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported action"));
+    }
+
     // ─── MR-668 — server-scoped action (graph_list) ─
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1377,7 +1515,7 @@ rules:
 
     #[test]
     fn invoke_query_authorizes_per_graph() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1428,7 +1566,7 @@ rules:
         // invoke_query is graph-scoped (like admin) — per-branch access is
         // enforced by the inner read/change gate — so a rule that puts a
         // `branch_scope` qualifier on it is rejected at validate().
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1451,7 +1589,7 @@ rules:
 
     #[test]
     fn server_scoped_rule_cannot_use_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1478,7 +1616,7 @@ rules:
         // A single rule must reference exactly one resource kind.
         // `graph_list` (Server) + `read` (Graph) in one allow block
         // is invalid — operators must split the rule.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1506,7 +1644,7 @@ rules:
         // as before, even when the compiled-in schema now declares
         // `Server` + `graph_*` actions. This pins the "Cedar refactor
         // is operator-invisible" promise.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1673,5 +1811,82 @@ rules:
             )
             .unwrap();
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn config_manage_is_explicit_cluster_authority_not_graph_admin() {
+        let source = r#"
+version: 1
+groups:
+  owners: [principal:owner]
+  readers: [principal:reader]
+rules:
+  - id: manage-configuration
+    allow:
+      actors: {group: owners}
+      actions: [config_manage]
+  - id: inspect-registry
+    allow:
+      actors: {group: readers}
+      actions: [graph_list]
+"#;
+        let policy = PolicyEngine::load_cluster_from_source(source).unwrap();
+        let request = |action| PolicyRequest {
+            action,
+            branch: None,
+            target_branch: None,
+        };
+        assert!(
+            policy
+                .authorize("principal:owner", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !policy
+                .authorize("principal:reader", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !policy
+                .authorize("principal:unknown", &request(PolicyAction::ConfigManage))
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            policy
+                .authorize("principal:reader", &request(PolicyAction::GraphList))
+                .unwrap()
+                .allowed
+        );
+        assert!(PolicyEngine::load_server_from_source(source).is_err());
+        assert!(PolicyEngine::load_graph_from_source(source, "graph").is_err());
+        assert_eq!(
+            PolicyAction::ConfigManage.resource_kind(),
+            PolicyResourceKind::Cluster
+        );
+        assert_eq!(
+            PolicyAction::Admin.resource_kind(),
+            PolicyResourceKind::Graph
+        );
+        assert_eq!(
+            "config_manage".parse::<PolicyAction>().unwrap(),
+            PolicyAction::ConfigManage
+        );
+        for scope in ["branch_scope", "target_branch_scope"] {
+            let scoped = source.replace(
+                "actions: [config_manage]",
+                &format!("actions: [config_manage]\n      {scope}: any"),
+            );
+            assert!(PolicyEngine::load_cluster_from_source(&scoped).is_err());
+        }
+        for action in ["read", "graph_list"] {
+            let mixed = source.replace(
+                "actions: [config_manage]",
+                &format!("actions: [config_manage, {action}]"),
+            );
+            assert!(PolicyEngine::load_cluster_from_source(&mixed).is_err());
+        }
     }
 }

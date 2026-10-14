@@ -7,9 +7,8 @@ use crate::schema::ast::{Annotation, Constraint};
 use crate::types::PropType;
 
 use super::schema_ir::{
-    ACTOR_TYPE_NAME, ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR,
-    PropertyRefIR, SchemaIR, StablePropertyId, StableTypeId, TableIncarnationId,
-    constraint_from_ir, validate_schema_ir,
+    ConstraintIR, EdgeIR, EmbedSourceIR, InterfaceIR, NodeIR, PropertyIR, PropertyRefIR, SchemaIR,
+    StablePropertyId, StableTypeId, TableIncarnationId, constraint_from_ir, validate_schema_ir,
 };
 use super::schema_shape::PropertyConstraintShape;
 
@@ -21,29 +20,6 @@ pub enum SchemaTypeKind {
     Edge,
 }
 
-/// How a drop step interacts with data.
-///
-/// - **`Soft`** — catalog tombstone only. The type / property is hidden
-///   from queries but the underlying Lance column / dataset is retained
-///   on disk. Reversible via `omnigraph schema unhide` (forthcoming).
-///   Tier: `safe`.
-/// - **`Hard`** — actual data removal. The Lance column is rewritten
-///   without the property, or the Lance dataset is dropped. Irreversible
-///   short of branch / snapshot restore. Tier: `destructive`; requires
-///   `--allow-data-loss` to apply.
-///
-/// The planner emits `Soft` by default; `--allow-data-loss` on the apply
-/// CLI promotes drops to `Hard`. This is the dimension orthogonal to
-/// `SafetyTier` from the schema-lint chassis (`crate::lint`): tier
-/// describes the rule's class; mode describes the operator's intent for
-/// data treatment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DropMode {
-    Soft,
-    Hard,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaMigrationPlan {
     pub supported: bool,
@@ -53,8 +29,6 @@ pub struct SchemaMigrationPlan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SchemaMigrationStep {
-    /// Change automatic materialization while retaining the protected table.
-    SetActorProvenance { enabled: bool },
     AddType {
         type_kind: SchemaTypeKind,
         name: String,
@@ -114,27 +88,24 @@ pub enum SchemaMigrationStep {
         property_name: String,
         annotations: Vec<Annotation>,
     },
-    /// Remove a node or edge type. Soft mode tombstones in the catalog
-    /// and retains data on disk; Hard mode drops the Lance dataset and
-    /// requires `--allow-data-loss`.
+    /// Remove a node or edge type by tombstoning its table in the catalog.
     ///
-    /// The planner emits Soft mode; apply promotes it to Hard mode when
-    /// the caller explicitly allows data loss.
+    /// Apply reclaims nothing: older graph commits keep reading the dropped
+    /// type until `omnigraph cleanup` stops retaining them, and after that
+    /// its data cannot be recovered.
     DropType {
         type_kind: SchemaTypeKind,
         name: String,
-        mode: DropMode,
     },
-    /// Remove a property from an existing type. Soft mode tombstones
-    /// the property in the catalog and retains the Lance column; Hard
-    /// mode rewrites the column out and requires `--allow-data-loss`.
-    ///
-    /// Dormant in this commit.
+    /// Remove a property from an existing type: a metadata-only commit takes
+    /// the column out of the table's schema and rewrites no row. Its values
+    /// stay in the existing data files until a compaction rewrites them, and
+    /// older graph commits read it until `omnigraph cleanup` stops retaining
+    /// them.
     DropProperty {
         type_kind: SchemaTypeKind,
         type_name: String,
         property_name: String,
-        mode: DropMode,
     },
     UnsupportedChange {
         entity: String,
@@ -199,17 +170,20 @@ pub fn plan_schema_migration(
         .into());
     }
     validate_evolution_identity(accepted, desired)?;
-    let mut steps = Vec::new();
-    if accepted.actor_provenance != desired.actor_provenance
-        && let Some(binding) = &desired.actor_provenance
-    {
-        steps.push(SchemaMigrationStep::SetActorProvenance {
-            enabled: binding.enabled,
-        });
+    let system_columns = accepted.system_columns();
+    if desired.system_columns() != system_columns {
+        return Err(crate::error::SchemaIdentityError::Resolution(format!(
+            "migration planning requires matching system column spellings (accepted {}, desired {}); \
+             the vintage never changes under evolution",
+            system_columns.id,
+            desired.system_columns().id
+        ))
+        .into());
     }
+    let mut steps = Vec::new();
     plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
-    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps);
-    plan_edges(&accepted.edges, &desired.edges, &mut steps);
+    plan_nodes(&accepted.nodes, &desired.nodes, &mut steps, system_columns);
+    plan_edges(&accepted.edges, &desired.edges, &mut steps, system_columns);
 
     if steps.is_empty() && accepted != desired {
         steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -230,38 +204,6 @@ pub fn plan_schema_migration(
 fn validate_evolution_identity(accepted: &SchemaIR, desired: &SchemaIR) -> Result<()> {
     use crate::error::SchemaIdentityError;
 
-    if let Some(previous) = &accepted.actor_provenance {
-        let Some(next) = &desired.actor_provenance else {
-            return Err(SchemaIdentityError::Resolution(
-                "protected actor binding cannot be removed".to_string(),
-            )
-            .into());
-        };
-        if previous.type_id != next.type_id
-            || previous.table_incarnation_id != next.table_incarnation_id
-            || previous.actor_id_property_id != next.actor_id_property_id
-        {
-            return Err(SchemaIdentityError::Resolution(
-                "protected actor binding cannot change identity".to_string(),
-            )
-            .into());
-        }
-    } else if let Some(binding) = &desired.actor_provenance
-        && (binding.type_id.get() < accepted.next_identity_id
-            || accepted
-                .interfaces
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .chain(accepted.nodes.iter().map(|entry| entry.name.as_str()))
-                .chain(accepted.edges.iter().map(|entry| entry.name.as_str()))
-                .any(|name| name == ACTOR_TYPE_NAME))
-    {
-        return Err(SchemaIdentityError::Resolution(
-            "a new actor binding cannot adopt an existing identity or unbound OmniActor declaration"
-                .to_string(),
-        )
-        .into());
-    }
     if desired.next_identity_id < accepted.next_identity_id {
         return Err(SchemaIdentityError::Resolution(format!(
             "desired next_identity_id {} regresses accepted high-water mark {}",
@@ -451,7 +393,12 @@ fn plan_interfaces(
     }
 }
 
-fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_nodes(
+    accepted: &[NodeIR],
+    desired: &[NodeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|node| (node.type_id, node))
@@ -517,6 +464,7 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &node.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -524,22 +472,22 @@ fn plan_nodes(accepted: &[NodeIR], desired: &[NodeIR], steps: &mut Vec<SchemaMig
         .iter()
         .filter(|node| !consumed.contains(&node.type_id))
     {
-        // Node type removed from the desired schema: emit Soft mode.
-        // Soft removes the table's entry from the current
-        // __manifest version; data files retained; previous manifest
-        // versions still reference the table, so Lance time travel
-        // restores it until cleanup_old_versions ages out the older
-        // __manifest entries. Apply promotes the step to Hard mode when
-        // --allow-data-loss is set.
+        // Node type removed from the desired schema. Apply removes the
+        // table's entry from the current __manifest version; retention is
+        // stated on `SchemaMigrationStep::DropType`.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Node,
             name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
 
-fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMigrationStep>) {
+fn plan_edges(
+    accepted: &[EdgeIR],
+    desired: &[EdgeIR],
+    steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
+) {
     let accepted_by_id = accepted
         .iter()
         .map(|edge| (edge.type_id, edge))
@@ -607,6 +555,7 @@ fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMig
             &existing.constraints,
             &edge.constraints,
             steps,
+            system_columns,
         );
     }
 
@@ -614,14 +563,11 @@ fn plan_edges(accepted: &[EdgeIR], desired: &[EdgeIR], steps: &mut Vec<SchemaMig
         .iter()
         .filter(|edge| !consumed.contains(&edge.type_id))
     {
-        // Edge type removed from the desired schema: emit Soft mode.
-        // The mechanics match node-type drops: the manifest
-        // entry tombstoned, data files retained, reversible via Lance
-        // time travel until cleanup.
+        // Edge type removed from the desired schema. The mechanics match
+        // node-type drops.
         steps.push(SchemaMigrationStep::DropType {
             type_kind: SchemaTypeKind::Edge,
             name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
@@ -772,20 +718,14 @@ fn plan_properties(
         .iter()
         .filter(|property| !consumed.contains(&property.property_id))
     {
-        // Property removed from the desired schema: emit Soft mode.
-        // Soft mode reuses the existing
-        // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
-        // iterates target_schema.fields(), so the dropped column is
-        // naturally projected away. The prior Lance version retains
-        // the column until cleanup_old_versions runs, matching the
-        // OG-DS-104 destructive-tier expectation that data remains
-        // recoverable via time travel until cleanup. Apply promotes the
-        // step to Hard mode when --allow-data-loss is set.
+        // Property removed from the desired schema. Apply drops the column
+        // from the table's schema by a metadata-only commit. Retention, which
+        // the OG-DS-104 destructive tier expects, is stated on
+        // `SchemaMigrationStep::DropProperty`.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
             type_name: type_name.to_string(),
             property_name: leftover.name.clone(),
-            mode: DropMode::Soft,
         });
     }
 }
@@ -880,6 +820,7 @@ fn plan_constraints(
     accepted: &[ConstraintIR],
     desired: &[ConstraintIR],
     steps: &mut Vec<SchemaMigrationStep>,
+    system_columns: super::schema_ir::SystemColumns,
 ) {
     let desired_map = desired
         .iter()
@@ -917,7 +858,7 @@ fn plan_constraints(
                 let step = SchemaMigrationStep::AddConstraint {
                     type_kind,
                     type_name: type_name.to_string(),
-                    constraint: constraint_from_ir(&constraint),
+                    constraint: constraint_from_ir(&constraint, system_columns),
                 };
                 if !steps.contains(&step) {
                     steps.push(step);
@@ -927,7 +868,8 @@ fn plan_constraints(
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), type_name),
                 reason: format!(
                     "adding constraint '{}' to '{}' is not supported in schema migration v1",
-                    key, type_name
+                    constraint_from_ir(&constraint, system_columns),
+                    type_name
                 ),
                 code: None,
             }),
@@ -1218,6 +1160,121 @@ node Ticket {
         );
     }
 
+    /// A legacy-vintage accepted IR, built the way `Omnigraph::init` builds
+    /// one: an empty accept stripped of `system-columns`, then resolved.
+    fn legacy_ir(source: &str) -> crate::catalog::schema_ir::SchemaIR {
+        let empty = compile_schema_shape(&parse_schema("").unwrap()).unwrap();
+        let accepted = crate::catalog::schema_ir::into_legacy_vintage(
+            initialize_schema_ir(
+                SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+                &empty,
+            )
+            .unwrap()
+            .schema_ir,
+        );
+        evolve(&accepted, source)
+    }
+
+    const LEGACY_KEYED: &str = r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#;
+
+    /// Legacy graphs keyed on main carry ir_version 4 and no names; evolution
+    /// re-stamps them 5 + `edge-keys`, and gaining or losing edge keys moves
+    /// 2 ↔ 5 within one vintage.
+    #[test]
+    fn plan_evolves_legacy_graphs_across_the_feature_number() {
+        let mut accepted = legacy_ir(LEGACY_KEYED);
+        accepted.features.clear();
+        accepted.ir_version = crate::catalog::schema_ir::SCHEMA_IR_VERSION_EDGE_KEYS;
+        validate_schema_ir(&accepted).unwrap();
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person { name: String @key extra: String? }
+edge Knows: Person -> Person {
+    @key(@src, @dst)
+}
+"#,
+        );
+        assert_eq!(
+            desired.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        assert_eq!(desired.system_columns(), accepted.system_columns());
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            AddProperty { property_name, .. } if property_name == "extra"
+        )));
+
+        let unkeyed = legacy_ir("node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let keyed = evolve(&unkeyed, LEGACY_KEYED);
+        assert_eq!(
+            keyed.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION_FEATURES
+        );
+        let gained = plan_schema_migration(&unkeyed, &keyed).unwrap();
+        assert!(gained.supported, "{gained:?}");
+        let unkeyed_again = evolve(&keyed, "node Person { name: String @key }\n");
+        assert_eq!(
+            unkeyed_again.ir_version,
+            crate::catalog::schema_ir::SCHEMA_IR_VERSION
+        );
+        let lost = plan_schema_migration(&keyed, &unkeyed_again).unwrap();
+        assert!(lost.supported, "{lost:?}");
+    }
+
+    #[test]
+    fn plan_refuses_a_vintage_change() {
+        let accepted = legacy_ir("node Person { name: String @key }\n");
+        let desired = ir("node Person { name: String @key }\n");
+        assert_ne!(desired.system_columns(), accepted.system_columns());
+        let error = plan_schema_migration(&accepted, &desired)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("matching system column spellings"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_adding_edge_key_to_existing_type() {
+        // The `is_key` committed-lookup skip is sound only because a key
+        // exists from type creation on; this pin makes a future Key
+        // special-case in plan_constraints a deliberate decision.
+        let accepted = ir(r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+}
+"#);
+        let desired = evolve(
+            &accepted,
+            r#"
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    since: String?
+    @key(@src, @dst)
+}
+"#,
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            !plan.supported,
+            "adding @key to an existing edge type must be unsupported: {plan:?}"
+        );
+    }
+
     #[test]
     fn plan_orders_rename_before_widening_and_names_the_new_property() {
         // A property renamed AND widened in one migration emits both steps:
@@ -1382,13 +1439,13 @@ node Account @rename_from("User") {
     }
 
     #[test]
-    fn plan_emits_soft_drop_for_removed_nullable_property() {
+    fn plan_emits_drop_for_removed_nullable_property() {
         // Removing a property from the desired schema emits
-        // DropProperty { Soft } (schema-lint v1 chassis commit #3,
+        // DropProperty (schema-lint v1 chassis commit #3,
         // MR-694). The plan is `supported = true` — the apply path
-        // handles soft drop via the existing stage_overwrite rewrite
-        // projection. Verified at the integration level by
-        // `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`
+        // drops the column by a metadata-only commit. Verified at the
+        // integration level by
+        // `apply_schema_drops_a_nullable_property_and_preserves_prior_version`
         // in `crates/omnigraph/tests/schema_apply.rs`.
         let accepted = ir(r#"
 node Person {
@@ -1417,11 +1474,9 @@ node Person {
                     type_kind: SchemaTypeKind::Node,
                     type_name,
                     property_name,
-                    mode: DropMode::Soft,
-                    ..
                 } if type_name == "Person" && property_name == "age"
             )),
-            "expected DropProperty {{ Soft }} step in plan: {plan:?}",
+            "expected a DropProperty step in plan: {plan:?}",
         );
         // Negative: no UnsupportedChange anywhere in the plan.
         assert!(
@@ -1429,18 +1484,18 @@ node Person {
                 .steps
                 .iter()
                 .any(|step| matches!(step, UnsupportedChange { .. })),
-            "soft drop must not emit UnsupportedChange: {plan:?}",
+            "a property drop must not emit UnsupportedChange: {plan:?}",
         );
     }
 
     #[test]
-    fn plan_emits_soft_drop_for_removed_node_and_edge_types() {
+    fn plan_emits_drops_for_removed_node_and_edge_types() {
         // Removing a node type + the edge type that references it
-        // emits two DropType { Soft } steps (chassis v1 commit #4,
+        // emits two DropType steps (chassis v1 commit #4,
         // MR-694). The plan is `supported = true` — apply tombstones
         // both manifest entries. Time-travel reversibility is verified
         // at the integration level by
-        // `apply_schema_drops_node_and_referencing_edge_softly`
+        // `apply_schema_drops_node_and_referencing_edge`
         // in `crates/omnigraph/tests/schema_apply.rs`.
         let accepted = ir(r#"
 node Person {
@@ -1470,10 +1525,9 @@ node Person {
                 SchemaMigrationStep::DropType {
                     type_kind: SchemaTypeKind::Node,
                     name,
-                    mode: DropMode::Soft,
                 } if name == "Company"
             )),
-            "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
+            "expected DropType {{ Node, Company }} in plan: {plan:?}",
         );
         assert!(
             plan.steps.iter().any(|step| matches!(
@@ -1481,10 +1535,9 @@ node Person {
                 SchemaMigrationStep::DropType {
                     type_kind: SchemaTypeKind::Edge,
                     name,
-                    mode: DropMode::Soft,
                 } if name == "WorksAt"
             )),
-            "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+            "expected DropType {{ Edge, WorksAt }} in plan: {plan:?}",
         );
         // Negative: no UnsupportedChange anywhere in the plan.
         assert!(
@@ -1492,7 +1545,7 @@ node Person {
                 .steps
                 .iter()
                 .any(|step| matches!(step, UnsupportedChange { .. })),
-            "soft type drop must not emit UnsupportedChange: {plan:?}",
+            "a type drop must not emit UnsupportedChange: {plan:?}",
         );
     }
 
@@ -1671,6 +1724,14 @@ node Pair {
 
     #[test]
     fn plan_classifies_property_constraint_provenance_and_satisfaction_changes() {
+        let accepted = ir("node N { value: String } edge E: N -> N {}");
+        let desired = evolve(
+            &accepted,
+            "node N { value: String } edge E: N -> N { @unique(@src, @dst) }",
+        );
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(plan.steps.iter().any(|step| matches!(step, UnsupportedChange { reason, .. }
+            if reason == "adding constraint '@unique(@dst, @src)' to 'E' is not supported in schema migration v1")));
         let accepted = ir("node N { value: String @unique }");
         let desired = evolve(&accepted, "node N { value: String @unique(value) }");
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
@@ -1727,52 +1788,58 @@ node Pair {
 
     #[test]
     fn drop_steps_round_trip_through_serde() {
-        // The DropType / DropProperty variants are dormant in this
-        // commit — the planner doesn't emit them yet — but their
-        // serde shape needs to be stable from day one. A future
-        // SchemaIR JSON containing one of these must deserialize
-        // back to the same value. This test pins the wire format
-        // so a v0 schema-ir consumer never sees a surprise variant
-        // shape after v1 ships.
+        // Plans reach callers as JSON (CLI `--json`, the HTTP schema-apply
+        // response, the cluster plan preview). Pin the drop steps' literal
+        // wire shape, and that it round-trips.
         let steps = vec![
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Node,
-                name: "Person".to_string(),
-                mode: DropMode::Soft,
-            },
-            SchemaMigrationStep::DropType {
-                type_kind: SchemaTypeKind::Edge,
-                name: "Knows".to_string(),
-                mode: DropMode::Hard,
-            },
-            SchemaMigrationStep::DropProperty {
-                type_kind: SchemaTypeKind::Node,
-                type_name: "Person".to_string(),
-                property_name: "age".to_string(),
-                mode: DropMode::Soft,
-            },
-            SchemaMigrationStep::DropProperty {
-                type_kind: SchemaTypeKind::Interface,
-                type_name: "Named".to_string(),
-                property_name: "alias".to_string(),
-                mode: DropMode::Hard,
-            },
+            (
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Node,
+                    name: "Person".to_string(),
+                },
+                serde_json::json!({"kind": "drop_type", "type_kind": "node", "name": "Person"}),
+            ),
+            (
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Edge,
+                    name: "Knows".to_string(),
+                },
+                serde_json::json!({"kind": "drop_type", "type_kind": "edge", "name": "Knows"}),
+            ),
+            (
+                SchemaMigrationStep::DropProperty {
+                    type_kind: SchemaTypeKind::Node,
+                    type_name: "Person".to_string(),
+                    property_name: "age".to_string(),
+                },
+                serde_json::json!({
+                    "kind": "drop_property",
+                    "type_kind": "node",
+                    "type_name": "Person",
+                    "property_name": "age",
+                }),
+            ),
+            (
+                SchemaMigrationStep::DropProperty {
+                    type_kind: SchemaTypeKind::Interface,
+                    type_name: "Named".to_string(),
+                    property_name: "alias".to_string(),
+                },
+                serde_json::json!({
+                    "kind": "drop_property",
+                    "type_kind": "interface",
+                    "type_name": "Named",
+                    "property_name": "alias",
+                }),
+            ),
         ];
 
-        for step in steps {
-            let json = serde_json::to_string(&step).expect("serialize");
-            let round_trip: SchemaMigrationStep = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(step, round_trip, "round-trip mismatch on {json}");
+        for (step, wire) in steps {
+            let json = serde_json::to_value(&step).expect("serialize");
+            assert_eq!(json, wire);
+            let round_trip: SchemaMigrationStep =
+                serde_json::from_value(json).expect("deserialize");
+            assert_eq!(step, round_trip, "round-trip mismatch on {wire}");
         }
-    }
-
-    #[test]
-    fn drop_mode_serde_uses_snake_case() {
-        // External tools may write SchemaIR JSON by hand. Pin the
-        // wire form so we don't silently break them later.
-        assert_eq!(serde_json::to_string(&DropMode::Soft).unwrap(), "\"soft\"");
-        assert_eq!(serde_json::to_string(&DropMode::Hard).unwrap(), "\"hard\"");
-        let soft: DropMode = serde_json::from_str("\"soft\"").unwrap();
-        assert_eq!(soft, DropMode::Soft);
     }
 }

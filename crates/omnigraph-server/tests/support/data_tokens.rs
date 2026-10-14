@@ -37,14 +37,34 @@ impl DataTokens {
     }
 
     pub fn token(&self, grants: Value) -> String {
+        self.signed(Some(grants), None)
+    }
+
+    pub fn identity_token(&self) -> String {
+        self.signed(None, None)
+    }
+
+    pub fn identity_token_for(&self, subject: &str) -> String {
+        self.signed(None, Some(subject))
+    }
+
+    fn signed(&self, grants: Option<Value>, subject: Option<&str>) -> String {
         let mut claims = self.fixture["claims"].clone();
+        if let Some(subject) = subject {
+            claims["sub"] = json!(subject);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         claims["iat"] = json!(now);
         claims["exp"] = json!(now + 3600);
-        claims["grants"] = grants;
+        if let Some(grants) = grants {
+            claims["grants"] = grants;
+        } else {
+            claims["version"] = json!(2);
+            claims.as_object_mut().unwrap().remove("grants");
+        }
         let content = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(self.fixture["header"].to_string()),

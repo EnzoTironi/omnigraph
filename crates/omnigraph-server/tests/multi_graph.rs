@@ -1,13 +1,14 @@
 //! Cluster-mode boot and the concurrent branch-ops matrix.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{ErrorOutput, ExportRequest, ReadRequest};
+use omnigraph::loader::LoadMode;
+use omnigraph_server::api::{ErrorOutput, ExportRequest, QueryRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;
@@ -49,7 +50,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell b: Merge × Merge, same target / distinct sources.
-    // Both want to land in main. merge_exclusive serializes; both should
+    // Both want to land in main. The schema/branch gates serialize; both should
     // succeed and main should contain BOTH sources' contributions.
     {
         let cell = "b:merge×merge:same-target-distinct-sources";
@@ -73,8 +74,8 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell c: Merge × Merge, same source / distinct targets (fanout).
-    // One source merged into two targets simultaneously. merge_exclusive
-    // serializes; both targets should reflect the source's content.
+    // One source merged into two targets simultaneously. Each merge captures
+    // its own target; both targets should reflect the source's content.
     {
         let cell = "c:merge×merge:same-source-distinct-targets";
         let h = matrix::Harness::new().await;
@@ -247,6 +248,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(g("/branches"))
                     .method(Method::GET)
                     .body(Body::empty())
@@ -279,7 +281,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell i: BranchDelete × Change, on a different branch. Delete one
-    // branch while a /change runs on main. Both should succeed.
+    // branch while a /mutate runs on main. Both should succeed.
     {
         let cell = "i:branch_delete×change:distinct-branch";
         let h = matrix::Harness::new().await;
@@ -368,6 +370,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                     .uri(g("/snapshot?branch=main"))
                     .method(Method::GET)
                     .body(Body::empty())
@@ -400,7 +403,14 @@ async fn concurrent_branch_ops_morphological_matrix() {
 #[tokio::test]
 async fn cluster_boot_serves_applied_state() {
     let temp = converged_cluster_dir("").await;
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -422,6 +432,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs")
             .body(Body::empty())
             .unwrap(),
@@ -432,6 +443,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs/knowledge/queries")
             .body(Body::empty())
             .unwrap(),
@@ -450,6 +462,7 @@ async fn cluster_boot_serves_applied_state() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")
@@ -477,6 +490,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
             uri: uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         });
@@ -493,6 +507,7 @@ async fn served_export_process_queue_budget_refuses_then_releases() {
     let app = build_app(state);
     let request = |graph_id: &str| {
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(format!("/graphs/{graph_id}/export"))
             .header("content-type", "application/json")
@@ -570,6 +585,7 @@ rules:
             uri: bad_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
@@ -578,10 +594,27 @@ rules:
             uri: good_uri.to_string_lossy().to_string(),
             policy: None,
             embedding: None,
+            startup_failure: None,
             external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
             queries: stored_query_registry(&[]),
         },
     ];
+    let all_failed = omnigraph_server::open_multi_graph_state(
+        vec![graphs[0].clone()],
+        Vec::new(),
+        Some(&server_policy),
+        temp.path().join("cluster.yaml"),
+        false,
+    )
+    .await;
+    assert!(
+        all_failed
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no healthy graphs opened"),
+        "a nonempty failed graph set must not become an empty serving revision"
+    );
     let strict_err = match omnigraph_server::open_multi_graph_state(
         graphs.clone(),
         vec![("act-admin".to_string(), "admin-token".to_string())],
@@ -618,11 +651,13 @@ rules:
         .collect();
     ready.sort();
     assert_eq!(ready, vec!["good"]);
+    assert_eq!(state.routing().registry.len(), 2);
     let app = build_app(state);
 
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs")
             .header("authorization", "Bearer admin-token")
             .body(Body::empty())
@@ -637,19 +672,59 @@ rules:
             .iter()
             .map(|graph| graph["graph_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["good"]
+        vec!["broken", "good"]
     );
 
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri("/graphs/broken/queries")
             .header("authorization", "Bearer admin-token")
             .body(Body::empty())
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "graph_unavailable");
+    assert!(!body.to_string().contains("missing.omni"));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/graphs/broken/mutate")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from_stream(futures::stream::poll_fn(
+                    |_| -> std::task::Poll<Option<Result<&'static str, std::io::Error>>> {
+                        panic!("a blocked graph must refuse before consuming mutation input")
+                    },
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("retry-after"));
+    for (id, expected) in [("good", StatusCode::OK), ("unknown", StatusCode::NOT_FOUND)] {
+        let (status, body) = json_response(
+            &app,
+            Request::get(format!("/graphs/{id}/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", "Bearer admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    let (status, body) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["served_graph_count"], 2);
+    assert_eq!(body["ready_graph_count"], 1);
+    assert_eq!(body["blocked_graph_count"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -709,18 +784,15 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let graph_uri = temp
         .path()
         .join("graphs/knowledge.omni")
         .to_string_lossy()
         .to_string();
-    let db = Omnigraph::open(&graph_uri).await.unwrap();
-    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let db = session(Omnigraph::open(&graph_uri).await.unwrap());
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
@@ -731,7 +803,14 @@ graphs:
         ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -748,17 +827,19 @@ graphs:
     .unwrap();
     let app = build_app(state);
 
-    let read = ReadRequest {
-        query_source: EMBED_QUERY.to_string(),
-        query_name: Some("vector_search_string".to_string()),
+    let read = QueryRequest {
+        query: EMBED_QUERY.to_string(),
+        name: Some("vector_search_string".to_string()),
         params: Some(serde_json::json!({ "q": "alpha" })),
         branch: Some("main".to_string()),
         snapshot: None,
+        settings: None,
     };
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/graphs/knowledge/read")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri("/graphs/knowledge/query")
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -804,10 +885,7 @@ graphs:
 "#,
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(temp.path()).await;
 
     let _guard = EnvGuard::set(&[
         ("OG_TEST_MISSING_EMBED_KEY", None),
@@ -880,14 +958,18 @@ graphs:
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(temp.path()).await;
         temp
     };
 
-    let settings = cluster_settings(temp.path()).await.unwrap();
+    let mut settings = cluster_settings(temp.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         server_policy,
@@ -935,9 +1017,13 @@ async fn cluster_boot_refusals() {
         err.to_string().contains("catalog_payload_digest_mismatch"),
         "{err}"
     );
-    assert!(err.to_string().contains("cluster refresh"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("restore its bytes from a trusted copy"),
+        "{err}"
+    );
 
-    // Missing state refuses with the import/apply remedy.
+    // Missing state refuses before acquiring serving admission.
     let empty = tempfile::tempdir().unwrap();
     let err = cluster_settings(empty.path()).await.unwrap_err();
     assert!(err.to_string().contains("cluster_state_missing"), "{err}");

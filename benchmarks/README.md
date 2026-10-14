@@ -1,127 +1,269 @@
 # Benchmark catalog
 
-This directory contains the checked-in inputs for the end-to-end benchmark
-harness. A case describes one benchmark point. A suite selects cases and says
-how many samples to collect. These files are experiment definitions, not run
-records, fixtures, or result storage.
+Start with a named scenario or your own YAML:
 
-## Layout
-
-- `cases/*.case-v1.yaml` assigns the fixture, workload, environment, and
-  protocol for one point.
-- `suites/*.suite-v1.yaml` lists cases to run. Suite files live directly in
-  `suites/`, whose parent is the authoritative catalog root. A `case` path is
-  resolved relative to the suite file that contains it, and its canonical
-  target must remain under the same catalog's `cases/` directory. Suite and
-  referenced-case symlinks cannot escape the catalog.
-- `fixtures/*.fixture-reference-v1.yaml` is the path-free logical contract for
-  an imported node-and-edge graph: builder provenance, logical data shape,
-  declared physical state, and expected schema/content digests.
-- `real-graph/*.run-v1.yaml` selects one registered fixture, the fixed
-  real-graph workload, repetition count, and operation deadline. This narrow
-  diagnostic path is separate from CaseV1 suites and durable run records.
-
-The `version` field selects the document schema. Keep identifiers and enum
-values in kebab-case. The scenario and fixture-builder versions identify the
-code contracts that interpret the remaining typed fields.
-
-Index state is an inventory rather than a global label. Use `indexes: []` for
-an unindexed fixture; each indexed entry names its `table`, `column`, `kind`,
-and `freshness`. Synthetic branch-merge builder v2 supports only
-`compaction_recency: not-optimized`, because OmniGraph optimization
-materializes physical indexes outside this builder's exact inventory contract.
-
-Builder v2 interprets `fixture.data.tables` as the total user-table count and
-requires an even value: half are immutable node endpoint tables and half are
-edge tables in a uniform type ring. Every edge row connects equal ordinals in
-adjacent node types. `workload.diverged_tables` selects edge tables only, so it
-must not exceed half of `fixture.data.tables`. Source and target update
-disjoint stable edge IDs, delete disjoint edge cohorts, and append distinct
-edge IDs while retaining valid endpoints.
-
-`protocol.deadline_seconds` is required. Set it to an integer from 1 through
-3600, or to YAML `null` when the measured operation has no deadline; the
-executor must still enforce a separate bounded safety watchdog. Leading and
-trailing whitespace in S3 identity fields and index table/column names is
-normalized before validation and hashing.
-
-`environment.cache_condition` is structured, not a single cold/warm label.
-Every current point uses `process: fresh-per-repetition`. Select one of these
-exact engine/page-cache/program combinations:
-
-```yaml
-# Process-cold: fresh worker, no declared warm-up, OS page cache uncontrolled.
-cache_condition:
-  process: fresh-per-repetition
-  engine: preparation-only
-  page_cache: uncontrolled
-  program: none
-  iterations: 0
-
-# Warm: named program, then measurement on the same handle.
-cache_condition:
-  process: fresh-per-repetition
-  engine: warmed-by-program
-  page_cache: program-conditioned
-  program: branch-merge-read-set-v1
-  iterations: 1
-
-# Post-reopen: named program, then a new engine handle; no invalidation claim.
-cache_condition:
-  process: fresh-per-repetition
-  engine: reopened-after-program
-  page_cache: program-conditioned
-  program: branch-merge-read-set-v1
-  iterations: 1
+```bash
+omnigraph-bench list scenarios
+omnigraph-bench show tiny-read
+omnigraph-bench run tiny-read
+omnigraph-bench run --config benchmarks/custom.example.yaml
 ```
 
-All five fields enter point identity. `program-conditioned` says the named
-reads ran immediately before measurement; it is not a page-residency proof.
-Page-cache-cold is deliberately absent: it requires both a named
-platform/backend eviction control and a post-control witness. Storage-cold is
-neither supported nor representable because controlling the OS page cache says
-nothing about device, object-store, or remote-service caches.
-Case definitions deliberately contain no source branch, system-under-test
-build, machine identity, AWS account, bucket URI, result location, or
-credentials. Record finalization binds the clean source/build, backend,
-complete typed process observations, session, and invocation to each completed
-run. Its hostname-derived label is only a non-secret, non-stable correlation
-hint—not a privacy boundary or proof of machine identity.
-Repetition count is run quantity, so it belongs to the suite rather than the
-case's experiment identity.
+The [shared config](benchmarks.yaml) defines all scenarios and groups. GQT files
+hold the data, operations and expected results:
 
-`fixture.state.history_depth` is the exact number of reachable OmniGraph graph
-commits on **each already-diverged frozen branch**, including the history
-shared before the branch was created. It is not merely the number of commits
-made after branching. Builder v2 measures both frozen branches and refuses a
-case whose declaration does not match; it does not silently pad or squash
-history. For the checked case, the reachable depth is 213: one genesis commit,
-200 base-load publications (25 chunks for each of four node and four edge
-tables), and 12 branch-local edge-divergence publications on each branch.
+```text
+benchmarks/
+  fixtures/            # starting states; registered references/preparation together
+  workloads/           # operations and verification
+  deferred/            # inactive sources awaiting language/executor support
+  benchmarks.yaml      # scenario names, groups and run settings
+  custom.example.yaml  # optional example to copy
+  README.md
+```
+
+Use `omnigraph-bench --help`, `help config` or `help cache` for the complete
+workflow. `help --json` describes this binary's commands for agents. Discovery
+works with a debug build; measurements require the qualified release build
+[described below](#run-locally).
+
+## End-to-end workloads
+
+All active benchmarks are fixture/workload GQT pairs in the shared catalog.
+The `end-to-end`, `query-shapes` and `traversal` groups contain bounded graph
+operation representatives. Run `omnigraph-bench list scenarios` for the exact
+inventory. The default remains `local-fast`.
+
+The representatives have independent expected rows and new experiment identities.
+Their fixture sizes, cache preparation and repetition boundaries differ from
+the historical Rust instruments; their timing series must not be combined.
+
+Unsupported workloads are preserved temporarily in [deferred/](deferred/README.md).
+Cleanup and optimization require GQ support. Concurrent and streaming instruments require an executor that preserves their
+scheduling and transport. Their preserved sources are outside Cargo discovery
+and are not active scenarios. Read-only HTTP acquisition is available through
+the served variants below.
+Raw Lance and Rust collection comparisons are retired from the benchmark suite.
+
+### Served query and traversal variants
+
+`query-shapes-served` lists 13 query scenarios and `traversal-served` lists
+three traversal scenarios. Their schema-less workloads contain a warm-up read,
+the measured read, and explicit result verification. Embedded workload files
+and default selections are unchanged. Six embedded scenarios have no served
+twin because the server target has no door for them: `e2e-query-destination-search`,
+`e2e-nearest-prefilter`, `e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need
+indexes (search, nearest and RRF), and `e2e-traversal-selective-csr` and
+`e2e-traversal-selective-indexed` pin a traversal path.
+
+These scenarios require an externally provisioned graph and a typed deployment
+receipt. One invocation binds one graph and dataset recipe, so run different
+fixture recipes separately. The stock definitions declare server-local
+APFS/NVMe and same-host network position; other deployments need explicit
+custom environment settings. Server build and dataset facts remain declared,
+server counters remain absent, and these records are claim-ineligible. See the
+[served acquisition guide](../crates/omnigraph-bench/README.md#served-read-only-acquisition)
+for the command, receipt fields, cache semantics and evidence boundaries.
+
+## Configuration
+
+One [version-2 YAML file](benchmarks.yaml) defines named scenarios. A scenario
+pairs a fixture with a workload and selects one measured operation. Groups
+select scenario IDs without duplicating their definitions. The `run` list is
+the explicit default selection: the repository selects only `local-fast`.
+Large histories and registered FinBench require explicit selection.
+
+- `fixtures/*.gqt` contains schema, seed and preparation/history steps.
+- `fixtures/finbench/` keeps a registered graph's logical reference and GQT
+  preparation together. The invocation supplies its physical source bundle.
+- `workloads/*.gqt` omits schema/seed and contains optional preparation reads,
+  the selected operation, then explicit verification.
+- `defaults` supplies repetitions, deadline, environment and protocol settings;
+  a scenario may override them. `--repetitions` changes only sample quantity.
+
+Use the complete [custom example](custom.example.yaml), or generate a config
+from the parser's exact selected operation:
+
+```bash
+omnigraph-bench show --workload benchmarks/workloads/tiny_read.gqt
+omnigraph-bench init --fixture benchmarks/fixtures/tiny_graph.gqt \
+  --workload benchmarks/workloads/tiny_read.gqt --step 1 --output custom.yaml
+omnigraph-bench show custom --config custom.yaml
+omnigraph-bench run --config custom.yaml
+```
+
+`init` refuses existing files. Put the output YAML in a directory containing
+both sources. YAML paths resolve relative to its directory and stay within it;
+absolute paths, parent traversal and symlink escapes are refused. CLI file
+arguments are relative to the working directory. An explicit `--config` never
+falls back to another config. With no `--config`, the CLI searches the working
+directory and its ancestors for `benchmarks.yaml` or `benchmarks/benchmarks.yaml`.
+
+A minimal config inherits five repetitions, a 60-second deadline, per-phase
+attribution, manual scheduling and a monotonic timer. Local defaults are
+APFS/clonefile on macOS or qualified XFS/plain-copy elsewhere. The repository
+config retains each scenario's original repetitions and leaves `environment`
+and `reset` out of its defaults, so a scenario without its own environment
+takes that host default and the one file runs on a macOS workstation and on a
+qualified Linux XFS volume alike; `show` reports the resolved value and the
+record carries it. A scenario whose volume is part of its meaning declares it
+explicitly, as `branch-merge-d50-process-cold-xfs` and
+`branch-merge-d50-history64-xfs` do. The resolved backend is part of a
+scenario's point identity, so APFS and XFS runs of one id are distinct points.
+`show` reports all effective settings before a run. `deadline_seconds: null`
+removes the measurement deadline; the supervisor remains bounded. Protocol
+fields are `attribution`, `schedule`, `reset` and `timer`.
+
+The internal validated case remains one experiment. Legacy case/suite readers
+and explicit `suite run --dataset ... --queries ...` remain available for
+existing callers; the authored catalog needs no separate case or suite files.
+
+The echo includes the complete operation header and body, including branch
+selection. It excludes expectations and separate parameter sections; the full
+queries SHA-256 binds those too. Moving a step or changing its text without
+updating the selector is refused. The selected step cannot occur in a loop.
+A generated load is selectable only when its recipe makes exactly one loader
+call; generation happens before its engine timer. Multi-call loads remain
+valid dataset construction steps.
+
+For embedded execution, cache treatment is derived, never authored as a label.
+No prefix reads means
+process-cold. Prefix reads on the same handle mean warmed-by-program. Prefix
+reads followed by one restart mean reopened-after-program. A read after that
+restart is refused. Settings and show steps are neutral; prefix writes belong
+in the dataset and are refused. Only reads that actually reach an engine
+operation prove the preparation. A prefix expected parameter error that never
+calls the engine cannot establish a warm treatment. Every repetition is a
+fresh process; the OS page cache remains uncontrolled or conditioned by the
+named GQT read program. No page-cache-cold or storage-cold claim is implied.
+[Served acquisition](#served-query-and-traversal-variants) uses a long-running
+server with uncontrolled OS page-cache state.
+
+### Preparing additional write history
+
+History is ordinary generated loads or GQ mutations in the dataset. The
+retired `fixture.preparation` Rust recipe is retained only for historical
+archive validation and parity tests. The checked-in D50 dataset reproduces
+its base load/divergence recipe, while the core parity tests cover reversible
+aging. Current-content and normalized lineage witnesses distinguish different
+histories without hashing random commit IDs or physical Lance versions.
+
+The D50 warm prefix is 24 authored aggregate queries. This is the new
+`gqt-read-set-v1` program, distinct from the retired Rust `warm_read_set`
+scans. Fixture parity does not make their wall-clock values or point IDs
+interchangeable.
+
+## Bounded scenario pairs
+
+The `local-regression` suite selects the following sequential cases, each with
+one measured engine operation. Dataset assertions check the prepared state;
+query suffixes check exact resulting rows and repeat those checks after restart.
+These inputs establish correctness conditions, not performance results.
+
+| Scenario | Cases and treatment | Verification and scope |
+| --- | --- | --- |
+| Very long history | `very-long-history-32-{read,write,reopen}` | One fixed live row, 32 real updates alternating 1/0, then a selected read, next write, or reopen. The build witness checks 34 reachable commits including genesis and seed. |
+| Hot table with idle registrations | `hot-table-idle-{base,tables-4,branches-4,branches-4-aged}` | Separate controls add four idle tables or four live branches. The aged branch case adds eight updates only on an idle branch. Every sentinel and unchanged branch is checked. |
+| Parallel tables | `parallel-tables-{1,2,4}` | One mutation touches one, two, or four of the same four populated tables. All touched and untouched rows are checked. This tests fan-out shape; it makes no actor-overlap or internal parallel-span claim. |
+| Identity lifecycle | `identity-lifecycle` | Delete and recreate a branch name, then measure its first write. Exact current views prove that the recreated branch inherits main while an old child retains its original parent view. Table-schema lifecycle and held snapshots are outside this subset. |
+| Repeated deletion/recreation | `repeated-deletion-recreation-{rows,branches}` | Four bounded cycles followed by the next insertion or branch creation. Every cycle verifies exact rows; the final branch inventory and reopened views are checked. Row churn and branch churn are separate treatments. |
+| Threshold crossings | `threshold-crossings-{before,at,after,production-control}` | A configured history-release boundary: two, three, or four updates at `history_release_bytes = 2048`, plus a three-update control at the production budget 262144, followed by an insert. Exact main/child contents are checked. |
+| Equal current state, different history | `equal-current-{narrow-one-batch,wide-one-batch,wide-four-batches}` | Four identical final rows after eight past/restore cycles. Prior payload width varies from 8 to 4096 bytes; a separate treatment publishes each load in four batches. Build witnesses check equal current contents and 18/18/66 reachable commits. |
+| Unattached branch root write (group `unattached-writes`, with `tiny-mutate-unattached`) | `very-long-history-32-write-unattached`, `unattached-chain-32-write` | The history checkpoint's next update written `as unattached branch` instead of on `main`: the row is checked at the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot is dropped. The chain case keeps the same 32 updates as one retained unattached chain (a root and 31 children) with `main` at the seed. Each twin pairs with the ordinary write on the same fixture (`very-long-history-32-write`, `tiny-mutate`). |
+
+An unattached record costs the root write only. A child `on` an earlier
+snapshot cannot be the selected step: its base id is bound by a write earlier
+in the same program, and writes before the selected step are refused. The
+engine's per-phase attribution covers `branch merge` only, so these mutation
+records carry elapsed time and logical store calls, not a publication or
+history-settlement phase split. Neither path's number stands in for a chained
+stream or for end-to-end published-write latency.
+
+The threshold fixtures preserve the configured shapes from the engine's
+history-release correctness cases. Their row assertions do not prove that a
+release counter fired, and they do not model an optimize, index-build, or
+cache-capacity threshold. There is no maintenance or cleanup step in these
+pairs. Concurrent interleavings, held-snapshot lifetimes, and historical row
+images need their own observations; these sequential cases do not establish
+those properties.
+
+Dataset and query basenames use the same scenario names with underscores.
+The history operations share `workloads/very_long_history_{read,write,reopen}.gqt`
+across depths, and equal-current cases share
+`workloads/equal_current_different_history.gqt`. The owning benchmark catalog
+test executes all 20 bounded pairs, plus the two unattached twins, through dataset construction and the
+measured adapter, including their explicit restart verification. Parsing and
+suite admission also cover the larger recipes without executing them.
+
+### Opt-in history scale
+
+The `history-1000`, `history-10000` and `history-100000` groups select read,
+next-write and reopen operations over fixed live contents with the named
+number of real updates. Their recipes live in `fixtures/`; nightly names its
+21 ordinary recipes explicitly and does not select these larger inputs.
+
+Each fixture retains one `HistoryRow` at `key = "hot"`, `value = 0`,
+`payload = "fixed"`. Updates alternate value 1 and 0, producing 1,002, 10,002
+or 100,002 reachable commits including genesis and seed publication. The
+100,000-update recipe uses five loops of 10,000 iterations, with two updates
+per iteration. Every workload verifies rows and repeats verification after
+restart. Their 600,000 ms whole-file budget may expire on a slow host.
+
+```bash
+target/debug/omnigraph-gqt benchmarks/fixtures/very_long_history_1000.gqt
+omnigraph-bench run history-1000 --dataset-cache /qualified/cache --json
+```
+
+These inputs have not been run as a scale campaign. Their authored scale is
+not a timing claim; no one-million-update recipe is included. The groups use
+one repetition by default. Cache construction and verification remain outside
+the selected operation timer.
 
 ## Validate and inspect
 
-From the repository root:
+From the repository root, use these read-only commands:
 
 ```bash
-cargo run --locked -p omnigraph-bench -- \
-  case validate benchmarks/cases/branch-merge-d50-warm.case-v1.yaml
-
-cargo run --locked -p omnigraph-bench -- \
-  case list benchmarks/cases
-
-cargo run --locked -p omnigraph-bench -- \
-  suite validate benchmarks/suites/local-smoke.suite-v1.yaml
-
-cargo run --locked -p omnigraph-bench -- \
-  suite plan benchmarks/suites/local-smoke.suite-v1.yaml
-
-cargo run --locked -p omnigraph-bench -- \
-  fixture reference validate /path/to/graph.fixture-reference-v1.yaml
+omnigraph-bench list fixtures --json
+omnigraph-bench list workloads --json
+omnigraph-bench list scenarios --json
+omnigraph-bench show tiny-read --json
+omnigraph-bench cache status tiny-read --dataset-cache /qualified/cache --json
+omnigraph-bench cache status tiny-read --dataset-cache /qualified/cache --verify --json
+omnigraph-bench cache list --dataset-cache /qualified/cache --limit 100 --json
 ```
 
-Each command accepts `--json` for machine-readable output. `suite plan` also
-accepts `--case <ID>` to select one case from a suite.
+Listings include unselected local inputs and keep missing or invalid references
+visible with diagnostics. They scan only config-relative content folders and
+references, never the workstation. `show --workload FILE` lists parser ordinals
+and exact operation text; `init` validates whether the selected operation is measurable.
+
+Cache status reports source availability separately from the matching cache
+variant. Source states are `available`, `missing`, `invalid`, `unbound`,
+`not_applicable`; cache states are `missing`, `present`, `cached`, `busy`,
+`invalid`, `incomplete`, `unknown`. A served scenario reports `not_applicable`
+with the diagnostic `served_scenario_has_no_dataset_cache` and exits zero: it
+reads a provisioned graph and uses no dataset cache.
+`present` validates the published evidence; `--verify` also audits metadata and
+physical bytes before reporting `cached`. A busy entry returns immediately.
+Inspection never builds, creates directories/locks, restores, cleans or quarantines.
+A missing/unbound source gives an unknown current key, not a cache miss. A known
+miss is a successful observation; invalid or unreadable evidence exits nonzero.
+
+The default cache path is `target/gqt-datasets` relative to cwd. Use the same
+`--dataset-cache` for inspection and execution. Keys bind recipe, engine/builder,
+backend/reset, cache location, index needs and registered source identity. An
+older variant in `cache list` may coexist with a current miss. Listing is paged
+at 1..100 entries; continue with `--after` and the returned `next_cursor`.
+Inspection is a snapshot, not a reservation for execution.
+
+Discovery success/error JSON carries `cli_output_version: 1`, `ok`, `value`
+(on success or status inspection), and `diagnostics`. Diagnostics have severity,
+code, path and message. JSON goes to stdout; progress goes to stderr. Execution
+retains `runner_output_version: 2` and its complete archive/failure evidence.
+`help --json` includes command syntax, defaults, effects and examples without
+reading any catalog or cache. Legacy `dataset validate` acquires a lease and
+stages worker files; it is not a read-only inspection command.
 
 An operator-quiesced external snapshot tree uses a location-free two-entry
 bundle:
@@ -153,9 +295,8 @@ target/release/omnigraph-bench fixture preflight-copy \
 ```
 
 These commands prove only physical byte identity and copy preflight. Physical
-identity is audit/reset evidence, not `point_id` input. They do not add the
-fixture to a CaseV1 suite or run a benchmark; CaseV1 remains the synthetic
-builder contract. No copied tree remains after preflight success.
+identity is audit/reset evidence, not `point_id` input. A registered `gqt-v1` case separately binds the logical reference and its
+preparation GQT. No copied tree remains after preflight success.
 
 ### Observe and validate a registered graph
 
@@ -177,17 +318,17 @@ tree after observation and removes it. It never opens the registered source as
 an OmniGraph database and does not mutate that source.
 
 The declarative expectations for the frozen FinGraph fixture live in
-`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+`benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
 Validate the YAML structure first, then recompute its implemented witnesses
 against the registered bytes:
 
 ```bash
 target/release/omnigraph-bench fixture reference validate \
-  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
   --json
 
 target/release/omnigraph-bench fixture validate-graph \
-  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
   --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
   --scratch-root /path/to/existing-apfs-scratch --json
 ```
@@ -211,196 +352,126 @@ checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+The checked-in smoke point declares no volume and takes the host default, APFS
+on a macOS workstation or XFS on a qualified Linux volume. The AWS point
 declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
 page cache. Validation is host-independent; runner-v1 probes the actual scratch
-volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
+volume and refuses a resolved or declared backend that does not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
 
 ## Run locally
 
-### CaseV1 suite runner
+Wall-clock execution requires a flag-free release-profile binary. The
+workspace development configuration injects `--cfg tokio_unstable`; the
+existing documented release build uses `RUSTFLAGS= cargo build --release
+--locked -p omnigraph-bench`. The guard refuses builds that retain encoded
+Rust flags, debug assertions, unsupported engine features, or unmodeled
+runtime overrides. Durable publication additionally requires a clean,
+committed source tree matching that executable's provenance.
 
-Wall-clock execution is available only from a release-profile binary:
-
-```bash
-cargo run --release --locked -p omnigraph-bench -- \
-  suite run benchmarks/suites/local-smoke.suite-v1.yaml \
-  --archive .bench/archive
-
-# On the AWS lab's XFS instance-store mount:
-target/release/omnigraph-bench suite run \
-  benchmarks/suites/aws-xfs-process-cold.suite-v1.yaml \
-  --scratch-root /mnt/nvme --archive /mnt/nvme/omnigraph-bench-archive
-```
-
-Use `--case <ID>` to select one suite entry, `--scratch-root <EXISTING-DIR>` to
-place disposable fixture trees on a particular volume, `--archive <DIR>` to
-publish immutable canonical records, and `--json` for machine-readable output.
-The host probe examines the created scratch tree, not merely the path supplied
-on the command line. Durable publication requires a release binary built from
-a clean committed tree so the record has honest source provenance. The exact
-system under test is bound separately by the executable SHA-256, Cargo/compiler
-observations, checked-in release-profile declarations, and engine feature
-inventory. The inventory includes Cargo's `default` feature and execution
-refuses manifest/registry drift or an unsuppressed implicit optional-dependency
-feature. Effective LTO/codegen/strip settings remain explicitly unproved
-until controlled benchmark infrastructure supplies a digest-bound receipt.
-
-Runner-v1 constructs and verifies one fixture whose `bench-source` and
-`bench-target` branches are already diverged, closes it, and freezes the
-complete directory by physical SHA-256. The fixture is built at a stable
-`active` path because Lance shallow-branch manifests can retain absolute base
-paths. Public execution constructs it in a dedicated process group under a
-bounded watchdog. The child freezes a byte-digested template and removes
-`active` before returning an identity-checked handoff. APFS uses forced
-clonefile with no byte-copy fallback. Linux XFS uses verified copies only for
-the process-fresh point: reset reads bytes outside timing, so its page cache is
-truthfully declared uncontrolled. Every repetition restores the exact stable
-`active` path; failed construction quarantines the workspace.
-
-Every repetition uses a fresh worker process and starts from the same frozen
-state. The parent pins and records the worker executable SHA-256 and requires
-matching source commit/dirty state, release-profile, target/compiler,
-engine-feature, and effective engine-environment evidence in the private
-handshake. Fixture and repetition children clear inherited environment. The
-fixture child receives an empty protocol-owned scratch sibling as `TMPDIR`; a
-measured worker receives a fresh per-repetition scratch sibling as both
-`TMPDIR` and `OMNIGRAPH_MERGE_STAGING_DIR`. Each child validates the exact real,
-absolute path and uses it as its current directory before work, so relative
-dependency spill cannot escape the verified disposable workspace. Cleanup
-occurs only after containment is proved.
-`LANCE_MEM_POOL_SIZE` is admitted only as the canonical decimal `u64` byte
-count Lance actually applies and is recorded as typed SUT identity. Unknown
-`LANCE_*`, engine-facing `OMNIGRAPH_*`, or process-runtime thread-count
-overrides fail closed without recording their values. Credentials and unrelated
-host knobs never reach the child or enter a record. The supervisor also records
-the repetition worker's peak RSS. The
-complete cache condition is part of point identity. A declared read-only
-warm-up program runs inside each repetition before measurement. A storage
-firewall allows only each read-write open's one balanced, empty
-create-if-absent capability probe and rejects any other preparation write; a
-complete metadata-shape witness independently catches path, kind, or length
-drift. Measured counters are then cleared and exactly one branch merge is
-timed. The repetition's writes disappear when `active` is removed rather than
-aging the next sample, and the never-opened template is checked after every
-worker exits.
-
-Before it initializes a fixture, the runner derives the exact builder-v2
-publication count, rejects a mismatched history declaration, applies explicit
-local row/byte/entry/history limits, and proves that the scratch volume has its
-conservative frozen-copy capacity allowance plus space for the staged,
-descriptor-bound worker executable. The concrete runner limits are listed in
-`crates/omnigraph-bench/README.md`; they are deliberately narrower than the
-host-independent case schema.
-
-The supervisor starts the declared hard deadline immediately before releasing
-the prepared worker with `Begin`. The worker must send `Settled` after its merge
-future returns. On timeout the supervisor kills the worker's complete process
-group without a grace period, waits for and reaps it, and proves the group is
-gone. Every repetition failure, including a frame after `Complete`, rejects the
-sample. Cleanup is allowed only after the direct child is reaped, its process
-group is gone, and bounded capture has observed clean EOF on both pipes;
-otherwise the disposable workspace is quarantined. A failure with complete
-containment may therefore clean up safely, but no killed or partial operation
-becomes a sample. Preparation and exact verification have separate bounded
-watchdogs with a 300-second minimum allowance.
-
-After timing and call counters stop, the worker reads and verifies exact IDs,
-values, cohorts, payloads, insertions, and deletions across every table on
-target, source, and main, including tables that should remain untouched, and
-requires unchanged source/main branch heads. The parent does not reread those
-content bytes; it independently derives and validates the point/case identity,
-general three-way route, and declared table/total-row count attestations
-returned by the worker. Exactly one `TableWalk` interval is required per
-diverged edge table. This
-full runner-v1 verification is O(store), deliberately outside timing.
-Receipt-based O(delta) certification starts with the future versioned-S3 reset
-slice. A future DST oracle adds independent evidence but never replaces these
-per-repetition probes. Reported storage counts are logical engine calls, not
-physical requests or cloud-cost estimates.
-
-The warm-up program `branch-merge-read-set-v1` reads the reachable commit list
-and a coherent snapshot for `main`, `bench-source`, and `bench-target`, then
-fully consumes every diverged edge table plus the union of its endpoint node
-tables using type-appropriate projections. A
-`reopened-after-program` point runs that same program and reopens the engine
-handle before measurement; it does not claim invalidation. A process-cold point
-uses `preparation-only`, `program: none`, and `iterations: 0`: the worker is
-fresh and no declared warm-up program runs, but ordinary engine open and
-protected-head capture still occur and `page_cache: uncontrolled` states the
-OS cache limitation explicitly. A true page-cache-cold point remains refused
-until a named platform/backend eviction control has a post-control witness;
-storage-cold is also unsupported and unrepresentable.
-
-### FinGraph diagnostic runner
-
-The real-graph run is declared independently from the synthetic CaseV1 suite.
-The checked-in run file has this strict shape:
-
-```yaml
-version: 1
-fixture_id: finbench-2026-08-21-sf10-v1
-workload: finbench-disjoint-insert-merge
-repetitions: 5
-operation_deadline_seconds: 600
-```
-
-`repetitions` must be from 1 through 20 and
-`operation_deadline_seconds` from 1 through 3600. Unknown fields are refused.
-The logical reference path and local bundle path stay outside the run file so
-neither a checkout location nor an operator's storage location becomes
-experiment identity.
-
-Build the CLI in release mode and run the checked-in FinGraph declaration and
-logical reference against a local registered bundle:
+Start with the small correctness-oriented catalog:
 
 ```bash
-cargo build --release --locked -p omnigraph-bench
-
-target/release/omnigraph-bench fixture run-graph \
-  benchmarks/real-graph/finbench-2026-08-21-sf10-v1.run-v1.yaml \
-  --reference \
-    benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
-  --fixture finbench-2026-08-21-sf10-v1=/path/to/finbench-2026-08-21-sf10-v1 \
-  --scratch-root /path/to/existing-qualified-scratch --json
+target/release/omnigraph-bench dataset build   benchmarks/fixtures/tiny_graph.gqt --dataset-cache /qualified/cache
+target/release/omnigraph-bench run local-fast   --dataset-cache /qualified/cache --json
 ```
 
-`run-graph` refuses a debug build. The harness copies and validates the
-registered graph, prepares two branches whose disjoint changes each contain
-two `Account` nodes and one `AccountTransferAccount` edge, and freezes that
-prepared input. Each repetition restores the same path and runs only the branch
-merge in a fresh worker process. macOS requires qualified local APFS and uses
-forced clonefiles. Linux requires XFS on a directly mounted EC2 instance-store
-NVMe namespace, refuses EBS, and uses a complete verified plain copy outside
-the timer. Use a dedicated benchmark mount: after freezing and after each
-restore, Linux `syncfs` waits for all writeback on that filesystem so reset I/O
-does not overlap the merge. The recorded reset is
-`xfs-plain-copy-syncfs-same-active-path`. Before making that template, the Linux
-path requires free space for one prepared-tree copy plus 1 GiB. The registered
-source is never opened as an OmniGraph database and remains unchanged.
-Before returning either success or failure, the command explicitly attempts to
-remove its disposable workspace. A cleanup failure is reported, and a run plus
-cleanup double failure retains both causes.
-The result includes raw elapsed samples, p50, merge route/phases, the prepared
-physical digest, per-worker machine and backend evidence, and verification evidence for
-the inserted delta, protected heads, and untouched tables. Pre-existing rows
-in the two changed tables are not yet fully re-read and are reported as
-unverified rather than implied to be proved. Machine identity is captured just
-before timing in every worker; differing identities fail the run.
+`dataset build <case.yaml>` prepares the exact cache entry needed by that
+case. `dataset build <dataset.gqt> --queries <queries.gqt>` includes the
+queries' index requirements without selecting or measuring an operation.
+Without `--queries`, only dataset index needs apply. The union of dataset and
+query requirements is part of the cache key, and indexes are built with the
+seed **before** authored updates/deletes. This preserves stale-index and
+fallback scenarios. Building an unindexed raw dataset cannot satisfy a later
+indexed case's `--no-build` request.
 
-This path deliberately does not make a publishable performance claim. Every
-result says `claim_eligible: false` and `durable_record: false`; it has no
-warm-up program, and although each measurement uses a fresh process, the
-operating-system page cache is uncontrolled; Linux plain-copy reset reads every
-fixture byte outside timing and can warm it. `run-graph` does not accept
-`--archive`, publish durable telemetry, calculate a noise floor, download an
-S3 fixture, or dispatch work through the AWS benchmark infrastructure. AWS may
-hold the source snapshot, but an operator must first provide the verified local
-two-entry bundle used above. AWS orchestration and durable-record integration
-are later connector work, not behavior hidden behind this command.
+`dataset validate` takes the same inputs and verifies a published matching
+entry without building. `suite run --no-build` refuses a miss. `--filesystem
+apfs|xfs` applies to raw dataset and explicit-pair commands; case/suite files
+supply their own backend or inherit the host default. APFS requires forced clonefile, and qualified Linux
+XFS uses verified plain copies. The host probe must establish the declared
+backend. Clonefile has no byte-copy fallback; copies condition the OS page
+cache outside measurement.
+
+An explicit pair uses the same resolver, cache, worker, and archive pipeline:
+
+```bash
+target/release/omnigraph-bench suite run   --dataset benchmarks/fixtures/tiny_graph.gqt   --queries benchmarks/workloads/tiny_restart.gqt   --measured-step 1 --measured-text '--- restart'   --repetitions 5 --deadline-seconds 60 --dataset-cache /qualified/cache
+```
+
+The full D50 suites are `local-smoke` (warm, using the host-local default),
+`aws-xfs-process-cold` (qualified XFS) and `aws-xfs-history64` (qualified XFS,
+fixture aged by 64 reversible single-row update commits before the branches
+exist). They build 800,000 base rows. The small `local-fast` suite is a separate
+smoke test, not proof of full-scale performance or correctness.
+
+Every build runs in a contained child, at its cache entry's final stable
+`active` path. The engine closes before freezing the never-opened `root/`
+template. Publication writes `fixture-source.json` and then
+`dataset-build.json` last. The parent accepts the handoff only after child
+reap, process-group exit, and clean bounded output capture. The exclusive
+cache lock remains held through every repetition's verification and cleanup.
+All entries restore at their original absolute path, including relocatable
+ones; this conservative policy keeps Lance branch base paths valid.
+
+A cache key includes recipe contents, production engine/builder digest,
+backend/reset, index requirements, canonical cache location, and registered
+physical source identity when applicable. `GQT_ENGINE_DIGEST` excludes authored
+case/data files, which have their own content digests. A hit verifies the
+registered descriptor, logical receipt, and full template bytes once. Each
+repetition uses metadata and forced-clone/copy witnesses without rereading
+all APFS template bytes before its timer. Changed published evidence is
+`dataset_cache_corrupt`, never an implicit rebuild. Unknown unpublished state
+or uncertain process containment is preserved/quarantined for explicit
+inspection; do not remove it while a child could still be alive.
+
+The selected engine operation alone owns its monotonic interval and logical
+store-call deltas. Query results are materialized before the interval closes.
+Parsing, generated-row preparation, cache work, assertions, verification,
+recording, and cleanup are outside it. Selected restart measures the fresh
+engine open, using fresh adapter counters; it does not include preparation
+checks. Optional merge-phase probes are installed only for a selected merge
+with per-phase attribution. Logical calls do not measure retries, pagination,
+multipart fan-out, physical network attempts, or cloud cost.
+
+A successful record requires the selected expectation and explicit following
+verification expectations. Restart alone is not verification. Any failure
+rejects the repetition. After `Settled`, a later assertion/protocol/exit
+failure may retain closed timing as diagnostic evidence, never as a passing
+sample. A declared deadline is measured separately by the parent from Begin;
+whole-file GQT budgets also apply. Process containment is required before any
+active tree or scratch directory can be removed.
+
+### Registered FinBench merge
+
+The old `fixture run-graph` command and `.run-v1.yaml` format are retired.
+The ordinary case and suite now select a registered reference plus
+[`fixtures/finbench/finbench_disjoint.gqt`](fixtures/finbench/finbench_disjoint.gqt) and
+[`workloads/finbench_disjoint_merge.gqt`](workloads/finbench_disjoint_merge.gqt):
+
+```bash
+target/release/omnigraph-bench run finbench   --fixture finbench-2026-08-21-sf10-v1=/path/to/bundle   --dataset-cache /qualified/cache --json
+```
+
+This shipped case declares no volume: it runs on APFS on a macOS workstation
+and on XFS on a qualified Linux volume, and the two are distinct points. The
+source bundle remains quiescent and is
+never opened as an engine store; a byte-verified disposable copy is validated
+against its logical reference before preparation. Registered imports currently
+require a main-only, relocation-self-contained source and deterministic node
+`@key` columns. Unsupported unkeyed node identity or named source branches is
+refused explicitly.
+
+Preparation publishes two accounts and one transfer atomically on each side.
+Post-merge GQT asserts exact reserved account/transfer properties, endpoints,
+and table counts on target, source, and main. Transfer IDs are engine-generated
+and can differ from the retired Rust recipe. The prepared graph uses logical
+equivalence, while an additional identity-aware export digest binds the fixed
+registered source's original IDs. The source reference and preparation text
+also enter recipe identity. This is a documented equivalence migration, not
+an assertion that the old physical bytes or experiment point IDs survive.
 
 ## Telemetry and delivery boundary
 
@@ -444,20 +515,29 @@ prefix as state-neutral `unpublished_run` recovery evidence. Resolve any `possib
 identity with `archive reconcile` before minting a replacement invocation. A
 later controlled-cloud adapter binds declared S3 facts, applies budget and lifecycle
 controls, executes the same typed plans, and uploads the same record format.
-S3 reset, fixture caching, server-mode execution, comparison/noise-floor
-reports, and proved operating-system page-cache eviction remain outside this
+S3 reset, served writes, comparison/noise-floor reports, and proved operating-system page-cache eviction remain outside this
 slice.
 
-## Add a case
+## Add a scenario
 
-1. Add a versioned case file with explicit levels for every typed factor.
-2. Reference it from a suite with a path relative to that suite.
-3. Run both `case validate` and `suite validate`.
-4. Inspect `suite plan` before executing the suite.
-5. Run from a release build on a host that can prove every declared environment
-   fact; an unsupported factor is a refusal, not permission to approximate it.
+1. Add a fixture GQT and schema-less workload GQT with explicit expectations.
+2. Use `show --workload FILE` and `init` to generate the exact measured selector.
+3. Add the scenario to `benchmarks.yaml`, or keep the custom config separately.
+4. Inspect it with `show NAME --config FILE`; optionally add its ID to a group.
+5. Run the explicit selection on a qualified release host.
 
-Do not encode a profile such as `micro` or `realistic` in a case. Profiles are
-derived from the declared factor levels. Benchmark timing is evidence and does
-not gate CI; deterministic count contracts remain in their existing owning
-tests.
+The final point ID binds a dataset logical witness, verified by embedded
+acquisition or declared in the served deployment receipt, plus recipe/query
+contents, the selected operation, cache treatment, target, network position,
+backend and protocol.
+Planning can report only a pre-build experiment digest until the dataset is
+bound. Paths, case display IDs, repetitions, cache-hit status, and physical
+tree bytes do not enter the point ID. Historic `branch-merge-v1` records retain
+their exact canonical encoding and remain queryable beside GQT records, but
+old authored execution is refused.
+
+Catalog parsing and GQT result assertions are correctness gates. Benchmark
+wall-clock and unpinned measured counters remain report-only. The slow nightly
+GQT route explicitly selects 21 ordinary recipes from `benchmarks/fixtures`, including full-size D50 and its
+64-commit history variant; reduced parity
+tests independently check the generator against the retained legacy test oracle.

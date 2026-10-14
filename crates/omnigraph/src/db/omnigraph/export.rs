@@ -1,5 +1,8 @@
 use super::*;
+use crate::changes::model::is_reserved_storage_system_column;
+use crate::ordered_cursor::{KeyOrder, OrderedRowCursor, WalkSubject};
 use futures::TryStreamExt;
+use omnigraph_compiler::SYSTEM_COLUMNS_META;
 use std::future::Future;
 
 /// Initial row estimate used by Lance's byte-targeted export scanner.
@@ -24,6 +27,7 @@ pub struct ExportCut {
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
     selected_tables: Vec<String>,
+    ranged: RangedExternalBlobs,
     _slot: crate::db::write_queue::ExportCutPermit,
 }
 
@@ -39,6 +43,7 @@ impl ExportCut {
             self.catalog.as_ref(),
             &self.selected_tables,
             ExportRowOrder::ById,
+            self.ranged,
             emit,
         )
         .await
@@ -102,8 +107,6 @@ impl Omnigraph {
                 actual: 2,
             }
         })?;
-
-        self.heal_pending_recovery_sidecars_outcome().await?;
         let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
         let snapshot = resolved.snapshot;
         let selected_tables = export_type_keys(&snapshot, type_names)?;
@@ -113,6 +116,7 @@ impl Omnigraph {
             snapshot,
             catalog,
             selected_tables,
+            ranged: RangedExternalBlobs::Refuse,
             _slot: slot,
         })
     }
@@ -127,7 +131,7 @@ impl Omnigraph {
         branch: &str,
         scope: &crate::changes::ChangeFeedScope,
     ) -> Result<(crate::changes::ChangeBaseline, ExportCut)> {
-        let parts = capture_baseline_parts(self, branch, scope, true).await?;
+        let parts = capture_baseline_parts(self, branch, scope).await?;
         Ok((
             parts.handshake,
             ExportCut {
@@ -135,6 +139,7 @@ impl Omnigraph {
                 snapshot: parts.snapshot,
                 catalog: parts.catalog,
                 selected_tables: parts.selected_tables,
+                ranged: RangedExternalBlobs::Describe,
                 _slot: parts.slot,
             },
         ))
@@ -203,6 +208,7 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
         catalog.as_ref(),
         &selected_tables,
         ExportRowOrder::ById,
+        RangedExternalBlobs::Refuse,
         &mut emit,
     )
     .await
@@ -234,6 +240,7 @@ pub(super) async fn export_jsonl_unordered_to_writer<W: Write>(
         catalog.as_ref(),
         &selected_tables,
         ExportRowOrder::Unspecified,
+        RangedExternalBlobs::Refuse,
         &mut emit,
     )
     .await
@@ -263,7 +270,6 @@ async fn capture_baseline_parts(
     db: &Omnigraph,
     branch: &str,
     scope: &crate::changes::ChangeFeedScope,
-    heal: bool,
 ) -> Result<BaselineParts> {
     let slot = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
         OmniError::ResourceLimitExceeded {
@@ -272,9 +278,6 @@ async fn capture_baseline_parts(
             actual: 2,
         }
     })?;
-    if heal {
-        db.heal_pending_recovery_sidecars_outcome().await?;
-    }
     let normalized_branch = Some(branch).filter(|branch| *branch != "main");
     let cut = db
         .coordinator
@@ -337,7 +340,7 @@ pub(super) async fn capture_change_baseline<W: Write>(
     scope: &crate::changes::ChangeFeedScope,
     writer: &mut W,
 ) -> Result<crate::changes::ChangeBaseline> {
-    let parts = capture_baseline_parts(db, branch, scope, false).await?;
+    let parts = capture_baseline_parts(db, branch, scope).await?;
     let _slot = parts.slot;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
@@ -347,6 +350,7 @@ pub(super) async fn capture_change_baseline<W: Write>(
         parts.catalog.as_ref(),
         &parts.selected_tables,
         ExportRowOrder::ById,
+        RangedExternalBlobs::Describe,
         &mut emit,
     )
     .await?;
@@ -359,15 +363,17 @@ async fn entity_from_snapshot(
     type_key: &str,
     id: &str,
 ) -> Result<Option<serde_json::Value>> {
-    if snapshot.dataset(type_key).is_none() {
+    let Some(entry) = snapshot.dataset(type_key) else {
         return Ok(None);
-    }
+    };
 
     let ds = db
         .storage()
         .open_snapshot_at_table(snapshot, type_key)
         .await?;
-    let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+    let system_columns =
+        crate::db::manifest::system_columns_at_image(ds.dataset().schema(), &entry.type_key)?;
+    let filter_sql = format!("{} = '{}'", system_columns.id, id.replace('\'', "''"));
     let mut batches = db
         .storage()
         .scan_stream_bounded(
@@ -386,7 +392,25 @@ async fn entity_from_snapshot(
         .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
         if batch.num_rows() > 0 {
-            let mut image = logical_row_image(ds.dataset(), &batch, 0).await?;
+            let mut image = logical_row_image(ds.dataset(), &batch, 0, system_columns.id).await?;
+            for (physical, logical) in [(system_columns.id, SYSTEM_COLUMNS_META.id)]
+                .into_iter()
+                .chain(
+                    type_key
+                        .starts_with("edge:")
+                        .then_some([
+                            (system_columns.src, SYSTEM_COLUMNS_META.src),
+                            (system_columns.dst, SYSTEM_COLUMNS_META.dst),
+                        ])
+                        .into_iter()
+                        .flatten(),
+                )
+            {
+                let value = image.remove(physical).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("entity image is missing '{physical}'"))
+                })?;
+                image.insert(logical.to_string(), value);
+            }
             image.retain(|_, value| !value.is_null());
             return Ok(Some(serde_json::Value::Object(image)));
         }
@@ -394,28 +418,46 @@ async fn entity_from_snapshot(
     Ok(None)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportRowOrder {
     ById,
     Unspecified,
 }
 
+/// Emit every selected table's rows in the export line format. `ranged`
+/// decides a ranged external Blob reference: export refuses it, because a bare
+/// URI reloads as the whole object; the change-feed baseline describes it as
+/// change images do, because its consumer starts from exactly this state.
 async fn export_selected_tables<Emit, EmitFuture>(
     db: &Omnigraph,
     snapshot: &Snapshot,
     catalog: &Catalog,
     selected_tables: &[String],
     row_order: ExportRowOrder,
+    ranged: RangedExternalBlobs,
     emit: &mut Emit,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
+    let mut chunks = ExportChunks {
+        emit,
+        pending: Vec::new(),
+    };
     for table_key in selected_tables {
-        export_table(db, snapshot, catalog, table_key, row_order, emit).await?;
+        export_table(
+            db,
+            snapshot,
+            catalog,
+            table_key,
+            row_order,
+            ranged,
+            &mut chunks,
+        )
+        .await?;
     }
-    Ok(())
+    chunks.flush().await
 }
 
 fn export_type_keys(snapshot: &Snapshot, type_names: &[String]) -> Result<Vec<String>> {
@@ -458,7 +500,8 @@ async fn export_table<Emit, EmitFuture>(
     catalog: &Catalog,
     table_key: &str,
     row_order: ExportRowOrder,
-    emit: &mut Emit,
+    ranged: RangedExternalBlobs,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
@@ -468,11 +511,50 @@ where
         .storage()
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
-    let ordering = match row_order {
-        ExportRowOrder::ById => Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
-        ExportRowOrder::Unspecified => None,
-    };
+    // Blob materialization reaches through to the inner Lance `Dataset`
+    // because the batched managed read (`TableStore::managed_blob_payloads`)
+    // takes a pinned dataset, not a `TableStorage` handle (the trait covers
+    // staged-write and snapshot-scan primitives; blob payload reads sit
+    // outside that surface). The ordered walk reads the same pinned dataset.
+    let source_ds = ds.dataset();
     let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
+
+    if row_order == ExportRowOrder::ById {
+        // Sort keys only and hydrate complete rows in bounded chunks: a
+        // complete-row sort fails on a row wider than the ordered-scan sort
+        // cap, and on an ordinary row arriving as a slice of a larger decoded
+        // batch.
+        let mut rows = OrderedRowCursor::open(
+            Some(source_ds.clone()),
+            KeyOrder {
+                key_batch_rows: EXPORT_SCAN_TARGET_ROWS,
+                key_batch_bytes: EXPORT_SCAN_TARGET_BYTES,
+                chunk_rows: EXPORT_SCAN_TARGET_ROWS,
+                chunk_bytes: EXPORT_SCAN_TARGET_BYTES,
+                ..KeyOrder::full()
+            },
+            WalkSubject {
+                operation: "export",
+                table: table_key.to_string(),
+                role: "export",
+            },
+            catalog.system_columns.id,
+        )
+        .await?;
+        while let Some(batch) = rows.next_ordered_batch().await? {
+            emit_export_batch(
+                source_ds,
+                catalog,
+                table_key,
+                &batch,
+                blob_properties,
+                ranged,
+                emit,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
 
     if blob_properties.is_empty() {
         let mut batches = db
@@ -481,7 +563,7 @@ where
                 &ds,
                 None,
                 None,
-                ordering,
+                None,
                 false,
                 EXPORT_SCAN_TARGET_ROWS,
                 EXPORT_SCAN_TARGET_BYTES,
@@ -498,17 +580,16 @@ where
     }
 
     // Lance's byte target is approximate and overrides its row estimate, so a
-    // scanner batch is not a hard memory bound. Slice each returned descriptor
-    // batch explicitly and materialize only one logical row's complete Blob
-    // property set before observing transport backpressure. One Blob value and
-    // one row's encoded JSON remain indivisible scratch allocations.
+    // scanner batch is not a hard memory bound. It holds Blob descriptors
+    // only: `emit_export_batch` takes one row's Blob values at a time from the
+    // batch's batched reads.
     let mut batches = db
         .storage()
         .scan_stream_bounded(
             &ds,
             None,
             None,
-            ordering,
+            None,
             true,
             EXPORT_SCAN_TARGET_ROWS,
             EXPORT_SCAN_TARGET_BYTES,
@@ -519,60 +600,259 @@ where
         .await
         .map_err(crate::table_store::TableStore::ordered_scan_error)?
     {
-        for row_index in 0..batch.num_rows() {
-            let row = batch.slice(row_index, 1);
-            let row_id = row
-                .column_by_name("_rowid")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "expected _rowid column when exporting '{}'",
-                        table_key
-                    ))
-                })?
-                .value(0);
-            // Blob materialization reaches through to the inner Lance
-            // `Dataset` because `take_blobs` is a Lance-only API not lifted
-            // onto the `TableStorage` trait surface (the trait covers
-            // staged-write and snapshot-scan primitives; blob descriptor
-            // materialization sits outside that surface).
-            let blob_values =
-                export_blob_values(ds.dataset(), &row, &[row_id], blob_properties).await?;
-            emit_export_rows_from_batch(catalog, table_key, &row, Some(&blob_values), emit).await?;
-        }
+        emit_export_batch(
+            source_ds,
+            catalog,
+            table_key,
+            &batch,
+            blob_properties,
+            ranged,
+            emit,
+        )
+        .await?;
     }
     Ok(())
 }
 
-pub(crate) async fn export_blob_values(
+/// Emit one scanned batch. A table with Blob properties reads each Blob
+/// column's managed cells through one batched read ([`BlobRowReader`]) and
+/// emits row by row, so one row's Blob values are materialized before
+/// observing transport backpressure; one Blob value and one row's encoded JSON
+/// remain indivisible scratch allocations. The batch must carry `_rowid` when
+/// the table has Blob properties.
+async fn emit_export_batch<Emit, EmitFuture>(
     source_ds: &Dataset,
+    catalog: &Catalog,
+    table_key: &str,
     batch: &RecordBatch,
-    row_ids: &[u64],
     blob_properties: &std::collections::HashSet<String>,
-) -> Result<HashMap<String, Vec<Option<String>>>> {
-    let mut values = HashMap::with_capacity(blob_properties.len());
-    let mut __dst_props: Vec<_> = blob_properties.iter().collect();
-    __dst_props.sort();
-    for property in __dst_props {
-        let descriptions = batch
-            .column_by_name(property)
-            .and_then(|col| col.as_any().downcast_ref::<StructArray>())
-            .ok_or_else(|| {
-                OmniError::blob_integrity(format!(
-                    "expected blob descriptions for export column '{}'",
-                    property
-                ))
-            })?;
-        values.insert(
-            property.clone(),
-            export_blob_column_values(source_ds, property, descriptions, row_ids).await?,
+    ranged: RangedExternalBlobs,
+    emit: &mut ExportChunks<'_, Emit>,
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
+    if blob_properties.is_empty() {
+        return emit_export_rows_from_batch(catalog, table_key, batch, None, emit).await;
+    }
+    let row_ids = batch
+        .column_by_name("_rowid")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "expected _rowid column when exporting '{}'",
+                table_key
+            ))
+        })?;
+    let mut blobs =
+        BlobRowReader::open(source_ds, batch, row_ids.values(), blob_properties, ranged).await?;
+    for row_index in 0..batch.num_rows() {
+        let blob_values = blobs.next_row().await?;
+        emit_export_rows_from_batch(
+            catalog,
+            table_key,
+            &batch.slice(row_index, 1),
+            Some(&blob_values),
+            emit,
+        )
+        .await?;
+    }
+    blobs.finish().await
+}
+
+/// One logical Blob cell value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogicalBlobValue {
+    /// Managed bytes as `base64:…`, or an external reference to a whole
+    /// object as its URI: the load format's own spelling.
+    Text(String),
+    /// An external descriptor naming a byte range of its object. The load
+    /// format has no spelling for it; only a caller that asked to describe
+    /// ranges receives one.
+    RangedExternal(crate::blob::ExternalBlobRef),
+}
+
+/// What a Blob value reader does with a ranged external descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangedExternalBlobs {
+    /// Fail: the output is reloadable, and a bare URI reloads as the whole
+    /// object, which would widen the cell.
+    Refuse,
+    /// Return the exact reference as [`LogicalBlobValue::RangedExternal`],
+    /// which the row renderers describe as `{"uri", "offset", "length"}`.
+    Describe,
+}
+
+/// The ranged external Blob cells of row `row` of `blob_values`, by property.
+fn ranged_blob_cells(
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
+    row: usize,
+) -> impl Iterator<Item = (&String, &crate::blob::ExternalBlobRef)> {
+    blob_values
+        .into_iter()
+        .flatten()
+        .filter_map(move |(name, cells)| match cells.get(row) {
+            Some(Some(LogicalBlobValue::RangedExternal(reference))) => Some((name, reference)),
+            _ => None,
+        })
+}
+
+/// Write the ranged external Blob cells of row `row` into that row's JSON
+/// object, which [`row_json_lines`] rendered with null in their place, as the
+/// exact `{"uri", "offset", "length"}` reference.
+fn describe_ranged_blob_cells(
+    image: &mut serde_json::Map<String, serde_json::Value>,
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
+    row: usize,
+) -> Result<()> {
+    for (name, reference) in ranged_blob_cells(blob_values, row) {
+        // The descriptor decoder gives every ranged reference a positive
+        // length: it refuses an offset with size 0, and offset 0 with size 0
+        // is the whole object, never ranged.
+        let length = reference.length.ok_or_else(|| {
+            OmniError::manifest_internal("a ranged external Blob reference carries no length")
+        })?;
+        image.insert(
+            name.clone(),
+            serde_json::json!({
+                "uri": reference.uri,
+                "offset": reference.offset,
+                "length": length,
+            }),
         );
     }
+    Ok(())
+}
+
+/// One Blob cell classified from its descriptor: decided without payload I/O,
+/// or managed and read from its column's batched read.
+enum ClassifiedBlobCell {
+    Decided(Option<LogicalBlobValue>),
+    Managed { length: u64 },
+}
+
+/// One Blob column of a [`BlobRowReader`]: its classified cells in row order
+/// and the batched read of its managed cells, in the same order.
+struct BlobColumnRows<'a> {
+    name: &'a str,
+    cells: std::vec::IntoIter<ClassifiedBlobCell>,
+    payloads: crate::table_store::ManagedBlobPayloads<'a>,
+}
+
+/// The Blob values of one batch, produced row by row. Every cell of every
+/// column is classified from its descriptor before any payload read: an
+/// external reference is never opened, and a ranged one is refused or
+/// described here. A column holding a managed cell then reads all of the
+/// batch's managed payloads through one batched read
+/// ([`TableStore::managed_blob_payloads`]), consumed as rows are taken, so one
+/// row's values plus each column read's bounded I/O buffer are resident,
+/// however many rows the batch holds.
+///
+/// [`TableStore::managed_blob_payloads`]: crate::table_store::TableStore::managed_blob_payloads
+pub(crate) struct BlobRowReader<'a> {
+    columns: Vec<BlobColumnRows<'a>>,
+}
+
+impl<'a> BlobRowReader<'a> {
+    /// Classify the `properties` cells of `batch`, whose row `i` has stable row
+    /// id `row_ids[i]`, then open each column's batched managed read.
+    pub(crate) async fn open(
+        source_ds: &Dataset,
+        batch: &RecordBatch,
+        row_ids: &[u64],
+        properties: &'a std::collections::HashSet<String>,
+        ranged: RangedExternalBlobs,
+    ) -> Result<Self> {
+        let mut names = properties.iter().map(String::as_str).collect::<Vec<_>>();
+        names.sort_unstable();
+        let mut classified = Vec::with_capacity(names.len());
+        for name in names {
+            let descriptions = batch
+                .column_by_name(name)
+                .and_then(|col| col.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::blob_integrity(format!(
+                        "expected blob descriptions for export column '{name}'"
+                    ))
+                })?;
+            classified.push((
+                name,
+                classify_blob_cells(name, descriptions, row_ids, ranged)?,
+            ));
+        }
+        let mut columns = Vec::with_capacity(classified.len());
+        for (name, (cells, managed_row_ids)) in classified {
+            columns.push(BlobColumnRows {
+                name,
+                cells: cells.into_iter(),
+                payloads: crate::table_store::TableStore::managed_blob_payloads(
+                    source_ds,
+                    name,
+                    managed_row_ids,
+                )
+                .await?,
+            });
+        }
+        Ok(Self { columns })
+    }
+
+    /// The next row's Blob values by property, each a one-row column.
+    pub(crate) async fn next_row(
+        &mut self,
+    ) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
+        let mut values = HashMap::with_capacity(self.columns.len());
+        for column in &mut self.columns {
+            let cell = column.cells.next().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "Blob column '{}' has no row left in its batch",
+                    column.name
+                ))
+            })?;
+            let value = match cell {
+                ClassifiedBlobCell::Decided(value) => value,
+                ClassifiedBlobCell::Managed { length } => {
+                    let bytes = column.payloads.next(length).await?;
+                    Some(LogicalBlobValue::Text(format!(
+                        "base64:{}",
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+                    )))
+                }
+            };
+            values.insert(column.name.to_string(), vec![value]);
+        }
+        Ok(values)
+    }
+
+    /// Refuse a read that returned more payloads than the batch's managed
+    /// cells.
+    pub(crate) async fn finish(self) -> Result<()> {
+        for column in self.columns {
+            column.payloads.finish().await?;
+        }
+        Ok(())
+    }
+}
+
+/// The Blob values of the one-row batch `row`, whose stable row id is
+/// `row_id`, by property.
+pub(crate) async fn row_blob_values(
+    source_ds: &Dataset,
+    row: &RecordBatch,
+    row_id: u64,
+    properties: &std::collections::HashSet<String>,
+    ranged: RangedExternalBlobs,
+) -> Result<HashMap<String, Vec<Option<LogicalBlobValue>>>> {
+    let mut reader = BlobRowReader::open(source_ds, row, &[row_id], properties, ranged).await?;
+    let values = reader.next_row().await?;
+    reader.finish().await?;
     Ok(values)
 }
 
 /// Convert one descriptor-scanned row into the same logical value shape used
-/// by export, materializing at most that row's Blob values.
+/// by export, materializing at most that row's Blob values. A ranged external
+/// descriptor, which export refuses, is described exactly as the object
+/// `{"uri", "offset", "length"}` without contacting the object.
 ///
 /// A pinned Lance version is the commit-era schema authority: the image is
 /// decoded from the batch's own schema, never the live catalog, so retained
@@ -583,9 +863,8 @@ pub(crate) async fn logical_row_image(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row: usize,
+    id_col: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
-    use crate::changes::model::is_reserved_storage_system_column;
-
     let row_batch = batch.slice(row, 1);
     let blob_properties = row_batch
         .schema()
@@ -609,9 +888,17 @@ pub(crate) async fn logical_row_image(
             .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
             .value(0);
-        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
+        Some(
+            row_blob_values(
+                source_ds,
+                &row_batch,
+                row_id,
+                &blob_properties,
+                RangedExternalBlobs::Describe,
+            )
+            .await?,
+        )
     };
-
     let fields = row_batch
         .schema()
         .fields()
@@ -619,7 +906,7 @@ pub(crate) async fn logical_row_image(
         .filter(|field| !is_reserved_storage_system_column(field.name()))
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0)?;
+    let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0, id_col)?;
     let bytes = json_rows(&lines)
         .next()
         .ok_or_else(|| OmniError::manifest_internal("row image rendered no JSON object"))?;
@@ -630,88 +917,122 @@ pub(crate) async fn logical_row_image(
     for name in fields {
         image.entry(name).or_insert(serde_json::Value::Null);
     }
+    describe_ranged_blob_cells(&mut image, blob_values.as_ref(), 0)?;
     Ok(image)
 }
 
+/// One rendered row's `data` object, with its ranged external Blob cells
+/// described. Only a row that holds one is parsed and written again.
+fn export_row_data<'a>(
+    data: &'a [u8],
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
+    row: usize,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    if ranged_blob_cells(blob_values, row).next().is_none() {
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+    let mut object: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(data)
+        .map_err(|err| {
+            OmniError::manifest_internal(format!(
+                "export row did not parse as a JSON object: {err}"
+            ))
+        })?;
+    describe_ranged_blob_cells(&mut object, blob_values, row)?;
+    serde_json::to_vec(&object)
+        .map(std::borrow::Cow::Owned)
+        .map_err(|err| OmniError::manifest_internal(format!("export row did not encode: {err}")))
+}
+
+/// Emits one JSON line per row. The logical envelope keys the identity as `id`
+/// beside `type` on every vintage, so `data` skips the leading system column and
+/// carries user properties only (RFC 0040).
 async fn emit_export_rows_from_batch<Emit, EmitFuture>(
     catalog: &Catalog,
     table_key: &str,
     batch: &RecordBatch,
-    blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
-    emit: &mut Emit,
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
+    emit: &mut ExportChunks<'_, Emit>,
 ) -> Result<()>
 where
     Emit: FnMut(Vec<u8>) -> EmitFuture,
     EmitFuture: Future<Output = Result<()>>,
 {
+    let ids = named_string_column(batch, catalog.system_columns.id)?;
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
-        let fields = std::iter::once("id".to_string()).chain(
-            node_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(1)
-                .map(|field| field.name().clone()),
-        );
-        let fields = fields.collect::<Vec<_>>();
+        let fields = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(1)
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
         let mut prefix = b"{\"type\":".to_vec();
         json_string_into(&mut prefix, type_name)?;
-        prefix.extend_from_slice(b",\"data\":");
+        prefix.extend_from_slice(b",\"id\":");
         for rows in render_windows(batch.num_rows()) {
             let lines = row_json_lines(
                 &batch.slice(rows.start, rows.len()),
                 &fields,
                 blob_values,
                 rows.start,
+                catalog.system_columns.id,
             )?;
-            for data in json_rows(&lines) {
-                let mut line = Vec::with_capacity(prefix.len() + data.len() + 2);
+            for (offset, data) in json_rows(&lines).enumerate() {
+                let row = rows.start + offset;
+                let data = export_row_data(data, blob_values, row)?;
+                let mut line = Vec::with_capacity(prefix.len() + data.len() + 32);
                 line.extend_from_slice(&prefix);
-                line.extend_from_slice(data);
+                json_string_into(&mut line, ids.value(row))?;
+                line.extend_from_slice(b",\"data\":");
+                line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
     }
 
     if let Some(edge_name) = table_key.strip_prefix("edge:") {
+        let sources = named_string_column(batch, catalog.system_columns.src)?;
+        let destinations = named_string_column(batch, catalog.system_columns.dst)?;
         let edge_type = catalog
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-        let fields = std::iter::once("id".to_string()).chain(
-            edge_type
-                .arrow_schema
-                .fields()
-                .iter()
-                .skip(3)
-                .map(|field| field.name().clone()),
-        );
-        let fields = fields.collect::<Vec<_>>();
+        let fields = edge_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(3)
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
         for rows in render_windows(batch.num_rows()) {
             let lines = row_json_lines(
                 &batch.slice(rows.start, rows.len()),
                 &fields,
                 blob_values,
                 rows.start,
+                catalog.system_columns.id,
             )?;
             for (offset, data) in json_rows(&lines).enumerate() {
                 let row = rows.start + offset;
+                let data = export_row_data(data, blob_values, row)?;
                 let mut line = b"{\"edge\":".to_vec();
                 json_string_into(&mut line, edge_name)?;
+                line.extend_from_slice(b",\"id\":");
+                json_string_into(&mut line, ids.value(row))?;
                 line.extend_from_slice(b",\"from\":");
-                json_string_into(&mut line, &named_string_value(batch, "src", row)?)?;
+                json_string_into(&mut line, sources.value(row))?;
                 line.extend_from_slice(b",\"to\":");
-                json_string_into(&mut line, &named_string_value(batch, "dst", row)?)?;
+                json_string_into(&mut line, destinations.value(row))?;
                 line.extend_from_slice(b",\"data\":");
-                line.extend_from_slice(data);
+                line.extend_from_slice(&data);
                 line.extend_from_slice(b"}\n");
-                emit_export_line(emit, line).await?;
+                emit.line(line).await?;
             }
         }
         return Ok(());
@@ -729,19 +1050,51 @@ fn json_string_into(out: &mut Vec<u8>, value: &str) -> Result<()> {
     })
 }
 
-async fn emit_export_line<Emit, EmitFuture>(emit: &mut Emit, line: Vec<u8>) -> Result<()>
-where
-    Emit: FnMut(Vec<u8>) -> EmitFuture,
-    EmitFuture: Future<Output = Result<()>>,
-{
-    for chunk in line.chunks(EXPORT_CHUNK_MAX_BYTES) {
-        emit(chunk.to_vec()).await?;
-    }
-    Ok(())
+/// One pending transport allocation, shared by consecutive JSON lines and
+/// tables. A full chunk moves into the callback before another buffer is
+/// allocated, so an awaited send never retains a second pending chunk here.
+struct ExportChunks<'a, Emit> {
+    emit: &'a mut Emit,
+    pending: Vec<u8>,
 }
 
-/// Rows rendered per writer call on export, so the first line leaves before a
-/// whole scanner batch is rendered.
+impl<Emit> ExportChunks<'_, Emit> {
+    async fn line<EmitFuture>(&mut self, line: Vec<u8>) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        let mut remaining = line.as_slice();
+        while !remaining.is_empty() {
+            if self.pending.capacity() == 0 {
+                self.pending = Vec::with_capacity(EXPORT_CHUNK_MAX_BYTES);
+            }
+            let count = remaining
+                .len()
+                .min(EXPORT_CHUNK_MAX_BYTES - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if self.pending.len() == EXPORT_CHUNK_MAX_BYTES {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush<EmitFuture>(&mut self) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        if !self.pending.is_empty() {
+            (self.emit)(std::mem::take(&mut self.pending)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Rows rendered per JSON writer call before filling transport chunks, rather
+/// than rendering a whole scanner batch into one scratch allocation.
 const EXPORT_RENDER_ROWS: usize = 256;
 
 fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
@@ -752,12 +1105,15 @@ fn render_windows(rows: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
 
 /// `batch` rendered by `QueryResult::to_json_lines` with its columns in `fields`
 /// order; a column named in `blob_values` is emitted from those strings (indexed
-/// from `first_row`) instead of the batch column. Iterate the rows with [`json_rows`].
+/// from `first_row`) instead of the batch column. A ranged external value has no
+/// string form and renders as null; its caller describes it with
+/// [`describe_ranged_blob_cells`]. Iterate the rows with [`json_rows`].
 fn row_json_lines(
     batch: &RecordBatch,
     fields: &[String],
-    blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
+    blob_values: Option<&HashMap<String, Vec<Option<LogicalBlobValue>>>>,
     first_row: usize,
+    id_col: &str,
 ) -> Result<Vec<u8>> {
     let source = batch.schema();
     let mut schema_fields: Vec<Arc<Field>> = Vec::new();
@@ -765,14 +1121,16 @@ fn row_json_lines(
     for name in fields {
         if let Some(values) = blob_values.and_then(|values| values.get(name)) {
             schema_fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
-            columns.push(Arc::new(
-                values
-                    .iter()
-                    .skip(first_row)
-                    .take(batch.num_rows())
-                    .map(Option::as_deref)
-                    .collect::<StringArray>(),
-            ));
+            let cells = values
+                .iter()
+                .skip(first_row)
+                .take(batch.num_rows())
+                .map(|cell| match cell {
+                    Some(LogicalBlobValue::Text(text)) => Some(text.as_str()),
+                    None | Some(LogicalBlobValue::RangedExternal(_)) => None,
+                })
+                .collect::<StringArray>();
+            columns.push(Arc::new(cells));
             continue;
         }
         let (index, _) = source.column_with_name(name).ok_or_else(|| {
@@ -782,13 +1140,17 @@ fn row_json_lines(
         columns.push(batch.column(index).clone());
     }
     let schema = Arc::new(Schema::new(schema_fields));
-    let projected =
-        RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)?;
+    let projected = RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(OmniError::arrow_internal)?;
     if let Some(cell) =
         omnigraph_compiler::json_output::unformattable_date(std::slice::from_ref(&projected))
     {
-        let id = projected
-            .column_by_name("id")
+        let id = batch
+            .column_by_name(id_col)
             .and_then(|column| column.as_any().downcast_ref::<StringArray>())
             .filter(|ids| ids.is_valid(cell.row))
             .map(|ids| ids.value(cell.row).to_string());
@@ -819,82 +1181,59 @@ fn json_rows(lines: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|line| !line.is_empty())
 }
 
-async fn export_blob_column_values(
-    source_ds: &Dataset,
+/// Classify one column's cells from their descriptors, with no payload I/O:
+/// the cells in row order, and the stable row ids of its managed cells in the
+/// same order.
+fn classify_blob_cells(
     column_name: &str,
     descriptions: &StructArray,
     row_ids: &[u64],
-) -> Result<Vec<Option<String>>> {
+    ranged: RangedExternalBlobs,
+) -> Result<(Vec<ClassifiedBlobCell>, Vec<u64>)> {
     let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let mut cells = Vec::with_capacity(row_ids.len());
     let mut managed_row_ids = Vec::new();
-    let mut managed_positions = Vec::new();
-    let mut values = vec![None; row_ids.len()];
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        match decoder.classify(row)? {
-            crate::blob::BlobDescriptor::Null => {}
-            crate::blob::BlobDescriptor::Managed { .. } => {
+        cells.push(match decoder.classify(row)? {
+            crate::blob::BlobDescriptor::Null => ClassifiedBlobCell::Decided(None),
+            crate::blob::BlobDescriptor::Managed { length } => {
                 managed_row_ids.push(*row_id);
-                managed_positions.push(row);
+                ClassifiedBlobCell::Managed { length }
             }
-            crate::blob::BlobDescriptor::External { uri, .. } => {
-                // Export is descriptor-preserving. It must not open or probe a
-                // caller-owned object merely to reproduce the stored URI.
-                values[row] = Some(uri);
+            crate::blob::BlobDescriptor::External {
+                uri,
+                offset,
+                length,
+            } => {
+                // Descriptor-preserving: never open or probe a caller-owned
+                // object merely to reproduce the stored reference. A bare URI
+                // reloads as the whole object, so a ranged descriptor is
+                // refused or described, never widened.
+                let reference = crate::blob::ExternalBlobRef {
+                    uri,
+                    offset,
+                    length,
+                };
+                ClassifiedBlobCell::Decided(Some(match (reference.whole_object_uri(), ranged) {
+                    (Ok(_), _) => LogicalBlobValue::Text(reference.uri),
+                    (Err(_), RangedExternalBlobs::Describe) => {
+                        LogicalBlobValue::RangedExternal(reference)
+                    }
+                    (Err(refused), RangedExternalBlobs::Refuse) => {
+                        return Err(OmniError::manifest(format!(
+                            "export cannot represent {refused} in '{column_name}': export writes an external Blob as a bare URI, which reloads as the whole object"
+                        )));
+                    }
+                }))
             }
-        }
+        });
     }
 
-    if managed_row_ids.is_empty() {
-        return Ok(values);
-    }
-
-    let mut perm: Vec<usize> = (0..managed_row_ids.len()).collect();
-    perm.sort_by_key(|&i| managed_row_ids[i]);
-    let sorted_ids: Vec<u64> = perm.iter().map(|&i| managed_row_ids[i]).collect();
-
-    let sorted_blobs = Arc::new(source_ds.clone())
-        .take_blobs(&sorted_ids, column_name)
-        .await
-        .map_err(OmniError::storage)?;
-
-    if sorted_blobs.len() != managed_positions.len() {
-        return Err(OmniError::blob_integrity(format!(
-            "blob export for '{}' lost alignment with selected rows",
-            column_name
-        )));
-    }
-
-    let mut inverse_perm = vec![0usize; perm.len()];
-    for (sorted_pos, &orig_pos) in perm.iter().enumerate() {
-        inverse_perm[orig_pos] = sorted_pos;
-    }
-
-    for (idx, position) in managed_positions.into_iter().enumerate() {
-        let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
-            OmniError::blob_integrity(format!(
-                "blob export for '{}' returned a null accessor for a managed description",
-                column_name
-            ))
-        })?;
-        if blob.uri().is_some() {
-            return Err(OmniError::blob_integrity(format!(
-                "blob export for '{}' resolved a managed description as external",
-                column_name
-            )));
-        }
-        let bytes = blob.read().await.map_err(OmniError::storage)?;
-        let value = format!(
-            "base64:{}",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-        );
-        values[position] = Some(value);
-    }
-
-    Ok(values)
+    Ok((cells, managed_row_ids))
 }
 
-fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
+fn named_string_column<'a>(batch: &'a RecordBatch, field_name: &str) -> Result<&'a StringArray> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
         OmniError::manifest_internal(format!("missing column '{}' in export batch", field_name))
     })?;
@@ -904,11 +1243,11 @@ fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Resu
         .ok_or_else(|| {
             OmniError::manifest_internal(format!("expected Utf8 column '{}'", field_name))
         })?;
-    if array.is_null(row) {
+    if array.null_count() != 0 {
         return Err(OmniError::manifest_internal(format!(
             "unexpected null in export column '{}'",
             field_name
         )));
     }
-    Ok(array.value(row).to_string())
+    Ok(array)
 }

@@ -24,9 +24,16 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer and graph-lineage update. A writer may move Lance HEADs
-   first only under durable recovery ownership. Per-table publication is never
-   graph publication.
+   visible table pointer, accepted schema contract and graph-lineage update.
+   A write to an existing registered table never moves its linear HEAD: its effects are detached commits the `__manifest`
+   pin `(published_dataset_version, staged_version, transaction_uuid)`
+   names, every pin is a detached version that opens, and the pin is the
+   table's version for its whole life. A graph table's linear HEAD stays at
+   its creation version, recorded per registration as
+   `omnigraph.last_linear_version`; `repair` reads it for drift. Added-type
+   admission may also inspect an unregistered deterministic path, but accepts
+   only its qualified original empty version 1, never an advanced HEAD.
+   Per-table publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
@@ -39,11 +46,31 @@ five more changes like this one?**
    They do not acknowledge or publish per statement or per table. The D2
    constructive-versus-destructive mutation split remains explicit.
 
-5. **Recovery is part of the commit protocol.** Any independently durable
-   effect that could become graph-visible must have enough persisted identity,
-   authority, and intended outcome to roll forward or compensate safely.
-   Ambiguous or foreign movement fails closed. Writers resolve or refuse
-   relevant recovery before replanning. See [recovery.md](recovery.md).
+5. **Crash convergence is part of the commit protocol.** An effect that is
+   durable before publication must be unreachable: a detached version or a
+   staged file nothing references, which a retry ignores. `cleanup`'s
+   collector reclaims such a version only when the publication authority
+   its transaction properties record is provably gone; age does not prove
+   abandonment. The two explicitly requested exceptions are the publishable
+   proposal (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md))
+   and the nonpublishable snapshot (`as unattached branch`,
+   [RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): each writes a
+   detached `__manifest` version reachable by its graph commit id through a
+   reserved tag, `unpublished_<id>` for the proposal and
+   `unattached_<root>_<C>` for the snapshot, which acknowledges durable
+   snapshot addressability with `published: false` and never branch
+   visibility; the branch still changes only at the proposal's later ordinary
+   publication, the snapshot never publishes, and both tags expire with the
+   captured target authority. Published table effects and the accepted schema contract
+   are complete in one manifest publication; no contract-file installation
+   remains. There is no side record to classify. The collector holds two properties
+   on every run: safety, that every pin of every retained `__manifest`
+   version on every live branch still opens and every path its manifest
+   lists still exists after the run; and progress, that a table version no
+   retained `__manifest` version names is gone after a run that retains
+   nothing else. Foreign movement fails closed: a linear commit above a
+   table's last linear version is reported by `repair` and never adopted.
+   See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -66,6 +93,18 @@ five more changes like this one?**
    mutations, polymorphism, policy predicates, and future planner capabilities
    belong in AST, IR, and typed plan structures. Do not smuggle semantics
    through strings, transport flags, global state, or side tables.
+   Expressions and parameter declarations retain the compiler's type.
+   Numeric comparison conversions are explicit Cast nodes; execution and scan
+   pushdown never select a domain from values. The internal exact integer
+   carrier cannot appear in a declared property, parameter or public result.
+   Mutation statements retain the compiler-selected node or edge target;
+   execution does not choose again when both namespaces contain the same name.
+   Binding validates every declared parameter, including unused declarations;
+   replay validates used values against the retained leaves. Projection fields
+   come from those declarations, including empty results. Opened Lance fields
+   must match the accepted storage schema in type and nullability. Derived
+   operator fields may widen nullable flags, but values may not violate a
+   declared non-null constraint.
 
 10. **Trust is established at the boundary and enforced at the engine.** HTTP
     resolves bearer tokens to actors; a client never supplies its trusted actor
@@ -80,7 +119,9 @@ five more changes like this one?**
     history.
 
 12. **One source of truth, cheaply derived.** Lance, `__manifest`, and the
-    accepted schema are authoritative. Immutable version-pinned state may be
+    accepted schema are authoritative. `__manifest` is a table's only
+    lineage; the table's Lance linear history is not a second, derived
+    history. Immutable version-pinned state may be
     cached; mutable-tip caches are hints, never commit authority. Do not
     maintain a shadow copy that can drift or rebuild a warm projection from
     full history on every call.
@@ -116,22 +157,35 @@ different:
   durable graph visibility;
 - maintained parallel truth or cold full-history reconstruction per request.
 
+Cases an RFC has argued: the flat locator objects and legacy data files under
+`__history/legacy/`, written once by the storage upgrade (from stamp 8, 9 or 13), in the
+[RFC 0068 amendment](../rfcs/0068-graph-commit-record.md#why-this-is-not-a-deny-list-shape).
+
 ## Current support boundaries
 
-- The server is cluster-only. Runtime graph add/remove is performed by
-  `cluster apply` followed by restart, not an HTTP mutation.
+- The server is cluster-only and ledger v2 is the sole operational protocol.
+  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
+  under existing writer admission.
+  Runtime views share engine authority and retain immutable request bindings.
+  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
+  conversion is explicit and preserves data; no v1 executor remains. Removing
+  a graph declaration authorizes deletion of its exact managed root and all
+  retained history, after affected admission closes and admitted work drains.
+  The existing ledger records deletion intent before effects and owns resumption
+  through verified root absence. Adoption and missing-root recreation remain
+  unsupported; unexpected roots and schema drift refuse rather than infer
+  identity from matching text.
+  One outstanding durable authority owns completion/recovery. Generic drain
+  does not prove native-I/O settlement or authorize lock release; excluded raw
+  and older writers remain an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.
-- Some Optimize and destructive full-recovery decisions retain a
-  one-mutation-process boundary because Lance does not expose the exact
-  caller-owned maintenance transaction proof they would need for distributed
-  takeover. The live write-entry heal's effect-free retirement (issue #554)
-  relies on the same boundary: its proof-then-delete is fenced by
-  process-local gates, so a second mutation process's live Armed intent, or
-  an already-transmitted storage write of a just-dropped in-process writer,
-  is outside what it can observe — the same bounded residual the Full-sweep
-  abandonment of an effect-free intent has always carried.
+- Schema apply retains its main-only, single-live-branch restriction and
+  process-local gate ordering. Its contract and table references publish
+  together; the removed file-installation protocol supplies no distributed
+  lock. Branch creation/deletion and cleanup retain their existing
+  single-writer-process control boundary.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 
@@ -142,7 +196,13 @@ code, tests, guide, and—when irreversible—RFC.
 
 - Does one snapshot or authority token cover the whole operation?
 - Is graph visibility still one manifest publication?
-- Is every pre-publication durable effect owned by recovery?
+- Is every pre-publication durable effect unreachable until the manifest names
+  it, and are the table pins and accepted contract complete in that publication?
+- Does it read linear HEAD outside `repair` or qualified original-version
+  admission for an unregistered added-type path, or rebuild a row without carrying
+  `omnigraph.last_linear_version` forward?
+- Does the collector's mark set still cover every retained pin, and does its
+  sweep still reach every unretained published version?
 - Are names kept separate from stable identity?
 - Does a missing physical optimization preserve logical correctness?
 - Are retries, memory, I/O, and failure outcomes bounded?

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-07-14
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -20,6 +20,20 @@ blocked_on: []
 > but RFC 0026 was later rejected and removed. Its lifecycle, WAL, and v7+
 > passages below are historical consumers of the identity model, not current
 > format behavior. See [the current ingestion design](../dev/ingestion.md).
+
+> **Later-RFC disposition:** [RFC 0067](0067-detached-table-commits.md) removed
+> the recovery sidecar. Historical: the SchemaApply recovery contract in §6, the
+> sidecar sentences in §4.5, §10, §11, and §13, and the arming and
+> rolled-back-attempt paragraph of §3.2.
+> [RFC 0040](0040-system-column-namespace.md) made system column spellings per
+> graph, so "These fields cannot be renamed" (§3.2) no longer holds; the fields
+> stay undeclarable.
+> [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
+> publishes the schema contract atomically in `__manifest`, so open validates
+> the `schema_contract` row, not the `_schema.ir.json` and `_schema.pg` files of
+> §4.3. `schema_ir_hash` and the schema token stay; the shape comparison is
+> recomputed, and no `schema_shape_hash` is recorded. Current: stable type, table, and property ids, table
+> incarnation, and the object-id grammar.
 
 **Depends on:** [RFC 0022](0022-unified-write-path.md)'s accepted-schema capture,
 SchemaApply recovery, and strict publication boundary
@@ -361,12 +375,14 @@ Object IDs and initial physical paths are name-independent:
 
 ```text
 table:{stable_table_id:016x}:{table_incarnation_id:016x}
-table_version:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
-table_tombstone:{stable_table_id:016x}:{table_incarnation_id:016x}:{version:020}
+table_version:{stable_table_id:016x}:{table_incarnation_id:016x}:{manifest_version:020}
+table_tombstone:{stable_table_id:016x}:{table_incarnation_id:016x}:{manifest_version:020}
 
 nodes/{stable_table_id:016x}-{table_incarnation_id:016x}
 edges/{stable_table_id:016x}-{table_incarnation_id:016x}
 ```
+
+Since [RFC 0062](0062-manifest-version-clock.md) the trailing segment is the `__manifest` version that wrote the row; the table's Lance version stays in the row's `table_version` column.
 
 The current registration row binds one identity pair to its current alias and
 unchanging path. A type rename updates that binding under the same registration
@@ -715,3 +731,10 @@ The implementation review completed these gates:
 This implementation closes BLOCKER-07's specification-ownership contradiction.
 RFC 0023 through RFC 0026 may consume the stable pair, but each still owns its
 independent activation, evidence, and format/recovery gates.
+
+## Decision log
+
+- 2026-09-07: RFC 0062 amends §4.5: the trailing `{version:020}` of
+  `table_version:` and `table_tombstone:` object ids becomes the `__manifest`
+  version that wrote the row (the manifest clock); the table's Lance version
+  stays in the row's `table_version` column.

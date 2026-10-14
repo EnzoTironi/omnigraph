@@ -1,0 +1,171 @@
+# issue: none
+# notes: Feature writes after a pointer switch while child still borrows its former fork.
+# notes: A replacement branch then writes and fast-forwards into feature.
+# notes: Further writes on feature and replacement stay isolated; child retains its old rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create child from feature
+
+--- expect ok
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_write() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate branch: feature
+query feature_writes_after_pointer_switch() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create replacement from feature
+
+--- expect ok
+
+--- mutate branch: replacement
+query replacement_write() {
+    update Person set { age: 34 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: replacement
+query replacement_reads_its_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":34}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate
+branch merge replacement into feature
+
+--- expect outcome: fast_forward
+
+--- query branch: feature
+query feature_reads_merged_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":34}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate branch: feature
+query feature_writes_after_borrowing() {
+    update Person set { age: 35 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: replacement
+query replacement_writes_independently() {
+    update Person set { age: 36 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: child
+query child_kept_its_rows() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":31}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: feature
+query feature_kept_its_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":35}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: replacement
+query replacement_kept_its_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":36}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query branch: main
+query main_kept_its_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+
+--- expect shape
+p.name: String
+p.age: I32

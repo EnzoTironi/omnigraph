@@ -1,0 +1,554 @@
+use std::sync::Arc;
+
+use arrow_array::{RecordBatch, RecordBatchIterator};
+use arrow_schema::{Field, Schema, SchemaRef};
+use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
+use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
+use lance_file::version::LanceFileVersion;
+use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::catalog::Catalog;
+use omnigraph_core::graph_commit_id::canonical_ulid;
+
+use crate::error::{OmniError, Result};
+
+use super::layout::{
+    manifest_uri, open_manifest_branch_with_identifier, open_manifest_dataset_with_session,
+};
+use super::metadata::TableVersionMetadata;
+use super::migrations::{guard_stamp, stamp_entry, stamp_for_system_columns};
+use super::state::{
+    GraphLineageRow, ManifestRows, ManifestState, TablePin, TableRow, TableState,
+    read_manifest_state, read_manifest_state_and_rows,
+};
+use super::{TableIdentity, TableRegistration, table_path_for_identity};
+use crate::history::ExtentCache;
+use crate::record::{compact_to_storage, manifest_storage_schema};
+use crate::seams::{decide_seam, fail};
+
+/// The manifest version the init `Dataset::write` produces (Lance datasets start
+/// at version one). The genesis graph commit pins this version — a snapshot at
+/// it is the empty, freshly-initialized graph, and since the whole manifest
+/// birth is that single Create commit (entries, lineage, and the
+/// internal-schema stamp all ride it), genesis IS the live version at init.
+const GENESIS_MANIFEST_VERSION: u64 = 1;
+
+/// The generation of the genesis commit, the one commit with no parent.
+const GENESIS_GENERATION: u64 = 0;
+
+/// Exact, attempt-local receipt embedded in a fresh graph's atomic manifest
+/// birth.  The random commit id distinguishes this initialization attempt from
+/// another valid v1 manifest whose deterministic table identities happen to
+/// have the same numeric values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenesisManifestAttempt {
+    lineage: GraphLineageRow,
+    stamp: u32,
+}
+
+impl GenesisManifestAttempt {
+    /// Mint the receipt before invoking the manifest Create operation so the
+    /// caller retains enough information to classify a lost acknowledgement.
+    pub fn mint(system_columns: SystemColumns) -> Result<Self> {
+        Ok(Self {
+            lineage: GraphLineageRow {
+                schema_contract: None,
+                schema_content_hash: None,
+                graph_commit_id: crate::dst_ids::new_ulid().to_string(),
+                graph_branch: None,
+                native_branch: None,
+                graph_manifest_version: GENESIS_MANIFEST_VERSION,
+                generation: GENESIS_GENERATION,
+                parent_commit_id: None,
+                merged_parent_commit_id: None,
+                actor_id: None,
+                created_at: crate::metadata::now_micros()?,
+            },
+            stamp: stamp_for_system_columns(system_columns)?,
+        })
+    }
+
+    /// Exact genesis identity carried by a durably prepared initialization.
+    pub fn graph_commit_id(&self) -> &str {
+        &self.lineage.graph_commit_id
+    }
+
+    /// Validate an untrusted serialized attempt before creating any datasets.
+    pub fn validate_for(&self, system_columns: SystemColumns) -> Result<()> {
+        let lineage = &self.lineage;
+        if self.stamp != stamp_for_system_columns(system_columns)?
+            || lineage.graph_manifest_version != GENESIS_MANIFEST_VERSION
+            || lineage.generation != GENESIS_GENERATION
+            || lineage.graph_branch.is_some()
+            || lineage.native_branch.is_some()
+            || lineage.parent_commit_id.is_some()
+            || lineage.merged_parent_commit_id.is_some()
+            || lineage.actor_id.is_some()
+            || canonical_ulid(&lineage.graph_commit_id).is_none()
+        {
+            return Err(OmniError::manifest_conflict(
+                "invalid prepared genesis attempt",
+            ));
+        }
+        Ok(())
+    }
+
+    fn lineage(&self) -> &GraphLineageRow {
+        &self.lineage
+    }
+}
+
+/// Internal phase distinction for graph initialization.  Once the manifest
+/// Create call has been invoked, any returned error is acknowledgement-unknown:
+/// the immutable v1 manifest may already be durable and must be probed before
+/// any schema cleanup is considered.
+#[derive(Debug)]
+pub enum ManifestInitError {
+    BeforeManifestCreate(OmniError),
+    ManifestCreateOutcomeUnknown(OmniError),
+}
+
+impl ManifestInitError {
+    pub fn into_source(self) -> OmniError {
+        match self {
+            Self::BeforeManifestCreate(source) | Self::ManifestCreateOutcomeUnknown(source) => {
+                source
+            }
+        }
+    }
+}
+
+impl From<OmniError> for ManifestInitError {
+    fn from(source: OmniError) -> Self {
+        Self::BeforeManifestCreate(source)
+    }
+}
+
+decide_seam! {
+    /// Before the durable exact-genesis probe used to classify an
+    /// acknowledgement-unknown manifest Create. An injected failure proves the
+    /// caller preserves schema artifacts when the outcome cannot be observed.
+    pub static INIT_MANIFEST_CREATE_PROBE = ("init.manifest_create_probe", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// After Lance has durably returned the new `__manifest` Dataset, but
+    /// before OmniGraph's create half can acknowledge it. Returning an error
+    /// here models a lost object-store acknowledgement and must route through
+    /// exact-genesis classification rather than schema cleanup.
+    pub static INIT_MANIFEST_CREATE_POST_NATIVE = ("init.manifest_create_post_native", Unreachable, [Fail]);
+}
+
+impl From<ManifestInitError> for OmniError {
+    fn from(error: ManifestInitError) -> Self {
+        error.into_source()
+    }
+}
+
+/// Assembles the initial entries, genesis lineage, and internal-schema stamp,
+/// and lands them all in the one `__manifest` Create commit. A returned error
+/// from the Create call is acknowledgement-unknown; reading the state back is
+/// `load_initial_manifest_state`, on the confirmed post-commit side.
+pub(crate) async fn init_manifest_graph(
+    root_uri: &str,
+    catalog: &Catalog,
+    contract: &crate::SchemaContractRow,
+    control_session: &Arc<lance::session::Session>,
+    attempt: &GenesisManifestAttempt,
+) -> std::result::Result<Dataset, ManifestInitError> {
+    attempt.validate_for(catalog.system_columns)?;
+    let root = root_uri.trim_end_matches('/');
+    let mut head = attempt.lineage().clone();
+    head.schema_contract = Some(contract.head.clone());
+    head.schema_content_hash = Some(crate::history::schema_content_hash(contract)?);
+    let tables = build_initial_entries(root, catalog, control_session).await?;
+    crate::history::check_head_record(&head, &tables)?;
+    crate::history::archive_schema(root, control_session, contract).await?;
+    let genesis = ManifestRows {
+        schema_contract_head: Some(contract.head.clone()),
+        schema_contract: Some(contract.clone()),
+        tables,
+        head,
+        buffer: Default::default(),
+        registry: Default::default(),
+    };
+    // The internal-schema stamp rides the Create write's schema metadata, so
+    // the stamp is atomic with manifest birth: no crash window can leave
+    // `__manifest` durable but unstamped. The Create commit is the manifest's
+    // entire birth — entries, genesis lineage, and the stamp in one commit,
+    // with nothing failable after it. (A `table_version_management` config
+    // key is deliberately not written: neither the pinned Lance substrate nor
+    // this crate reads it.)
+    let (stamp_key, stamp_value) = stamp_entry(attempt.stamp);
+    let schema: SchemaRef =
+        manifest_storage_schema([(stamp_key, stamp_value)].into_iter().collect());
+    let manifest_batch = compact_to_storage(&genesis.to_batch()?, &schema)?;
+    let reader = RecordBatchIterator::new(vec![Ok(manifest_batch)], schema);
+    let manifest_path = manifest_uri(root);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(&manifest_path)?),
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        auto_cleanup: None,
+        skip_auto_cleanup: true,
+        session: Some(Arc::clone(control_session)),
+        ..Default::default()
+    };
+    let params = crate::lance_clone::write_params(&manifest_path, params)
+        .await
+        .map_err(OmniError::storage)?;
+    let dataset = Dataset::write(reader, &manifest_path, Some(params))
+        .await
+        .map_err(|e| ManifestInitError::ManifestCreateOutcomeUnknown(OmniError::storage(e)))?;
+    // Models the object-store shape where the immutable Create landed but its
+    // acknowledgement was lost before `Dataset::write` returned success to
+    // OmniGraph.  It deliberately sits inside the create half, before the
+    // caller can classify the returned Dataset as proof of commitment.
+    fail(&INIT_MANIFEST_CREATE_POST_NATIVE)
+        .map_err(ManifestInitError::ManifestCreateOutcomeUnknown)?;
+    Ok(dataset)
+}
+
+/// Reopen and authenticate the one immutable genesis manifest created by
+/// `attempt`.  This is the only positive classification of an ambiguous Create
+/// result; a merely valid v1 manifest from another initializer is not enough.
+pub(crate) async fn open_exact_genesis_manifest(
+    root_uri: &str,
+    attempt: &GenesisManifestAttempt,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<OpenedManifest> {
+    fail(&INIT_MANIFEST_CREATE_PROBE)?;
+    let opened = open_manifest_graph(root_uri, None, control_session).await?;
+    let OpenedManifest {
+        dataset,
+        known_state,
+        rows: ManifestRows { head, .. },
+        ..
+    } = &opened;
+
+    let stamp = guard_stamp(dataset)?;
+    if stamp != attempt.stamp {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            format!(
+                "internal-schema stamp is v{stamp}, expected v{}",
+                attempt.stamp
+            ),
+        ));
+    }
+    if dataset.version().version != GENESIS_MANIFEST_VERSION
+        || known_state.version != GENESIS_MANIFEST_VERSION
+    {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            format!(
+                "manifest version is {}, expected {GENESIS_MANIFEST_VERSION}",
+                dataset.version().version
+            ),
+        ));
+    }
+    let mut expected = attempt.lineage().clone();
+    expected.schema_contract = head.schema_contract.clone();
+    expected.schema_content_hash = head.schema_content_hash.clone();
+    if head != &expected {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            "genesis lineage does not match this initialization attempt",
+        ));
+    }
+    if known_state.graph_heads.len() != 1
+        || known_state
+            .graph_heads
+            .get(super::MAIN_BRANCH_HEAD_KEY)
+            .map(String::as_str)
+            != Some(attempt.lineage().graph_commit_id.as_str())
+    {
+        return Err(genesis_probe_mismatch(
+            root_uri,
+            "main graph head does not match this initialization attempt",
+        ));
+    }
+    Ok(opened)
+}
+
+decide_seam! {
+    /// The first ordinary post-commit read-back failpoint after the graph's
+    /// `__manifest` Create has been positively classified. A crash OR an error
+    /// return here must leave an openable graph; init's schema cleanup is
+    /// unreachable from this window (issue #495).
+    pub static INIT_POST_MANIFEST_CREATE = ("init.post_manifest_create", Unreachable, [Fail]);
+}
+
+fn genesis_probe_mismatch(root_uri: &str, detail: impl std::fmt::Display) -> OmniError {
+    OmniError::manifest_conflict(format!(
+        "__manifest at '{}' is not the exact genesis created by this initialization attempt: {detail}",
+        root_uri.trim_end_matches('/')
+    ))
+}
+
+/// One version of a branch's `__manifest` with what one scan of it holds: its
+/// rows and the visible table state they reduce to.
+pub(crate) struct OpenedManifest {
+    pub(crate) dataset: Dataset,
+    pub(crate) known_state: ManifestState,
+    pub(crate) rows: ManifestRows,
+    pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
+    /// The native ref the branch resolved to, `None` on main.
+    pub(crate) native_branch: Option<String>,
+}
+
+/// Reads back the state the `__manifest` Create commit landed. The
+/// `init.post_manifest_create` failpoint fires as this function's first
+/// statement.
+pub(crate) async fn load_initial_manifest_state(dataset: Dataset) -> Result<OpenedManifest> {
+    fail(&INIT_POST_MANIFEST_CREATE)?;
+    let (known_state, rows) = read_manifest_state_and_rows(&dataset).await?;
+    Ok(OpenedManifest {
+        dataset,
+        known_state,
+        rows,
+        branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+        native_branch: None,
+    })
+}
+
+pub(crate) async fn open_manifest_graph(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<OpenedManifest> {
+    let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
+        root_uri.trim_end_matches('/'),
+        branch,
+        control_session,
+    )
+    .await?;
+    let (known_state, rows) = read_manifest_state_and_rows(&dataset).await?;
+    Ok(OpenedManifest {
+        dataset,
+        known_state,
+        rows,
+        branch_identifier,
+        native_branch,
+    })
+}
+
+/// What one `__manifest` version is read from: its own rows, or the record
+/// the legacy history of an upgraded root holds for it.
+pub(crate) enum VersionState {
+    Rows(ManifestState),
+    Legacy(crate::legacy::LegacyAt),
+}
+
+pub(crate) async fn snapshot_state_at(
+    root_uri: &str,
+    branch: Option<&str>,
+    version: u64,
+    history: &ExtentCache,
+) -> Result<(Dataset, VersionState)> {
+    let control_session = crate::lance_access::control_session();
+    let root = root_uri.trim_end_matches('/');
+    let dataset = open_manifest_dataset_with_session(root, branch, &control_session).await?;
+    let dataset = dataset
+        .checkout_version(version)
+        .await
+        .map_err(OmniError::storage)?;
+    let state = match crate::legacy::at_version(root, &control_session, history, &dataset).await? {
+        None => VersionState::Rows(read_manifest_state(&dataset).await?),
+        Some(at) => VersionState::Legacy(at),
+    };
+    Ok((dataset, state))
+}
+
+async fn build_initial_entries(
+    root_uri: &str,
+    catalog: &Catalog,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Vec<TableRow>> {
+    let mut entries = Vec::new();
+    let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "manifest initialization requires an identity-bound accepted catalog",
+        )
+    })?;
+
+    let mut __dst_nt: Vec<_> = catalog.node_types.iter().collect();
+    __dst_nt.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, node_type) in __dst_nt {
+        let node_ir = accepted_ir
+            .nodes
+            .iter()
+            .find(|node| node.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing node IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(node_ir.type_id.get(), node_ir.table_incarnation_id.get())?;
+        let table_key = format!("node:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
+        let full_path = format!("{}/{}", root_uri, table_path);
+
+        let ds = create_empty_dataset(
+            &full_path,
+            &node_type.arrow_schema,
+            catalog.system_columns,
+            control_session,
+        )
+        .await?;
+        entries.push(genesis_table_row(
+            root_uri, identity, table_key, table_path, &ds,
+        )?);
+    }
+
+    let mut __dst_et: Vec<_> = catalog.edge_types.iter().collect();
+    __dst_et.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, edge_type) in __dst_et {
+        let edge_ir = accepted_ir
+            .edges
+            .iter()
+            .find(|edge| edge.name == *name)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "identity-bound catalog is missing edge IR for '{name}'"
+                ))
+            })?;
+        let identity =
+            TableIdentity::new(edge_ir.type_id.get(), edge_ir.table_incarnation_id.get())?;
+        let table_key = format!("edge:{}", name);
+        let table_path = table_path_for_identity(&table_key, identity)?;
+        let full_path = format!("{}/{}", root_uri, table_path);
+
+        let ds = create_empty_dataset(
+            &full_path,
+            &edge_type.arrow_schema,
+            catalog.system_columns,
+            control_session,
+        )
+        .await?;
+        entries.push(genesis_table_row(
+            root_uri, identity, table_key, table_path, &ds,
+        )?);
+    }
+
+    Ok(entries)
+}
+
+/// The `table` row of a table the genesis commit creates empty at `dataset`'s version.
+fn genesis_table_row(
+    root_uri: &str,
+    identity: TableIdentity,
+    table_key: String,
+    table_path: String,
+    dataset: &Dataset,
+) -> Result<TableRow> {
+    let table_version = dataset.version().version;
+    let metadata = TableVersionMetadata::from_dataset(root_uri, &table_path, dataset)?
+        .with_last_linear_version(Some(table_version));
+    Ok(TableRow {
+        registration: TableRegistration {
+            identity,
+            table_key,
+            table_path,
+        },
+        state: TableState::Pinned(TablePin {
+            table_version,
+            table_branch: None,
+            row_count: 0,
+            metadata,
+            manifest_version: GENESIS_MANIFEST_VERSION,
+        }),
+    })
+}
+
+decide_seam! {
+    /// After a per-type Lance dataset Create returns success, before graph
+    /// initialization can acknowledge it. The graph manifest does not exist
+    /// yet, but retry and schema cleanup are unsafe because the table Create
+    /// may be durable.
+    pub static INIT_TABLE_CREATE_POST_NATIVE = ("init.table_create_post_native", Unreachable, [Fail]);
+}
+
+async fn create_empty_dataset(
+    uri: &str,
+    schema: &SchemaRef,
+    system_columns: SystemColumns,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    // Keep initialization self-contained even for manifest-level callers that
+    // construct an identity-bound compiler catalog directly in tests. Engine
+    // catalogs already carry this metadata, but there must never be a
+    // create-then-annotate window: Lance makes the PK metadata immutable after
+    // dataset creation and RFC-023 activates it only for new format-v6 graphs.
+    let schema = keyed_graph_table_schema(schema, system_columns)?;
+    let batch = RecordBatch::new_empty(schema.clone());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        store_params: Some(crate::storage::lance_store_params_for_uri(uri)?),
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        allow_external_blob_outside_bases: true,
+        auto_cleanup: None,
+        skip_auto_cleanup: true,
+        session: Some(Arc::clone(control_session)),
+        ..Default::default()
+    };
+    let params = crate::lance_clone::write_params(uri, params)
+        .await
+        .map_err(OmniError::storage)?;
+    let dataset = Dataset::write(reader, uri, Some(params))
+        .await
+        .map_err(OmniError::storage)?;
+    fail(&INIT_TABLE_CREATE_POST_NATIVE)?;
+    Ok(dataset)
+}
+
+fn keyed_graph_table_schema(
+    schema: &SchemaRef,
+    system_columns: SystemColumns,
+) -> Result<SchemaRef> {
+    let mut id_count = 0;
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut field = field.as_ref().clone();
+            let mut metadata = field.metadata().clone();
+            metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+            if field.name() == system_columns.id {
+                id_count += 1;
+                metadata.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+            } else {
+                metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+            }
+            field.set_metadata(metadata);
+            field
+        })
+        .collect::<Vec<Field>>();
+
+    if id_count != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "graph table initialization requires exactly one top-level `{}` field; found {id_count}",
+            system_columns.id
+        )));
+    }
+    let id = fields
+        .iter()
+        .find(|field| field.name() == system_columns.id)
+        .expect("id_count == 1");
+    if id.is_nullable() {
+        return Err(OmniError::manifest_internal(format!(
+            "graph table initialization requires a non-null `{}` field",
+            system_columns.id
+        )));
+    }
+
+    Ok(std::sync::Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata.clone(),
+    )))
+}

@@ -42,8 +42,8 @@ iwr -UseBasicParsing https://raw.githubusercontent.com/ModernRelay/omnigraph/mai
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ReleaseChannel edge
 ```
 
-Install a specific tag with `VERSION=v0.10.0` on macOS/Linux or
-`-Version v0.10.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+Install a specific tag with `VERSION=v0.12.0` on macOS/Linux or
+`-Version v0.12.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
 different destination.
 
 Documentation on `main` may describe behavior newer than the latest stable
@@ -55,11 +55,15 @@ Install the Rust stable toolchain and the Protocol Buffers compiler (`protoc`),
 then:
 
 ```bash
-cargo build --release --locked \
+RUSTFLAGS= cargo build --release --locked \
   -p omnigraph-cli \
   -p omnigraph-server \
   -p omnigraph-azure-admission
 ```
+
+The empty `RUSTFLAGS` replaces the workspace `.cargo/config.toml` build flags,
+which exist for the development test suites; release binaries build without
+them.
 
 Or use the source installer:
 
@@ -86,5 +90,38 @@ omnigraph version
 omnigraph-server --help
 omnigraph-azure-admission --help
 ```
+
+`omnigraph version` reports what the binary itself speaks, without opening a
+graph or contacting a server. For example, release 0.13.0 prints:
+
+```text
+omnigraph 0.13.0
+internal-schema 16 (serves v14 to v16)
+http-contract 0.13
+```
+
+`omnigraph version --json` prints the same facts as one object:
+
+```json
+{
+  "version": "0.13.0",
+  "http_contract": "0.13",
+  "internal_schema": {
+    "writes": 16,
+    "serves": [14, 16]
+  }
+}
+```
+
+`http_contract` is the `Omnigraph-Http-Api` value the CLI sends. A server
+accepts only an exact match and returns its own value on every response,
+including `HEAD /healthz` ([HTTP contract](operations/server.md#http-contract)).
+When several CLIs are installed, for example one in `~/.local/bin` and an
+older one from Homebrew, choose by this field, not by the package version.
+`internal_schema.writes` is the storage-format stamp this binary's commits
+write, and `internal_schema.serves` is the inclusive range, lowest first, that
+normal open accepts; `snapshot --json` reports a graph's own stamp as
+`internal_schema_version`. `omnigraph --version` (`-v`) prints only the first
+line.
 
 Continue with the [quickstart](quickstart.md).

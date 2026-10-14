@@ -6,11 +6,13 @@
 //! hints are retained for resolution but deliberately skipped by shape
 //! serialization and hashing.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SystemColumns};
 use crate::error::{CompilerError, Result};
 use crate::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
@@ -23,6 +25,51 @@ pub struct SchemaShape {
     pub interfaces: Vec<InterfaceShape>,
     pub nodes: Vec<NodeShape>,
     pub edges: Vec<EdgeShape>,
+}
+
+impl SchemaShape {
+    /// Canonicalize role spellings using the accepted graph's source dialect.
+    pub fn canonicalized_for_system_columns(&self, system_columns: SystemColumns) -> Cow<'_, Self> {
+        if system_columns != SYSTEM_COLUMNS_LEGACY {
+            return Cow::Borrowed(self);
+        }
+        let mut shape = self.clone();
+        for constraints in shape
+            .nodes
+            .iter_mut()
+            .map(|node| &mut node.constraints)
+            .chain(shape.edges.iter_mut().map(|edge| &mut edge.constraints))
+        {
+            for constraint in constraints.iter_mut() {
+                let normalize = |name: &mut String| {
+                    *name = match name.as_str() {
+                        name if name == SYSTEM_COLUMNS_META.id => {
+                            SYSTEM_COLUMNS_LEGACY.id.to_string()
+                        }
+                        name if name == SYSTEM_COLUMNS_META.src => {
+                            SYSTEM_COLUMNS_LEGACY.src.to_string()
+                        }
+                        name if name == SYSTEM_COLUMNS_META.dst => {
+                            SYSTEM_COLUMNS_LEGACY.dst.to_string()
+                        }
+                        _ => return,
+                    };
+                };
+                match constraint {
+                    Constraint::Key(names)
+                    | Constraint::Unique(names)
+                    | Constraint::Index(names) => {
+                        names.iter_mut().for_each(normalize);
+                    }
+                    Constraint::Range { property, .. } | Constraint::Check { property, .. } => {
+                        normalize(property)
+                    }
+                }
+            }
+            *constraints = canonical_constraints(constraints);
+        }
+        Cow::Owned(shape)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,21 +142,6 @@ pub enum PropertyConstraintShape {
 }
 
 pub fn compile_schema_shape(schema: &SchemaFile) -> Result<SchemaShape> {
-    compile_schema_shape_inner(schema, false)
-}
-
-/// Compile customer source for later resolution against an accepted actor binding.
-/// The reserved actor endpoint may be absent from this source projection; only
-/// subsequent IR resolution and catalog validation can establish its authority.
-/// Generic source-only compilation remains strict through `compile_schema_shape`.
-pub fn compile_schema_source_shape(schema: &SchemaFile) -> Result<SchemaShape> {
-    compile_schema_shape_inner(schema, true)
-}
-
-fn compile_schema_shape_inner(
-    schema: &SchemaFile,
-    allow_actor_endpoint: bool,
-) -> Result<SchemaShape> {
     let interfaces_by_name = schema
         .declarations
         .iter()
@@ -244,7 +276,7 @@ fn compile_schema_shape_inner(
         nodes,
         edges,
     };
-    validate_shape(&shape, allow_actor_endpoint)?;
+    validate_shape(&shape)?;
     Ok(shape)
 }
 
@@ -443,7 +475,7 @@ pub(crate) fn constraint_sort_key(constraint: &Constraint) -> String {
     }
 }
 
-fn validate_shape(shape: &SchemaShape, allow_actor_endpoint: bool) -> Result<()> {
+fn validate_shape(shape: &SchemaShape) -> Result<()> {
     let interface_names = shape
         .interfaces
         .iter()
@@ -472,11 +504,9 @@ fn validate_shape(shape: &SchemaShape, allow_actor_endpoint: bool) -> Result<()>
                 edge.name
             )));
         }
-        let resolved_endpoint = |name: &str| {
-            node_names.contains(name)
-                || (allow_actor_endpoint && name == super::schema_ir::ACTOR_TYPE_NAME)
-        };
-        if !resolved_endpoint(&edge.from_type) || !resolved_endpoint(&edge.to_type) {
+        if !node_names.contains(edge.from_type.as_str())
+            || !node_names.contains(edge.to_type.as_str())
+        {
             return Err(CompilerError::Catalog(format!(
                 "edge '{}' has an unresolved endpoint",
                 edge.name

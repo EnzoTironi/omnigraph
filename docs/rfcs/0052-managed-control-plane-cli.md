@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-10-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -16,11 +16,17 @@ blocked_on: []
 
 # RFC 0052: Managed control-plane CLI
 
+> The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+> replaces this RFC's original authentication contract with provider-native
+> login and automatic identity acquisition. The routing and exact-plan
+> execution contracts below remain applicable.
+
 ## Summary
 
-Add an HTTP client for the managed Intent API to the existing CLI. A folder's
-`.omnigraph/context` selects managed cluster operations; absence preserves
-the existing direct Core path. Managed authentication establishes identity,
+The explicit `cluster <command> --managed` mode addresses the managed Intent
+API. A folder's `.omnigraph/context` selects the service and cluster only after
+that mode is chosen. Without `--managed`, cluster commands never inspect it.
+Managed authentication establishes identity,
 and current permissions authorize execution of an exact saved plan. There is
 no separate managed approval workflow. Engine behavior and storage formats
 are unchanged.
@@ -32,19 +38,18 @@ external repository, but users currently need raw HTTP requests. The CLI has
 direct cluster commands and per-server token login, neither of which can
 substitute for managed identity, durable runs, leases, and signed offers.
 Routing and credential ownership are public contracts, so this is an RFC
-rather than a local command refactor. The companion control-plane decision
-is DEC-08-22 in `ModernRelay/og-control-plane/specs/02-DEC-Decisions.md`.
+rather than a local command refactor.
 
 ## User and operational behavior
 
 ```sh
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example
-omnigraph cluster plan --config . --json
-omnigraph cluster apply --config . --plan PLAN_RUN_ID --json
-omnigraph cluster status --config . --json
-omnigraph cluster history --config . --json
-omnigraph cluster cancel RUN_ID --config . --json
+omnigraph cluster plan --managed --config . --json
+omnigraph cluster apply --managed --config . --plan PLAN_RUN_ID --json
+omnigraph cluster status --managed --config . --json
+omnigraph cluster history --managed --config . --json
+omnigraph cluster cancel --managed RUN_ID --config . --json
 omnigraph logout --api https://control.example
 ```
 
@@ -55,11 +60,22 @@ does not commit files, upload a bundle, silently replan, or ask for another
 approval. Current permissions, binding, digests, and lease are checked by the
 API and execution authority is independently checked by the executor.
 
-`--direct` explicitly selects existing Core behavior for `--config`; its
-`cluster.yaml` still owns the root. There is no root substitution. Without
-that flag, malformed context, unknown context version, unsupported managed
-commands, provider/API errors, and permission refusals fail closed. No such
-failure may invoke Core or consult graph-root credentials.
+The mode flag selects authority before context discovery. `cluster` without
+`--managed` uses self-hosted configuration or its explicit server/root target;
+with `--managed` it uses only the service API. Managed mode rejects `--direct`,
+`--server`, `--cluster`, `--store`, `--profile`, `--graph`, and `--as` before
+context, credentials, HTTP, or storage access. Malformed context, unknown context
+version, provider/API errors and permission refusals fail closed. No managed failure may
+invoke Core or consult graph-root credentials.
+
+Service-only `create`, `push`, `delete`, `undo-delete`, `token`, `operation`,
+`history`, and `cancel` require `--managed`. Local `validate`, `observe`,
+`force-unlock`, and `upgrade-ledger` reject it. Shared `plan`, `apply`, and
+`status` validate arguments against the selected mode before dispatch. Managed
+plan uses `--rev`, apply requires `--plan`, and status accepts an optional
+positional run ID. Self-hosted deployment uses local configuration or exact
+`--deployment-id`; served status alone permits deployment `--wait`. No argument
+or folder context infers a mode. The flag may precede or follow the subcommand.
 
 `--no-wait` returns the accepted run envelope. Otherwise the CLI polls every
 two seconds for up to 300 seconds; `--timeout` selects 1–3,600 seconds. Timeout
@@ -82,7 +98,7 @@ serialized by the API. It never cancels accepted effects through lease expiry.
 The versioned, secret-free context is at most 16 KiB and lives only in the
 selected config directory; parent directory search is not performed. Context
 must be a regular file and neither it nor `.omnigraph` may be a symbolic link;
-a dangling link is a refusal, never absence selecting the Core:
+a dangling link is a refusal, never permission to select Core:
 
 ```yaml
 version: 1
@@ -96,16 +112,15 @@ origins, without userinfo, path, query, or fragment. HTTPS is mandatory except
 exact loopback hosts for local integration. Redirects are refused; each
 request has a 10-second deadline and 8 MiB body limit.
 
-`login --api` calls the Intent API's device authorization and polling routes.
-The service brokers WorkOS's native device flow and reuses its browser login
-JWT, membership, enrollment, and grant checks. The CLI prints the verification
-URL/user code, never the device secret. It respects expiry and polling
-interval, including slowdown, and saves only the returned opaque session in
-the OS keychain under the canonical API origin. Sessions live at most 15
-minutes and no longer than the provider token. No provider access/refresh
-token is stored by the CLI. An unavailable keychain refuses without a
-plaintext fallback. Logout revokes the service session and removes the local
-entry; session expiry requires a new login. Accepted runs continue normally.
+The original authentication contract used service-brokered device login and
+an opaque session, stored only in the OS keychain for at most 15 minutes.
+That protocol is superseded by the
+[provider-native authentication contract](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
+The current CLI uses the provider SDK directly and does not retain the
+broker's device, refresh or opaque-session cache paths. Upgrade the API and
+CLI together and sign in again; no broker migration period is required.
+Named-server credentials and the public restricted data-token verifier are
+separate compatibility contracts, not fallbacks for managed login.
 
 Scoped automation may supply `OMNIGRAPH_CONTROL_TOKEN` only together with
 `OMNIGRAPH_CONTROL_API` matching the selected canonical origin. Data-plane
@@ -129,26 +144,30 @@ fork, cloud-only correctness fix, duplicated lock, or new writer fence.
 
 Existing profiles/servers/clusters config and `login SERVER --token` /
 `logout SERVER` remain intact. The new `--api` mode is mutually exclusive
-with legacy server login. Existing direct commands without context retain
-their flags and behavior. Managed-only flags without context refuse.
-Unsupported managed commands refuse before direct execution.
+with named-server login. Self-hosted commands retain their own addressing
+regardless of folder context. Managed control requires `cluster <command> --managed`;
+the top-level `managed` command is removed, with no alias. Omitting the mode
+flag cannot select service execution.
 
-No stored graph or server API format changes. Removing the context or using
-`--direct` restores the existing direct path intentionally. Older CLI builds
-do not understand this context contract and must not be presented as safe
-managed clients; deploying the new CLI and API together is the pilot boundary.
+No stored graph or server API format changes. Bound managed commands refuse
+without context; its absence cannot select direct execution. Deploy a compatible
+CLI and API together.
 The server SDK and Python SDK gain no new authority or dependencies.
 
 ## Alternatives
 
 - Raw HTTP keeps the current gap in bounded waits, identity storage, and
   context isolation and makes every script reproduce the managed contract.
-- A second top-level verb family avoids dispatch integration but contradicts
-  the existing cluster command model and duplicates discoverability/docs.
+- Ambient context dispatch makes identical cluster commands select different
+  protocols. Explicit `--managed` keeps the choice visible and mode validation
+  refuses arguments belonging to another protocol before any access.
+- Separate top-level command families repeat cluster concepts and workflows.
+  One `cluster` noun with an explicit mode retains the authority boundary.
 - Inferring managed mode from storage roots or existing server aliases risks
   forwarding the wrong credential; explicit context and origin binding win.
-- Refresh-token persistence adds rotation/revocation/storage behavior beyond
-  the bounded pilot. Re-login after expiry keeps the browser contract.
+- Requiring browser sign-in after every short access lifetime interrupts
+  long-running commands. The provider-native extension owns bounded renewal
+  and keeps provider credentials in the OS keychain.
 - Plaintext fallback helps headless setup but silently weakens human secret
   storage. Explicit scoped automation credentials cover unattended execution.
 
@@ -162,25 +181,22 @@ process tests do not touch user keychains or operator configuration. The
 focused baseline passed 91 unit tests and 45 cluster process tests, including
 the existing direct behavior.
 
-The control-plane repository owns transactional permission/revocation,
-device replay, and abandon/apply race tests plus a kind proof driven by this
-actual CLI binary. The passing proof compares CLI/API plan and bundle digests,
-terminal outcome, receipts and readiness witness, and tests cancellation,
-idempotency and denied access. A separate live WorkOS pilot passed native
-device login, real OS keychain storage, exact-plan apply through readiness,
-permission removal and restoration for the same session, and logout. This
-live evidence covers one identity and a nondestructive plan; it does not
-replace deterministic provider fixtures or claim a full browser/two-user
-qualification matrix.
+API implementations separately own transactional permission/revocation,
+device replay, and abandon/apply races. Integration qualification must compare
+CLI/API plan and bundle digests, terminal outcomes, and readiness witnesses,
+and exercise cancellation, idempotency and denied access. Provider fixtures
+do not establish live browser or multi-user interoperability.
 
 ## Rollout
 
 Land the public contract and implementation together with CLI user docs and
-release notes. The companion API adds device sessions and plan abandonment
+release notes. A compatible API supplies authentication and plan abandonment
 without changing executor or engine gates. Existing CLI/direct and managed
 HTTP tests must pass before recommending the managed client. Data-plane
-tokens, managed-store editing, provisioning, console, SSE, and persistent
-refresh tokens remain out of scope.
+tokens, managed-store editing, provisioning, console and SSE were outside the
+initial increment. Managed-store editing
+and service provisioning are extended by
+[RFC 0061](0061-managed-cluster-lifecycle.md).
 
 ## Unresolved questions
 
@@ -194,6 +210,19 @@ rather than introducing a root-URI override the Core does not currently expose.
 
 2026-09-05: Accepted after maintainer-authorized review of the implementation,
 compatibility, bounded HTTP and credential handling, focused regression
-suites, the full native CLI kind proof, and the separate live WorkOS pilot.
+suites and native CLI integration qualification.
 No engine or storage contract changes are required. Data access remains a
 separate increment; this decision authorizes control-plane operations only.
+
+2026-09-06: The Rollout scope sentence now explicitly limits its deferral of
+managed-store editing and provisioning to this original increment, and links
+RFC 0061 as the owner of those additional client commands. Its authentication,
+folder context, direct routing and exact-plan execution contract is unchanged.
+
+2026-10-06: The maintainer chose `cluster <command> --managed`. Summary and
+User behavior replace command-family routing with explicit mode selection,
+early conflicts and shared-command argument rules. Compatibility removes the
+top-level `managed` command without an alias. Alternatives replaces separate
+command families with one cluster noun while rejecting ambient interception.
+Managed data-command context and service protocols remain unchanged. Existing
+CLI owners cover mode refusal and self-hosted isolation from malformed context.

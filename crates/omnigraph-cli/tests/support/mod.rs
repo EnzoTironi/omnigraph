@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
 use std::sync::mpsc;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use assert_cmd::Command;
 use reqwest::blocking::Client;
 use serde_json::Value;
-use tempfile::{TempDir, tempdir};
+use tempfile::{NamedTempFile, TempDir, tempdir};
 
 /// Hermetic default: point OMNIGRAPH_HOME at a path that exists on no
 /// machine, so spawned binaries never read the developer's real
@@ -19,12 +19,40 @@ use tempfile::{TempDir, tempdir};
 /// exercising the operator layer override the var explicitly.
 pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
 
+/// Controlled diagnostics use the same explicit pool in fixture and SUT children.
+pub const HTTP_DIAGNOSTIC_LANCE_POOL_BYTES: &str = "104857600";
+
+/// Direct HTTP assertions exercise the current graph contract. CLI journeys
+/// still use the production client and its independent discovery gate.
+pub fn graph_http_client() -> Client {
+    Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static(omnigraph_api_types::HTTP_API_CONTRACT_HEADER),
+            reqwest::header::HeaderValue::from_static(omnigraph_api_types::HTTP_API_CONTRACT),
+        )]))
+        .build()
+        .unwrap()
+}
+
 pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
     command.env_remove("OMNIGRAPH_CONFIG");
     command.env_remove("OMNIGRAPH_CONTROL_TOKEN");
     command.env_remove("OMNIGRAPH_CONTROL_API");
+    command
+}
+
+/// Explicit executable for controlled diagnostics. Ordinary test discovery
+/// remains unchanged; no process-global environment mutation is needed.
+pub fn cli_at(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env_clear();
+    command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("LANG", "C");
+    command.env("LC_ALL", "C");
+    command.timeout(Duration::from_secs(60));
     command
 }
 
@@ -38,6 +66,8 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+#[cfg(unix)]
+pub mod unix_gateway;
 
 pub fn write_managed_context(config: &Path, origin: &str) {
     fs::create_dir_all(config.join(".omnigraph")).unwrap();
@@ -55,7 +85,7 @@ pub fn managed_cli(config: &Path, origin: &str) -> Command {
         .env("OMNIGRAPH_CONTROL_API", origin)
         .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
         .current_dir(config)
-        .arg("cluster")
+        .args(["cluster", "--managed"])
         .timeout(Duration::from_secs(15));
     command
 }
@@ -77,7 +107,7 @@ fn server_process() -> StdCommand {
     }
 }
 
-fn built_server_binary() -> Option<PathBuf> {
+pub fn built_server_binary() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let candidate = workspace_root
         .join("target")
@@ -116,6 +146,33 @@ pub fn output_failure(cmd: &mut Command) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+/// Thread cap for a matrix of independent CLI cases, each owning its fixture.
+pub const CASE_WORKERS: usize = 16;
+
+/// Run independent cases on at most `workers` threads. The first failing
+/// case's own panic payload reaches the caller, so its message is kept.
+pub fn for_each_concurrently<T: Send>(cases: Vec<T>, workers: usize, run: impl Fn(T) + Sync) {
+    let queue = std::sync::Mutex::new(cases.into_iter());
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let next = queue.lock().unwrap().next();
+                        let Some(case) = next else { break };
+                        run(case);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            if let Err(payload) = worker.join() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    });
 }
 
 pub fn stdout_string(output: &Output) -> String {
@@ -203,6 +260,54 @@ policy: {{}}
 pub struct TestServer {
     child: Child,
     pub base_url: String,
+    stderr_log: NamedTempFile,
+}
+
+impl TestServer {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn stop(mut self) -> String {
+        let _ = self.child.kill();
+        self.child.wait().expect("reap test server");
+        read_stderr(&self.stderr_log)
+    }
+
+    /// Settle an otherwise idle process through the real shutdown path before
+    /// a cross-version test releases its retained writer lock.
+    #[cfg(unix)]
+    pub fn stop_gracefully(mut self) -> String {
+        // The owned child has not been reaped, so its pid cannot be reused.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) },
+            0,
+            "signal test server"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for test server") {
+                assert!(
+                    status.success(),
+                    "server shutdown: {status}\n{}",
+                    self.stderr()
+                );
+                return self.stderr();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server failed to settle\n{}",
+                self.stderr()
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Everything the server wrote to stderr so far; the diagnostic of a
+    /// request that died mid-stream lives here, not in the client's error.
+    pub fn stderr(&self) -> String {
+        read_stderr(&self.stderr_log)
+    }
 }
 
 impl Drop for TestServer {
@@ -212,13 +317,17 @@ impl Drop for TestServer {
     }
 }
 
+fn read_stderr(stderr_log: &NamedTempFile) -> String {
+    fs::read_to_string(stderr_log.path()).expect("read server stderr log")
+}
+
 fn spawn_server_process(mut command: StdCommand) -> TestServer {
-    let mut stderr_log = tempfile::tempfile().unwrap();
+    let stderr_log = NamedTempFile::new().unwrap();
     let mut child = command
         .arg("--bind")
         .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_log.try_clone().unwrap()))
+        .stderr(Stdio::from(stderr_log.reopen().unwrap()))
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().expect("server stdout must be piped");
@@ -237,10 +346,14 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
         }
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
     let mut base_url = None;
     let mut early_exit = None;
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if base_url.is_none()
             && let Ok(address) = listen_addr_rx.try_recv()
         {
@@ -248,37 +361,42 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
         }
         if let Some(base_url) = &base_url
             && client
-                .get(format!("{base_url}/healthz"))
+                .get(format!("{base_url}/readyz"))
                 .send()
-                .map(|response| response.status().is_success())
+                .map(|response| {
+                    response.status().is_success()
+                        && response
+                            .json::<Value>()
+                            .map(|body| body["loading_graph_count"] == 0)
+                            .unwrap_or(false)
+                })
                 .unwrap_or(false)
         {
             return TestServer {
                 child,
                 base_url: base_url.clone(),
+                stderr_log,
             };
         }
         if let Some(status) = child.try_wait().unwrap() {
             early_exit = Some(status);
             break;
         }
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(5));
     }
     // Kill + wait before reading stderr so the final buffered diagnostic is
     // visible for both a stalled process and an early startup failure.
     if early_exit.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
     }
-    let mut stderr = String::new();
-    let _ = stderr_log.seek(SeekFrom::Start(0));
-    let _ = stderr_log.read_to_string(&mut stderr);
+    let _ = child.wait();
+    let stderr = read_stderr(&stderr_log);
     match early_exit {
         Some(status) => {
-            panic!("server exited before becoming healthy ({status}); stderr:\n{stderr}")
+            panic!("server exited before becoming ready ({status}); stderr:\n{stderr}")
         }
         None => panic!(
-            "server did not become healthy{}; stderr:\n{stderr}",
+            "server did not become ready{}; stderr:\n{stderr}",
             base_url
                 .as_deref()
                 .map(|url| format!(" on {url}"))
@@ -326,6 +444,37 @@ pub fn spawn_server_with_cluster_env(cluster_dir: &Path, envs: &[(&str, &str)]) 
     for (name, value) in envs {
         command.env(name, value);
     }
+    spawn_server_process(command)
+}
+
+/// The same cluster startup owner, with an explicit attested executable and
+/// a cleared environment for controlled cross-binary diagnostics.
+pub fn spawn_server_with_cluster_binary(cluster_dir: &Path, binary: &Path) -> TestServer {
+    spawn_server_with_cluster_binary_env(
+        cluster_dir,
+        binary,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    )
+}
+
+pub fn spawn_server_with_cluster_binary_env(
+    cluster_dir: &Path,
+    binary: &Path,
+    envs: &[(&str, &str)],
+) -> TestServer {
+    let mut command = StdCommand::new(binary);
+    command.env_clear();
+    command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env("LANG", "C");
+    command.env("LC_ALL", "C");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.arg("--cluster").arg(cluster_dir);
     spawn_server_process(command)
 }
 
@@ -449,8 +598,7 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
     )
     .unwrap();
 
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(&dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(&dir));
+    apply_cluster_fixture(&dir);
 
     let served_root = dir.join("graphs").join(format!("{graph_id}.omni"));
     output_success(
@@ -463,6 +611,7 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
             .arg(&served_root),
     );
 
+    unlock_cluster_fixture(&dir);
     ClusterFixture { _temp: temp, dir }
 }
 
@@ -473,6 +622,14 @@ use lance::Dataset;
 use lance::index::DatasetIndexExt;
 #[allow(unused_imports)]
 use omnigraph::db::{Omnigraph, ReadTarget};
+
+/// A session with the definition's defaults over a handle the fixture opened.
+fn session_over(db: Omnigraph) -> omnigraph::Session {
+    omnigraph::Session::from_defaults(
+        std::sync::Arc::new(db),
+        omnigraph::settings::SessionSettings::default(),
+    )
+}
 
 pub const POLICY_YAML: &str = r#"
 version: 1
@@ -525,7 +682,10 @@ pub fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     })
 }
 
-pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+/// A foreign commit on the Person table's Lance linear history (a config
+/// upsert, which commits on the empty linear HEAD a detached-only table
+/// keeps). Returns (published version, Lance HEAD after the commit).
+pub fn forge_person_foreign_commit(graph: &std::path::Path) -> (u64, u64) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let uri = graph.to_string_lossy();
         let db = Omnigraph::open(uri.as_ref()).await.unwrap();
@@ -533,10 +693,12 @@ pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
         let entry = snap.dataset("node:Person").unwrap();
         let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.dataset_path);
         let mut ds = Dataset::open(&full_path).await.unwrap();
-        let deleted = ds.delete("name = 'Alice'").await.unwrap();
-        assert_eq!(deleted.num_deleted_rows, 1);
-        let head = deleted.new_dataset.version().version;
-        assert!(head > entry.published_dataset_version);
+        let linear_head_before = ds.version().version;
+        ds.update_config(vec![("forged_by", Some("cli_data test"))])
+            .await
+            .unwrap();
+        let head = ds.version().version;
+        assert!(head > linear_head_before);
         (entry.published_dataset_version, head)
     })
 }
@@ -591,7 +753,7 @@ rules:
   - id: cluster-operators-change
     allow:
       actors: { group: cluster_operators }
-      actions: [change]
+      actions: [change, schema_apply]
 "#,
     )
     .unwrap();
@@ -619,22 +781,6 @@ policies:
     .unwrap();
 }
 
-pub fn init_cluster_derived_graph(root: &std::path::Path) {
-    init_named_cluster_graph(root, "knowledge", "people.pg");
-}
-
-pub fn init_named_cluster_graph(root: &std::path::Path, graph_id: &str, schema_file: &str) {
-    let graph_dir = root.join("graphs");
-    fs::create_dir_all(&graph_dir).unwrap();
-    output_success(
-        cli()
-            .arg("init")
-            .arg("--schema")
-            .arg(root.join(schema_file))
-            .arg(graph_dir.join(format!("{graph_id}.omni"))),
-    );
-}
-
 pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str) {
     let state_dir = root.join("__cluster");
     fs::create_dir_all(&state_dir).unwrap();
@@ -647,68 +793,51 @@ pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str
     .unwrap();
 }
 
-pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
-    // This helper fabricates a ledger with NO physical graph behind it.
-    let validate = parse_stdout_json(&output_success(
+/// Tests call this only after the fixture's direct CLI process has exited.
+/// The exact recorded identity is released before the next fixture owner starts.
+pub fn unlock_cluster_fixture(root: &Path) {
+    let lock_path = root.join("__cluster/lock.json");
+    if !lock_path.exists() {
+        return;
+    }
+    let lock: Value = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+    output_success(cli().args([
+        "--cluster",
+        &format!("file://{}", root.display()),
+        "cluster",
+        "force-unlock",
+        lock["lock_id"].as_str().unwrap(),
+        "--json",
+    ]));
+}
+
+/// Bootstrap or advance a fixture through the production v2 deployment door.
+pub fn apply_cluster_fixture(root: &Path) -> Value {
+    let output = output_success(
         cli()
-            .arg("cluster")
-            .arg("validate")
-            .arg("--config")
+            .args(["--as", "act-cluster-test", "cluster", "apply", "--config"])
             .arg(root)
             .arg("--json"),
-    ));
-    let schema_digest = validate["resource_digests"]["schema.knowledge"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    // The fabricated state predates external Blob policy metadata and has no
-    // applied query child yet. Its graph resource must therefore bind exactly
-    // the historical graph + schema + default-Deny composite; a placeholder
-    // digest is not a valid old or current ledger shape.
-    let graph_digest = {
-        use sha2::{Digest, Sha256};
-
-        let input = format!("graph\0knowledge\0schema\0{schema_digest}\0");
-        let digest = Sha256::digest(input.as_bytes());
-        digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let state_dir = root.join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("state.json"),
-        format!(
-            r#"{{
-  "version": 1,
-  "state_revision": 1,
-  "applied_revision": {{
-    "resources": {{
-      "graph.knowledge": {{ "digest": "{graph_digest}" }},
-      "schema.knowledge": {{ "digest": "{schema_digest}" }}
-    }}
-  }}
-}}
-"#
-        ),
-    )
-    .unwrap();
-    validate
+    );
+    let receipt = parse_stdout_json(&output);
+    assert_eq!(receipt["status"], "complete", "{receipt}");
+    assert_eq!(receipt["result"]["converged"], true, "{receipt}");
+    unlock_cluster_fixture(root);
+    receipt
 }
 
 pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value {
-    let mut invocation = cli();
     if command == "apply" {
-        invocation.arg("--as").arg("act-cluster-test");
+        return apply_cluster_fixture(root);
     }
-    invocation
-        .arg("cluster")
-        .arg(command)
-        .arg("--config")
-        .arg(root);
-    invocation.arg("--json");
-    parse_stdout_json(&output_success(&mut invocation))
+    parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(root)
+            .arg("--json"),
+    ))
 }
 
 pub fn write_multi_graph_cluster_fixture(root: &std::path::Path) {
@@ -770,15 +899,6 @@ policies:
     .unwrap();
 }
 
-pub fn change_for<'j>(json: &'j serde_json::Value, resource: &str) -> &'j serde_json::Value {
-    json["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|change| change["resource"] == resource)
-        .unwrap_or_else(|| panic!("missing change for {resource}: {json}"))
-}
-
 pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
     fs::create_dir_all(root.join("data")).unwrap();
     fs::create_dir_all(root.join("build")).unwrap();
@@ -809,7 +929,7 @@ pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
             "  types:\n",
             "    Decision:\n",
             "      target: embedding\n",
-            "      fields: [slug, intent]\n"
+            "      fields: [intent]\n"
         ),
     )
     .unwrap();
@@ -850,23 +970,6 @@ pub fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> Strin
 }
 
 // ---- RFC-009 Phase 1: parity-matrix harness ----
-
-/// Twin graphs for embedded-vs-remote comparison: the same loaded fixture
-/// copied to two roots, so write verbs can run once per arm on identical
-/// state. Returns (tempdir-guard, local_graph, remote_graph).
-pub fn twin_graphs() -> (TempDir, PathBuf, PathBuf) {
-    let temp = tempdir().unwrap();
-    let seed = temp.path().join("seed");
-    fs::create_dir_all(&seed).unwrap();
-    let graph = seed.join("server.omni");
-    init_graph(&graph);
-    load_fixture(&graph);
-    let local = temp.path().join("local.omni");
-    let remote = temp.path().join("remote.omni");
-    copy_dir(&graph, &local);
-    copy_dir(&graph, &remote);
-    (temp, local, remote)
-}
 
 pub fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
@@ -913,7 +1016,7 @@ pub const BLOB_CLI_DATA: &str = r#"{"type":"Document","data":{"title":"readme","
 {"type":"Document","data":{"title":"empty","content":"base64:","note":"valid empty"}}
 {"type":"Document","data":{"title":"null","note":"null"}}
 {"type":"Document","data":{"title":"peer","note":"edge target"}}
-{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQD/"}}"#;
+{"edge":"Attachment","id":"attachment-1","from":"readme","to":"peer","data":{"payload":"base64:RWRnZQD/"}}"#;
 
 pub const BLOB_NODE_BYTES: &[u8] = &[0, 1, 2, 3, 4, 255];
 pub const BLOB_EDGE_BYTES: &[u8] = b"Edge\0\xff";
@@ -934,7 +1037,8 @@ pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
         let db = omnigraph::db::Omnigraph::open(&graph.to_string_lossy())
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Merge)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Merge)
             .await
             .unwrap();
     });
@@ -971,7 +1075,8 @@ pub fn init_blob_graph(graph: &Path) {
         let db = omnigraph::db::Omnigraph::init(&graph.to_string_lossy(), BLOB_CLI_SCHEMA)
             .await
             .unwrap();
-        omnigraph::loader::load_jsonl(&db, BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(BLOB_CLI_DATA, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1005,7 +1110,8 @@ pub fn init_external_blob_graph(
             }
         })
         .to_string();
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1069,17 +1175,11 @@ policies:
     output_success(
         cli()
             .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(&cluster_dir),
-    );
-    output_success(
-        cli()
-            .arg("cluster")
             .arg("apply")
             .arg("--config")
             .arg(&cluster_dir),
     );
+    unlock_cluster_fixture(&cluster_dir);
 
     let served_root = cluster_dir
         .join("graphs")
@@ -1101,7 +1201,8 @@ policies:
         let data = format!(
             "{BLOB_CLI_DATA}\n{{\"type\":\"Document\",\"data\":{{\"title\":\"external\",\"content\":\"{external_uri}\",\"note\":\"descriptor only\"}}}}"
         );
-        omnigraph::loader::load_jsonl(&db, &data, omnigraph::loader::LoadMode::Overwrite)
+        session_over(db)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Overwrite)
             .await
             .unwrap();
     });
@@ -1122,6 +1223,7 @@ pub fn scrub_volatile(value: &mut serde_json::Value) {
         // identity-bearing per-instance values
         "commit_id",
         "id",
+        "__id",
         "parent_id",
         "merge_parent_id",
         "snapshot",
@@ -1208,7 +1310,32 @@ pub const PARITY_GRAPH_ID: &str = "parity";
 /// the served graph is the source of truth and the local twin mirrors it.
 ///
 /// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
-pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
+pub fn parity_configs(root: &Path, local_graph: &Path) -> PathBuf {
+    parity_configs_with_schema(root, local_graph, &fixture("test.pg"))
+}
+
+/// The same parity setup with additional schema declarations. Seed data and
+/// policy remain shared with the ordinary parity fixture.
+pub fn parity_configs_with_schema(root: &Path, local_graph: &Path, schema: &Path) -> PathBuf {
+    parity_configs_using_cli(root, local_graph, schema, None)
+}
+
+pub fn parity_configs_with_cli(
+    root: &Path,
+    local_graph: &Path,
+    schema: &Path,
+    binary: &Path,
+) -> PathBuf {
+    parity_configs_using_cli(root, local_graph, schema, Some(binary))
+}
+
+fn parity_configs_using_cli(
+    root: &Path,
+    local_graph: &Path,
+    schema: &Path,
+    binary: Option<&Path>,
+) -> PathBuf {
+    let fixture_cli = || binary.map(cli_at).unwrap_or_else(cli);
     let policy = root.join("parity.policy.yaml");
     fs::write(&policy, parity_policy_yaml()).unwrap();
 
@@ -1216,7 +1343,7 @@ pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> 
     // (`parity`), schema = the shared fixture, policy bound to the graph.
     let cluster_dir = root.join("parity-cluster");
     fs::create_dir_all(&cluster_dir).unwrap();
-    fs::copy(fixture("test.pg"), cluster_dir.join("parity.pg")).unwrap();
+    fs::copy(schema, cluster_dir.join("parity.pg")).unwrap();
     fs::copy(&policy, cluster_dir.join("parity.policy.yaml")).unwrap();
     fs::write(
         cluster_dir.join("cluster.yaml"),
@@ -1242,24 +1369,18 @@ policies:
     // Converge the cluster (creates the empty graph at the derived root),
     // then seed it with the same fixture data the local twin holds.
     output_success(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(&cluster_dir),
-    );
-    output_success(
-        cli()
+        fixture_cli()
             .arg("cluster")
             .arg("apply")
             .arg("--config")
             .arg(&cluster_dir),
     );
+    unlock_cluster_fixture(&cluster_dir);
     let served_root = cluster_dir
         .join("graphs")
         .join(format!("{PARITY_GRAPH_ID}.omni"));
     output_success(
-        cli()
+        fixture_cli()
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
@@ -1267,6 +1388,8 @@ policies:
             .arg("overwrite")
             .arg(&served_root),
     );
+
+    unlock_cluster_fixture(&cluster_dir);
 
     // Mirror the seeded served graph into the local twin so both arms hold
     // identical ULIDs / commit ids (the served graph is authoritative).
@@ -1299,17 +1422,20 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
-    // The read commands (blob/query/changes/commit) reject `--as`: a served read
-    // resolves the actor from its bearer token and a direct read attributes
-    // none, so passing `--as` there is an error. Only the write verbs carry the
-    // parity actor on the direct arm.
-    if !matches!(
-        args.first().copied(),
-        Some("blob") | Some("query") | Some("changes") | Some("commit")
-    ) {
+    // The read commands (blob get/stat, branch diff/merge-base, query,
+    // changes, commit, diff) reject `--as`: a served read resolves the actor
+    // from its bearer token and a direct read attributes none, so passing
+    // `--as` there is an error. Only the write verbs, `blob put` and
+    // `blob clear` among them, carry the parity actor on the direct arm.
+    let read = match args {
+        ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
+        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
+        [verb, ..] => matches!(*verb, "query" | "changes" | "commit" | "diff"),
+        [] => false,
+    };
+    if !read {
         local.arg("--as").arg(PARITY_ACTOR);
     }
-    let local_out = local.output().unwrap();
 
     let mut remote = cli();
     remote
@@ -1324,8 +1450,11 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         remote.env("NO_COLOR", "1");
     }
-    let remote_out = remote.output().unwrap();
-    (local_out, remote_out)
+    std::thread::scope(|scope| {
+        let remote = scope.spawn(move || remote.output().unwrap());
+        let local_out = local.output().unwrap();
+        (local_out, remote.join().unwrap())
+    })
 }
 
 /// Parse, scrub, and pretty-print for diffable assertion messages.

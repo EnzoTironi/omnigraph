@@ -23,7 +23,7 @@ scheduler seam (TODO(#527), a v2 issue).
 ## Run
 
 ```bash
-cd crates/omnigraph-dst   # the crate-local .cargo/config.toml sets the flag
+cd crates/omnigraph-dst   # its [env]-only .cargo/config.toml supplies the pool trio
 cargo test
 # fast simulations that keep assertions:
 cargo test --profile dst
@@ -38,10 +38,39 @@ the nightly deterministic fleet uses `DST_FLEET_SEED_BASE` +
 failing job's log line.
 
 The required `--cfg tokio_unstable` (it gates tokio's seeded scheduler,
-`Builder::rng_seed`) comes from this crate's own `.cargo/config.toml` when
-cargo is invoked from the crate directory; from anywhere else, set
-`RUSTFLAGS="--cfg tokio_unstable"` yourself. The `failpoints` feature is a
+`Builder::rng_seed`) comes from the workspace `.cargo/config.toml` for every
+build; an env `RUSTFLAGS` replaces that list, so never set one without the
+cfg. The pool trio (`env_knobs::QUIESCE_ENV`) still needs the crate directory
+or an explicit export, as `dst.yml` does. The `failpoints` feature is a
 default of this crate.
+
+## Shared execution and storage lifetime
+
+`environment::run_universe(&environment, &scenario)` runs one complete scenario
+under one selected root seed. `UniverseEnvironment` creates resources inside
+the seeded runtime; `UniverseScenario` owns the operation loop and checks.
+Rust recipes and GQT use this executor with their respective scenario types.
+The ordinary GQT engine target retains its ordinary runtime.
+
+`MemoryEnvironment` supplies a fresh control-object adapter and an empty owned
+Lance graph namespace. It refuses nonempty or actively owned namespaces.
+The same resources survive an `Omnigraph` reopen within a scenario. Teardown
+clears only the owned Lance prefix, through the raw provider after scenario
+observations, and releases the adapter. This preserves a fresh graph, not a
+reset of shared-backend ETag counters or incomplete multipart state.
+
+`UniverseRun` records the execution phase, primary outcome, and cleanup outcome
+separately. Setup guards partial acquisitions; scenario errors and panics still
+run teardown. Panic payloads remain available to the Rust caller. The caller
+owns process-start settings, failpoint registration, isolation, wall deadlines,
+and containment of hung or killed workers. GQT still executes each replay in a
+fresh child process and verifies the frozen inputs and observations.
+
+The existing `harness::run_universe(root, &Scenario)` and
+`harness::run_universe_caught` calls translate `Scenario.seed` into the explicit
+environment. The four child streams retain their draw order; `FaultPlan.seed`
+continues to select the independent storage-fault stream. Rust fault wrappers,
+counters, and final census remain available through prepared resources.
 
 ## What a universe checks (the oracles)
 
@@ -68,13 +97,13 @@ The five GROUPS below are the reader's map; the enforced census counts
 
 Three distinct instruments, complementary — none subsumes another:
 
-1. **Fault plans** (weather): seeded per-call fault rates in BOTH storage
-   realms (the `StorageAdapter` seam and Lance's interposed provider) —
-   clean errors and latency, read-path corruption (bit rot, truncation,
-   latent sector errors), write-side weather (corrupted, lost, misdirected
-   writes), ack-loss, and bounded staleness. Unaimed — discovers handling
-   bugs statistically across the whole run.
-2. **Crash-window hunt**: a named failpoint (71 in `catalog::CRASH_WINDOWS`)
+1. **Fault plans** (weather): seeded errors, latency and lost acknowledgements
+   in the adapter realm and, when enabled, Lance's provider. The adapter also
+   models text corruption, lost or misdirected writes, and bounded staleness;
+   each verb needs a workload that reaches its supported methods. Seeded
+   engine-effect failures use existing pre-publication decision seams.
+   Lance-call weather retains the semantic oracles but is outside strict replay.
+2. **Crash-window hunt**: a named failpoint (72 in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
 3. **Crash-state enumeration** (ALICE-style): kill at completion #k for
@@ -86,24 +115,29 @@ crash: the storage wrapper stops forwarding, same process judges) and
 **lane B** (real death: a parent spawns `dst_child`, waits on the fsync'd
 barrier line at completion #k, SIGKILLs, then recovers and judges from the
 oplog). Lane B ships as a labeled preview; see `src/lane_b.rs`
-and `tests/lane_b.rs`.
+and `tests/integration/lane_b.rs`.
 
 ## Fault axes
 
-- **Crash windows**: `Scenario::crash_at` arms any of the engine's 71 named
+- **Crash windows**: `Scenario::crash_at` arms any of the engine's 72 named
   failpoints (`catalog::CRASH_WINDOWS`) at a seeded op index. The ignored
   `dst_hunt_crash_window_sweep` test sweeps the whole catalog.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
-  over both realms — marked errors + latency charged in VIRTUAL
-  time (`start_paused` clock, so faulty universes still run in milliseconds),
-  plus the corruption/ack-loss/staleness axes listed under Failure models.
+  on the adapter and optionally Lance. Latency uses virtual time. Lance supports
+  errors, latency and lost acknowledgements; adapter text corruption and
+  staleness do not extend to Lance or binary graph-index artifacts.
+- **Engine-effect failures**: `FaultPlan::engine_effect_error_pct` selects an
+  existing pre-publication seam from a separate seeded stream. The atomicity
+  and live-handle owners require counted delivery and full report replay;
+  the latter also requires later model-changing writes without reopening.
+  These process-wide decision seams require serialized scenario ownership.
 
 ## Known limits
 
 Racing-writer determinism is blocked on the upstream Lance deterministic-mode
 proposal (4 flag-gated items) — the
-`#[ignore]`d instruments flip on when it lands. Crash-mode universes cannot
-yet run in parallel threads (failpoint-registry threading is a planned follow-up).
+`#[ignore]`d instruments flip on when it lands. Crash-mode universes and engine-effect weather use process-wide decision
+seams and must be serialized within a test process.
 
 ## Deferred work (#527 review)
 

@@ -29,15 +29,22 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.10.0
+- Version surveyed: 0.13.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
-- Workspace: compiler, storage, engine (`omnigraph-engine` package), policy,
-  API types, cluster, CLI, server, Azure admission wrapper, benchmark harness,
+- Workspace: compiler, planner (logical/physical plans and optimizer), storage,
+  `omnigraph-core` (the engine's shared base: `OmniError`, Lance dataset
+  access, request instrumentation, Lance native ref control
+  (`branch_control`), dataset addressing),
+  `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
+  and lineage, the publish), `omnigraph-seams` (the one seam type every
+  test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
+  package), policy, API types, cluster, CLI, server, Azure admission
+  wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
   test per case), and `omnigraph-dst` (deterministic simulation testing; needs
-  `--cfg tokio_unstable`, set by its crate-local `.cargo/config.toml` when
-  cargo runs from the crate dir — compiles empty without it)
+  `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
+  build — the workspace test gate excludes the crate by name)
 - License: MIT
 
 OmniGraph is a typed property-graph engine coordinating many versioned Lance
@@ -74,7 +81,6 @@ authority model.
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
-| Review configuration and CLI contracts | [Configuration and CLI framework](docs/dev/config-cli-framework.md) |
 | Propose or inspect a decision | [RFC registry](docs/rfcs/README.md) |
 | Write documentation | [Documentation guide](docs/dev/documentation.md) |
 | Review shipped history | [Release notes](docs/releases/) |
@@ -85,6 +91,9 @@ The decision lens is ongoing liability: ask what a design looks like after five
 more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
+Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
+Reason from first principles about OmniGraph instead of in arbitrary database categories.
+Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -94,8 +103,9 @@ working memory:
 2. A query or write attempt uses one coherent accepted snapshot. A retry starts
    fresh rather than mixing old and new authority.
 3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
-4. Independently durable pre-publication effects require enough recovery
-   identity and authority to converge safely; ambiguity fails closed.
+4. Pre-publication durable effects stay unreachable (detached commits, staged
+   files). Table pins and the accepted schema contract are complete in one
+   manifest publication; ambiguity fails closed.
 5. Stable schema identity survives supported renames, not drop/re-add. Never
    infer identity from names, paths, versions, field IDs, or branch refs.
 6. Indexes, caches, topology, fragment layout, and compaction are derived
@@ -107,10 +117,7 @@ working memory:
    Never acknowledge before durable graph visibility or return silent partial
    results.
 
-Do not add a custom WAL/transaction manager, a queue for manifest-derived work,
-inline vector/FTS rebuilds, raw public Lance writers, string-built query
-semantics, process-local locks advertised as distributed fencing, cloud-only
-correctness paths, or a shadow source of truth without an accepted RFC that
+Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw public Lance writers, string-built query semantics, process-local locks advertised as distributed fencing, cloud-only correctness paths, or a shadow source of truth without an accepted RFC that
 changes the invariant.
 
 ## Build and test
@@ -122,11 +129,14 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
-# Focused examples
-cargo test -p omnigraph-engine --test traversal
+# Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
+# binary (one link per crate, not one per file); a file stays a separate binary only when its tests
+# need their own process. CI selects a module's test as `--test integration <module>::<name>`.
+cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
 
@@ -134,11 +144,29 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -W clippy::dbg_macro
 
+# Activate the documentation environment first; see docs/dev/documentation.md.
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
+cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
+python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
+python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
+python3 scripts/check-workspace-test-owners.py --self-test   # after editing the `Test Workspace` owner list or .config/nextest.toml
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
+
+The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
+`cargo test -p omnigraph-gqt --locked` and
+`cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`
+from any directory inside the checkout: the workspace `.cargo/config.toml`
+enables DST by default there. `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` (empty
+included) or a `target.*.rustflags` config entry replaces that list, and a
+cargo run outside the checkout (`--manifest-path`) never reads it; such a
+build must refuse requested DST execution, not skip those cases. The DST suite itself runs from
+`crates/omnigraph-dst` (`cargo test`): its `[env]`-only Cargo configuration
+supplies the pool trio the suite asserts at process start.
 
 S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
 environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the
@@ -162,18 +190,36 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
   assertions; when the reported symptom additionally needs scale to
-  manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
-  guards it, and the two cross-reference each other in comments.
+  manifest, a second test guards it, a `.gqt` case under
+  `crates/omnigraph-gqt/cases_slow/` when the format can express the symptom
+  and an `#[ignore]`d test in a `tests/integration/repro_issue_*.rs` module otherwise,
+  and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
-  (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
-  expensive regression repros use `heavy-repro:` and thereby enroll in the
-  nightly job.
+  (`instrument:`, `hunt:`, `heavy-repro:`, `nightly:`, or the environment it
+  needs); expensive regression repros use `heavy-repro:`, a test that waits
+  out a real production deadline or runs a whole CLI journey on the real poll
+  interval uses `nightly:`, and both enroll by exact name in
+  `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
+  with `--run-ignored only` and refuses a run in which an enrolled name did
+  not pass.
+- Engine v1 is frozen: every file under
+  `crates/omnigraph-reference-engine/src/` is pinned by
+  `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only
+  through GQT's `--- expect same as v1`, which compares a query step's v2
+  rows with v1's. A defect seen on v1 is fixed on v2
+  (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
+  same PR and a reviewer's eyes.
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
-- Add release notes for user-visible release changes; keep private tickets and
-  planning shorthand out of public history.
+- Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
+  follow [release-note authoring](docs/dev/documentation.md#release-notes).
+  Keep private tickets and planning shorthand out of public history.
+- Title a pull request `type(scope)!: description` and read the title back
+  after opening it; the `PR Title` check refuses every other shape, and the
+  squash subject on `main` is that title
+  ([CONTRIBUTING.md](CONTRIBUTING.md), Pull Requests).
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

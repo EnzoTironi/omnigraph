@@ -4,6 +4,7 @@
 
 pub mod data_tokens;
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,15 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
+use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
-use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
+use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, QueryRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{AppState, ProcessDefaults, build_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -88,19 +91,6 @@ rules:
       target_branch_scope: unprotected
 "#;
 
-pub const SCHEMA_APPLY_POLICY_YAML: &str = r#"
-version: 1
-groups:
-  admins: [act-ragnor]
-protected_branches: [main]
-rules:
-  - id: admins-schema-apply
-    allow:
-      actors: { group: admins }
-      actions: [schema_apply]
-      target_branch_scope: protected
-"#;
-
 pub fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../omnigraph/tests/fixtures")
@@ -116,25 +106,22 @@ pub async fn init_loaded_graph() -> tempfile::TempDir {
 }
 
 pub async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfile::TempDir {
-    init_graph_with_schema_and_data_as(schema, data, None).await
-}
-
-pub async fn init_graph_with_schema_and_data_as(
-    schema: &str,
-    data: &str,
-    actor: Option<&str>,
-) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let graph = graph_path(temp.path());
     fs::create_dir_all(&graph).unwrap();
     Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    db.load_as("main", None, data, LoadMode::Overwrite, actor)
-        .await
-        .unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
     temp
+}
+
+/// A session with the definition's defaults over a freshly opened handle:
+/// the engine methods that consult a setting (`load*`, `mutate*`, `query*`,
+/// `branch_merge*`) live on `Session`; everything else derefs to the handle.
+pub fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
 }
 
 pub async fn init_graph_with_schema(schema: &str) -> tempfile::TempDir {
@@ -230,28 +217,6 @@ rules:
       branch_scope: any
 "#;
 
-pub const STORED_QUERY_SCHEMA_APPLY_POLICY_YAML: &str = r#"
-version: 1
-groups:
-  admins: [act-ragnor]
-protected_branches: [main]
-rules:
-  - id: admins-can-invoke
-    allow:
-      actors: { group: admins }
-      actions: [invoke_query]
-  - id: admins-can-read
-    allow:
-      actors: { group: admins }
-      actions: [read]
-      branch_scope: any
-  - id: admins-can-schema-apply
-    allow:
-      actors: { group: admins }
-      actions: [schema_apply]
-      target_branch_scope: protected
-"#;
-
 pub const FIND_PERSON_GQ: &str =
     "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
 
@@ -265,6 +230,7 @@ pub fn g(path: &str) -> String {
 
 pub fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("content-type", "application/json")
@@ -280,6 +246,7 @@ pub fn invoke_request_bytes(
     content_type: Option<&str>,
 ) -> Request<Body> {
     let mut builder = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("authorization", format!("Bearer {token}"));
@@ -291,17 +258,12 @@ pub fn invoke_request_bytes(
 
 pub fn get_request(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(uri)
         .method(Method::GET)
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap()
-}
-
-pub fn drifted_test_schema() -> String {
-    fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("age: I32?", "age: I64?")
 }
 
 pub async fn manifest_dataset_version(graph: &Path) -> u64 {
@@ -344,6 +306,21 @@ pub async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
+    (temp, build_app(state))
+}
+
+/// [`app_for_loaded_graph`] with the process defaults every request's
+/// session starts from, the pair `omnigraph::settings::from_env_with`
+/// returns; a test seeds them here instead of the process environment.
+pub async fn app_for_loaded_graph_with_process_defaults(
+    defaults: ProcessDefaults,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap()
+        .with_process_defaults(defaults);
     (temp, build_app(state))
 }
 
@@ -416,20 +393,7 @@ pub async fn app_for_loaded_graph_with_auth_tokens_and_policy(
     tokens: &[(&str, &str)],
     policy: &str,
 ) -> (tempfile::TempDir, Router) {
-    app_for_loaded_graph_with_auth_tokens_and_policy_as(tokens, policy, None).await
-}
-
-pub async fn app_for_loaded_graph_with_auth_tokens_and_policy_as(
-    tokens: &[(&str, &str)],
-    policy: &str,
-    actor: Option<&str>,
-) -> (tempfile::TempDir, Router) {
-    let temp = init_graph_with_schema_and_data_as(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
-        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
-        actor,
-    )
-    .await;
+    let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, policy).unwrap();
@@ -496,7 +460,7 @@ pub fn additive_schema_with_nickname() -> String {
 
 pub fn schema_without_age() -> String {
     // Drop the nullable `age` column from the test schema. Used by the
-    // HTTP soft/hard drop tests below.
+    // HTTP drop tests.
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
         .replace("    age: I32?\n", "")
@@ -689,6 +653,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g("/branches"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
@@ -712,6 +677,7 @@ pub mod matrix {
                 name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": name, "age": age })),
                 branch: Some(branch.to_string()),
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -719,7 +685,8 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(g("/change"))
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/mutate"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -761,6 +728,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                         .uri(g(&format!("/snapshot?branch={}", branch)))
                         .method(Method::GET)
                         .body(Body::empty())
@@ -787,12 +755,13 @@ pub mod matrix {
         /// `get_person` query from `test.gq` for identity rather than
         /// just count.
         pub async fn person_exists(&self, branch: &str, name: &str) -> bool {
-            let body = serde_json::to_vec(&ReadRequest {
-                query_source: include_str!("../../../omnigraph/tests/fixtures/test.gq").to_string(),
-                query_name: Some("get_person".to_string()),
+            let body = serde_json::to_vec(&QueryRequest {
+                query: include_str!("../../../omnigraph/tests/fixtures/test.gq").to_string(),
+                name: Some("get_person".to_string()),
                 params: Some(json!({ "name": name })),
                 branch: Some(branch.to_string()),
                 snapshot: None,
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -800,7 +769,8 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(g("/read"))
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/query"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -853,13 +823,14 @@ pub mod matrix {
         /// C6: insert a uniquely-named sentinel on main and verify it
         /// landed. Catches engine-state poisoning where a cell's
         /// concurrent ops left the engine half-broken — subsequent
-        /// /change either deadlocks or returns a non-200.
+        /// /mutate either deadlocks or returns a non-200.
         pub async fn assert_post_op_sentinel(&self, cell: &str, sentinel: &str) {
             let body = serde_json::to_vec(&ChangeRequest {
                 query: MUTATION_QUERIES.to_string(),
                 name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": sentinel, "age": 99 })),
                 branch: Some("main".to_string()),
+                settings: None,
             })
             .unwrap();
             let r = self
@@ -867,7 +838,8 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(g("/change"))
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/mutate"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -878,7 +850,7 @@ pub mod matrix {
             assert_eq!(
                 r.status(),
                 StatusCode::OK,
-                "[{}] post-op sentinel /change on main failed (engine poisoned?)",
+                "[{}] post-op sentinel /mutate on main failed (engine poisoned?)",
                 cell
             );
             assert!(
@@ -904,11 +876,15 @@ pub mod matrix {
                     source,
                     target: Some(target),
                     delete_branch: false,
+                    as_commit: false,
+                    dry_run: false,
+                    settings: None,
                 })
                 .unwrap();
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g("/branches/merge"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
@@ -940,12 +916,14 @@ pub mod matrix {
                     name: Some("insert_person".to_string()),
                     params: Some(json!({ "name": name, "age": age })),
                     branch: Some(branch),
+                    settings: None,
                 })
                 .unwrap();
                 let response = app
                     .oneshot(
                         Request::builder()
-                            .uri(g("/change"))
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                            .uri(g("/mutate"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
                             .body(Body::from(body))
@@ -978,6 +956,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g("/branches"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
@@ -1005,6 +984,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
+                            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                             .uri(g(&format!("/branches/{}", name)))
                             .method(Method::DELETE)
                             .body(Body::empty())
@@ -1054,7 +1034,7 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
         db.branch_create_from(ReadTarget::branch("main"), "feature")
             .await
             .unwrap();
@@ -1075,10 +1055,12 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
 
 pub async fn sdk_change_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
     let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap())
-        .await
-        .unwrap()
-        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let db = session(
+        Omnigraph::open(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>),
+    );
     let mut params: omnigraph_compiler::ParamMap = Default::default();
     // Parameter keys are bare names (no `$` prefix); the runtime resolves
     // `$name` references in the query body to `params["name"]`.
@@ -1122,11 +1104,13 @@ pub async fn http_change_decision(
         name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "ParityCharlie", "age": 30 })),
         branch: Some("main".to_string()),
+        settings: None,
     };
     let (status, _body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
@@ -1143,10 +1127,12 @@ pub async fn http_change_decision(
 
 pub async fn sdk_merge_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
     let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(graph.to_str().unwrap())
-        .await
-        .unwrap()
-        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let db = session(
+        Omnigraph::open(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>),
+    );
     let result = db.branch_merge_as("feature", "main", Some(actor)).await;
     match result {
         Ok(_) => ParityDecision::Allow,
@@ -1173,10 +1159,14 @@ pub async fn http_merge_decision(
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
+        dry_run: false,
+        settings: None,
     };
     let (status, _body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
@@ -1189,6 +1179,28 @@ pub async fn http_merge_decision(
         StatusCode::OK => ParityDecision::Allow,
         StatusCode::FORBIDDEN => ParityDecision::Deny,
         other => panic!("unexpected HTTP status for branch_merge: {other}"),
+    }
+}
+
+/// Bootstrap through the production v2 protocol and hand off a fully settled
+/// fixture to the server. These tests own every writer of the temporary root.
+pub async fn apply_cluster_fixture(config_dir: &Path) {
+    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+    let captured = omnigraph_cluster::capture_deployment(config_dir).unwrap();
+    let applied = omnigraph_cluster::apply_deployment(config_dir, None, &caller, |_, _, _| {})
+        .await
+        .unwrap();
+    assert!(
+        matches!(applied, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
+        "{applied:?}"
+    );
+    let status = omnigraph_cluster::deployment_status(captured.canonical_root(), None, &caller)
+        .await
+        .unwrap();
+    if let Some(lock_id) = status.lock_id {
+        omnigraph_cluster::force_unlock_storage_root(captured.canonical_root(), &lock_id)
+            .await
+            .unwrap();
     }
 }
 
@@ -1219,10 +1231,7 @@ graphs:
         ),
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    apply_cluster_fixture(temp.path()).await;
     temp
 }
 

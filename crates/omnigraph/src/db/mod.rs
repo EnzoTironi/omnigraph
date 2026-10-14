@@ -1,23 +1,44 @@
+#[cfg(test)]
+mod catalog_tests;
 pub mod commit_graph;
-mod graph_coordinator;
+pub(crate) mod graph_coordinator;
+pub(crate) mod legacy_sidecars;
 pub mod manifest;
-mod omnigraph;
-mod recovery_audit;
+pub(crate) mod omnigraph;
 mod schema_state;
+pub(crate) mod snapshot;
+#[cfg(test)]
+mod system_roles_tests;
+pub(crate) mod upgrade;
 pub(crate) mod write_queue;
 
-pub use commit_graph::GraphCommit;
+pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
-pub use manifest::{DatasetEntry, DatasetUpdate, Snapshot, SnapshotDataset, SnapshotScanner};
-pub(crate) use omnigraph::ensure_public_branch_ref;
+pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
-    CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction, RepairClassification,
-    RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult, SkipReason,
+    CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
+    CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
+    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
+    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
+    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
+    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
+    unattached_release_order,
 };
-pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
-pub(crate) use omnigraph::{export_blob_values, logical_row_image};
+pub(crate) use omnigraph::{
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
+};
+pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph_core::metadata::now_micros;
+pub(crate) use schema_state::SchemaContractIdentity;
+pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
+pub use upgrade::{
+    UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
+    UpgradeWork, upgrade_storage, upgrade_storage_as,
+};
 
 use crate::error::{OmniError, Result};
 
@@ -45,7 +66,6 @@ pub fn reserve_export_root_exclusion(graph_uri: &str) -> Result<ExportRootExclus
     Ok(ExportRootExclusion { _permit: permit })
 }
 
-pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 /// Persisted graph-level property identity carried by each user property's
 /// physical Lance field.  Historical consumers compare this authority rather
 /// than inferring property lifetime from a Lance field id or field position.
@@ -91,26 +111,4 @@ impl MutationOpKind {
             MutationOpKind::Update | MutationOpKind::Delete | MutationOpKind::SchemaRewrite => true,
         }
     }
-}
-
-pub(crate) fn is_schema_apply_lock_branch(name: &str) -> bool {
-    name.trim_start_matches('/') == SCHEMA_APPLY_LOCK_BRANCH
-}
-
-pub(crate) fn is_internal_system_branch(name: &str) -> bool {
-    // Legacy `__run__*` staging branches (Run state machine, removed MR-771)
-    // are swept off `__manifest` by the v2→v3 internal-schema migration, so the
-    // only internal branch the engine still creates is the schema-apply lock.
-    is_schema_apply_lock_branch(name)
-}
-
-/// Microseconds since the UNIX epoch — the `created_at` stamp threaded through
-/// every graph-lineage / recovery-audit / commit-graph row. One canonical
-/// helper so the clock-error mapping (variant + message) cannot drift across
-/// the call sites that record those timestamps.
-pub(crate) fn now_micros() -> Result<i64> {
-    let duration = crate::dst_clock::system_time_now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| OmniError::manifest(format!("system clock before UNIX_EPOCH: {e}")))?;
-    Ok(duration.as_micros() as i64)
 }

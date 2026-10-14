@@ -1,0 +1,91 @@
+# issue: none
+# notes: After feature adopts main, its next write must reclaim its former fork.
+# notes: bob proves that fork starts from main's lineage; main keeps its own values after restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_write() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_write() {
+    update Person set { age: 32 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query main_adds_bob() {
+    insert Person { name: "bob", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into feature
+
+--- expect outcome: fast_forward
+
+--- mutate branch: feature
+query feature_rewrites() {
+    update Person set { age: 33 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: feature
+query feature_reads_own_write() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":33}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+query main_unchanged() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"alice","p.age":32}
+{"p.name":"bob","p.age":40}
+
+--- expect shape
+p.name: String
+p.age: I32

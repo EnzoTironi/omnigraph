@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on:
   - Upstream Lance entropy and mock-time seams
   - Pool-thread identity propagation
-  - Per-instance failpoint registries
+  - Per-instance failpoint registries (superseded by RFC 0066's per-seam slots)
 ---
 
 # RFC 0037: Deterministic simulation harness
@@ -274,7 +274,7 @@ exactly:
 
 | # | Name | Imitated reality | Who sees the fault | What must survive | Positions indexed by | Mechanism |
 |---|---|---|---|---|---|---|
-| 1 | injected storage faults | the store misbehaves on a call | the operation (an error or wrong bytes) | its retry and error paths | the call | call-level |
+| 1 | injected operation failures | the store misbehaves on a call, or the engine fails before publication | the operation (an error or wrong bytes) | its retry and error paths | the storage call or pre-publication seam | call-level or named decision seam |
 | 2 | crash windows | the process dies at a phase boundary | nobody; the process is gone | recovery, from a marked place | code location (the 71 cataloged windows) | line-level |
 | 3 | crash-state enumeration | the process dies between durable writes | nobody; the process is gone | recovery, from every write cut | write ordinal (W writes = W states) | call-level (a write counter) |
 
@@ -284,7 +284,9 @@ Per model, what is built and measured:
    inputs") injects clean errors and latency, corruption on the read
    path (value-aware bit rot, truncated reads, persistent latent
    sector errors), lost and misdirected writes, ack-loss (the effect
-   durable, the confirmation lost), and bounded staleness.
+   durable, the confirmation lost), and bounded staleness. The separate
+   `engine_effect_error_pct` stream returns failures at existing
+   pre-publication seams while the process stays alive; it is not a crash.
 2. The judged contract is two-sided: a failed operation is invisible
    XOR fully applied, and committed writes never roll back.
 3. Since memory dies with the process, storage is the only surviving
@@ -543,7 +545,10 @@ judge's dump), not as transcripts.
    unlocks in-process parallel universes. Verification rides with it:
    order-swap and first-versus-last position tests (the #503 table's
    AB/BA row) stand guard in CI so no future shared state quietly
-   reintroduces a leak between universes.
+   reintroduces a leak between universes. Superseded by RFC 0066: the
+   registry became one slot per seam behind an RAII guard (process-wide
+   for decision and storage seams, thread-local for clock, ids and gate);
+   in-process parallel universes stay out of scope.
 
 ## Reference-level design
 
@@ -691,6 +696,17 @@ by attribution: a damage ledger records what was injected, so
 engine-born detection errors are legalized by overlap instead of
 guessed at.
 
+Coverage follows the methods the workload actually calls. Current-format
+schema contracts are Lance rows. Adapter text-read corruption and staleness
+are qualified against offline legacy upgrade admission; rejected attempts
+must preserve the adapter and Lance objects, followed by a successful clean
+conversion. Binary graph-index writes support loss and misdirection but not
+the adapter's text-only corruption. Lance-call weather supports errors,
+latency and lost acknowledgements and remains outside strict report replay.
+The separate engine-effect stream preserves strict replay, requires counted
+seam delivery, and is scoped to workload operations under serialized scenario
+ownership; the live-handle owner also requires subsequent successful writes.
+
 ### Provenance
 
 Every recorded execution is a numbered run whose meta names the
@@ -806,7 +822,7 @@ lists the seven with one.
 | Modeled death is not process death | P1-1 | vocabulary rescope (the two delivery lanes above); lane B preview in-tree with six judge red-proofs | lane B qualification: PRE_ACK/ACK cells, no-kill baselines, sensitivity fixture, second backend, lane A agreement check | #TBD-1 |
 | Multipart writes bypass completion hooks | P1-3 | tripwire: census gate reds on first multipart use; typed exclusion row | harness-owned MultipartUpload wrapper, part-level cuts | #TBD-2 |
 | Adapter collapses rename/delete_prefix stages | P1-4 | typed exclusion rows + census never-fired report | shared DurableEventSequencer below both realms | #TBD-3 |
-| DST seams reachable via feature flag only | P1-5 | non-default `dst` cargo feature; passthroughs compile to direct calls when off | instance-owned builder injection, no feature flag | #TBD-4 |
+| DST seams reachable via feature flag only | P1-5 | non-default `dst` cargo feature; passthroughs compile to direct calls when off | instance-owned builder injection, no feature flag. Superseded by RFC 0066: one slot per seam behind an RAII guard, process-wide for the decision and storage seams (serialized by the scenario gate) and thread-local for the clock, id source and gate; per-instance registries are not pursued | #TBD-4 |
 | Nightly seed identity derived, not declared | P1-6 | evidence note in the nightly workflow; failures carry the literal seed row | versioned RunPlan/RunResult manifest artifact | #TBD-5 |
 | Scheduler escapes tolerated outside strict cells | P1-7 | replay-honesty labels: wild arms declared non-replayable | logical turns for finish/timeouts; readers gated | #TBD-6 |
 | Strict replay compares a report projection | P1-9 | claim rescoped to report-projection replay; ambient ID/clock sites routed through seams | full-trace and object-inventory comparison; ambient-source guard | #TBD-7 |

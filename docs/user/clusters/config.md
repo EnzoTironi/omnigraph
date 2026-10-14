@@ -35,7 +35,6 @@ providers:
 graphs:
   knowledge:
     schema: knowledge.pg
-    actor_provenance: true
     queries: queries/
     embedding_provider: default
     external_blobs:
@@ -58,9 +57,9 @@ policies:
 |---|---:|---|
 | `version` | yes | Configuration schema; currently `1` |
 | `metadata.name` | no | Display name |
-| `storage` | no | Cluster root: local by default, or `file://`, `s3://`, `az://` |
+| `storage` | no | Cluster root; direct default is the config directory, remote apply defaults to the selected server |
 | `state.backend` | no | Omit or set to `cluster` |
-| `state.lock` | no | Serialize cluster operations; defaults to `true` |
+| `state.lock` | no | Exclusive writer admission; omit or set to `true`; `false` refuses execution |
 | `providers.embedding` | no | Named embedding provider profiles |
 | `graphs` | no | Graph declarations keyed by graph ID |
 | `policies` | no | Policy bundles keyed by bundle name |
@@ -82,7 +81,6 @@ Optional fields:
 
 | Field | Meaning |
 |---|---|
-| `actor_provenance` | Optional `true` or `false`; defaults to enabled on creation and preserves the accepted setting on existing graphs |
 | `queries` | Stored-query files, directories, or explicit name mappings |
 | `embedding_provider` | Name under `providers.embedding` |
 | `external_blobs` | Allow-list for new external Blob references |
@@ -103,42 +101,16 @@ queries:
 ```
 
 Unreadable files, parse errors, duplicate query names, and queries that do not
-type-check against the graph's desired schema fail validation. Static
-`validate` permits references to the built-in `OmniActor` type provisionally:
-only `plan` and `apply` can consult an existing graph's accepted schema to
-determine whether that type is bound. They recheck stored queries against the
-accepted or proposed catalog before publication. Existing catalog-only
-reconciliation with a missing graph uses source-only validation and never
-assumes a system binding.
-
-### Actor provenance
-
-New graphs enable automatic actor provenance unless `actor_provenance: false`
-is explicit. The accepted schema adds the protected system type
-`OmniActor { actorId: String @key }`; customer `.pg` files should not declare
-it. Effective discovery through `schema show --json` includes the type and
-its stable identity binding in `accepted_schema`, alongside unchanged
-customer `schema_source`.
-
-On an existing graph, omitting the field preserves its accepted setting,
-including legacy graphs that have no system binding. An explicit value is
-applied even when the `.pg` file has not changed. Disabling an existing
-binding stops automatic materialization and retains the system type, actor
-rows, stable identities, and history; enabling it again reuses that binding.
-An unbound customer type named `OmniActor` is never adopted automatically;
-explicit enablement refuses the name collision.
-
-This field is desired intent. The graph's accepted schema owns the effective
-setting. Cluster state records an observed projection for reconciliation and
-recovery; it does not override the graph at server startup.
+type-check against the graph's desired schema fail validation.
 
 ## Embedding providers
 
 Provider `kind` may be `openai-compatible`, `openai`, `gemini`, or `mock`.
 Real providers require `api_key: ${ENVIRONMENT_VARIABLE}`; inline secrets are
-rejected. The environment variable is resolved when the server boots, not by
-`cluster validate`, `plan`, or `apply`. Vector dimensions remain part of the
-graph schema.
+rejected. The serving process resolves the environment variable at boot and
+during live deployment preflight for affected graphs. `cluster validate`,
+`plan`, and direct apply do not resolve it. Vector dimensions remain part of
+the graph schema.
 
 See [Embeddings](../search/embeddings.md) for provider behavior.
 
@@ -158,6 +130,28 @@ external_blobs:
 embedded host and may permit a local `file://` directory; it is not installed
 by the HTTP server or direct-store CLI. Bases must be absolute, non-overlapping,
 and free of credentials, query strings, fragments, and path traversal.
+
+A base must also name storage outside the cluster's storage root: the config
+directory when `storage` is omitted, or the `storage` URI. That root holds every
+graph and the applied state, and ingress reads with the process's own storage
+credentials, so a base over it would let any writer copy another graph's data
+or the cluster ledger into a readable Blob value. `cluster validate`, `plan`,
+and `apply` refuse such a base with `external_blob_base_overlaps_storage_root`,
+whatever its scope. Put external objects under a sibling prefix instead, for
+example `s3://company-assets/cluster-external/` beside
+`storage: s3://company-assets/cluster`. A server that finds an overlapping
+`server_safe` base in the applied state quarantines that graph and serves the
+others; if no applied graph is left to serve, startup fails with
+`cluster_no_healthy_graphs`. An embedded handle refuses a policy whose base
+overlaps its own graph root.
+
+A base is compared only with a storage root of its own kind: an `s3://` base
+with an `s3://` root, a `file://` base with a local root. When the root is
+spelled with a path component a base URI cannot express (an empty component
+such as `s3://bucket/a//cluster`, or a percent sign in a local path), a
+same-kind base is refused with `external_blob_storage_root_uncomparable`,
+because disjointness cannot be proven. Moving the base does not clear that
+code; the storage root spelling does.
 
 The allow-list controls which external objects an authorized writer may cause
 the process to inspect. Cedar policy separately decides who may write. See
@@ -181,9 +175,11 @@ Only one bundle may bind a given graph or the cluster scope. See
 
 ## Storage
 
-When `storage` is omitted, applied state and graph data live under the config
-directory. An `s3://` or `az://` value puts them under that object-storage root;
-the source bundle still stays in the operator's working tree.
+For direct apply, omitted `storage` puts applied state and graph data under the
+config directory. `cluster apply --server` instead uses the selected server’s
+canonical root when `storage` is omitted; an explicit absolute path or `file://`,
+`s3://` or `az://` URI must match it. Remote apply rejects relative storage paths
+and reads only the source bundle from the caller’s filesystem.
 
 Use the standard storage credential environment for the chosen backend. Azure
 is a qualification preview and requires the admission wrapper for every writer;
@@ -208,16 +204,45 @@ Prefer relative paths; they are what keep a bundle portable and hermetic.
 | Command | Changes graph or cluster state? | Use |
 |---|---:|---|
 | `validate` | no | Parse and type-check the declaration |
-| `plan` | no | Preview creates, updates, and deletes |
-| `apply` | yes | Converge to the declaration |
-| `approve` | yes | Approve one exact destructive plan item |
-| `status` | no | Read recorded state and lock status |
-| `refresh` | state only | Refresh observations for declared graphs |
-| `import` | state only | Adopt existing declared resources |
+| `plan` | no | Preview desired differences; unsupported deployment effects still refuse |
+| `apply` | yes | Converge graph inventory, schemas, queries, policies and provider/Blob settings |
+| `status` | no | Read recorded deployment and lock status; server status also observes activation |
+| `observe` | no | Report current observations without changing authority |
 | `force-unlock` | yes | Remove one proven-stale lock by exact ID |
+| `upgrade-ledger` | state only | Convert a stopped legacy ledger without resetting graph data |
 
-`apply` can create graphs, apply supported soft schema changes, publish query
-and policy resources, and execute approved graph deletion. It does not load
-graph data, start servers, or perform hard schema drops.
+All execution uses ledger v2 and requires `state.lock: true`. With `--server`,
+apply submits to the existing writer and activates without restart. Direct
+apply owns exclusive admission and requires an explicit handoff before serving.
+Retained graph roots and storage formats stay fixed. Policy/provider/Blob bindings
+can change; removing a graph declaration deletes its managed storage and history. See
+[deployment boundaries](index.md#deployment-boundaries).
+Apply does not load rows or start servers. Root-addressed status, reconciliation
+and conversion do not use `cluster.yaml`; see [the deployment workflow](index.md).
+
+## Limits
+
+Configuration loading refuses limits before schema effects. Shared files with
+identical bytes count once toward the aggregate source limit.
+
+| Resource | Limit |
+|---|---:|
+| Each `cluster.yaml`, schema, query or policy source | 1 MiB |
+| Distinct source bytes in one captured bundle | 8 MiB |
+| Declared resources (each graph and schema count separately) | 4096 |
+| Query discovery paths plus directory entries, including ignored files | 4096 |
+| Encoded immutable deployment bundle | 16 MiB |
+| Encoded cluster ledger | 16 MiB |
+| Lock metadata read | 64 KiB |
+| Outstanding deployments | 1 |
+| Retained deployment results | 32 records, 4 MiB total, 1 MiB each |
+| Deployment actor / resource address / canonical root | 256 / 512 / 4096 UTF-8 bytes |
+
+Deployment admission checks the actual encoded prepared intents and reserves
+ledger/result space to record completion before accepting schema effects.
+JSON escaping and prepared state can make a deployment exceed its encoded limit
+even when raw source bytes fit. Result history may evict older completed records
+to admit a new deployment; outstanding authority is retained. These bounds do
+not cap graph data, native manifest-history scans or total process memory.
 
 See [Operating a cluster](index.md) for the end-to-end workflow.

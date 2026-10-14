@@ -1,14 +1,21 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use lance::Dataset;
 use lance::session::Session;
+use omnigraph_compiler::CheckedRead;
+use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::ir::QueryIR;
+use omnigraph_core::handle_cache::LruMap;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::db::{ResolvedTarget, Snapshot};
+use crate::db::{ResolvedTarget, SchemaContractIdentity, Snapshot};
 use crate::error::Result;
 use crate::graph_index::{GraphIndex, persist};
+
+pub(crate) use omnigraph_core::handle_cache::TableHandleCache;
 
 /// Cache key for a built `GraphIndex`. Keyed (A1) by the physical identity of the
 /// edge tables the topology is derived from, NOT by the resolved snapshot id. The
@@ -29,6 +36,9 @@ struct GraphIndexTableState {
     identity: crate::db::manifest::TableIdentity,
     table_key: String,
     table_version: u64,
+    /// The detached pin the version resolves to: `table_version` is a
+    /// per-lineage counter, so two branches share it with different pins.
+    staged_version: Option<u64>,
     table_branch: Option<String>,
     /// Lance manifest incarnation token for this edge table version. Preserves the
     /// incarnation distinction the dropped synthetic snapshot id used to carry: a
@@ -116,6 +126,7 @@ impl RuntimeCache {
         resolved: &ResolvedTarget,
         edge_types: &HashMap<String, (String, String)>,
         adapter: &dyn crate::storage::StorageAdapter,
+        system_columns: SystemColumns,
     ) -> Result<Arc<GraphIndex>> {
         let key = graph_index_cache_key(resolved, edge_types);
         {
@@ -180,7 +191,8 @@ impl RuntimeCache {
         // build concurrently. The graph-build probe fires inside
         // `GraphIndex::build` itself, so a persisted-artifact load is never
         // counted as a build.
-        let index = Arc::new(GraphIndex::build(&resolved.snapshot, edge_types).await?);
+        let index =
+            Arc::new(GraphIndex::build(&resolved.snapshot, edge_types, system_columns).await?);
         let mut cache = self.graph_indices.lock().await;
         if let Some(existing) = cache.entries.get(&key).cloned() {
             return Ok(existing);
@@ -220,69 +232,6 @@ impl GraphIndexCache {
     }
 }
 
-#[derive(Debug)]
-struct LruMap<K, V>
-where
-    K: Clone + Eq + Hash,
-{
-    entries: HashMap<K, V>,
-    lru: VecDeque<K>,
-    cap: usize,
-}
-
-impl<K, V> LruMap<K, V>
-where
-    K: Clone + Eq + Hash,
-{
-    fn new(cap: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            lru: VecDeque::new(),
-            cap,
-        }
-    }
-
-    fn get(&mut self, key: &K) -> Option<&V> {
-        if self.entries.contains_key(key) {
-            self.touch(key.clone());
-            self.entries.get(key)
-        } else {
-            None
-        }
-    }
-
-    fn insert(&mut self, key: K, value: V) {
-        self.entries.insert(key.clone(), value);
-        self.touch(key);
-        while self.entries.len() > self.cap {
-            let Some(oldest) = self.lru.pop_front() else {
-                break;
-            };
-            self.entries.remove(&oldest);
-        }
-    }
-
-    fn invalidate_all(&mut self) {
-        self.entries.clear();
-        self.lru.clear();
-    }
-
-    #[cfg(test)]
-    fn contains_key(&self, key: &K) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    fn touch(&mut self, key: K) {
-        self.lru.retain(|existing| existing != &key);
-        self.lru.push_back(key);
-    }
-}
-
 impl Default for GraphIndexCache {
     fn default() -> Self {
         Self {
@@ -308,6 +257,7 @@ fn graph_index_cache_key(
                     identity: entry.identity,
                     table_key,
                     table_version: entry.published_dataset_version,
+                    staged_version: entry.version_metadata.staged_version(),
                     table_branch: entry.native_dataset_branch.clone(),
                     e_tag: entry.version_metadata.e_tag().map(str::to_string),
                     endpoints: endpoints.clone(),
@@ -319,105 +269,6 @@ fn graph_index_cache_key(
     GraphIndexCacheKey { edge_tables }
 }
 
-/// Max held `Dataset` handles. A handle holds only Arcs (object store + manifest),
-/// never table data, so this is cheap; it bounds how many `(table, branch,
-/// version, e_tag)` cells stay warm. One graph's live table set across a couple
-/// of branches at the current version fits comfortably, with headroom for the
-/// recently-superseded versions left by writes until they age out.
-const TABLE_HANDLE_CACHE_CAP: usize = 64;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TableHandleKey {
-    table_path: String,
-    table_branch: Option<String>,
-    version: u64,
-    e_tag: Option<String>,
-}
-
-/// Held open-`Dataset` handles keyed by `(table_path, branch, version, e_tag)` — the
-/// version-keyed analogue of LanceDB's `DatasetConsistencyWrapper`
-/// (`rust/lancedb/src/table/dataset.rs`). A warm read reuses a held handle with
-/// zero open IO (a cheap `Dataset` clone); a miss opens once at the location with
-/// the shared `Session`. Version plus e_tag are in the key, so a write (or a
-/// delete/recreate that reuses a version number on object stores with e_tags) is
-/// simply a new key. A same-branch manifest refresh clears this cache as the
-/// fallback for e_tag-less table locations. Only read-path Data opens use this —
-/// writes open HEAD directly and never receive a pinned handle.
-#[derive(Default)]
-pub struct TableHandleCache {
-    inner: Mutex<TableHandleCacheInner>,
-}
-
-struct TableHandleCacheInner {
-    entries: LruMap<TableHandleKey, Dataset>,
-}
-
-impl TableHandleCache {
-    /// Drop all held handles. Correctness never requires this (version-in-key);
-    /// it is memory hygiene, called from the same hooks that clear the graph
-    /// index cache (branch switch / refresh).
-    pub async fn invalidate_all(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.entries.invalidate_all();
-    }
-
-    /// Return the dataset for `(dataset_path, branch, version, e_tag)`, reusing a
-    /// held handle (0 open IO) or opening it once at `location` with the shared
-    /// `session` on a miss.
-    pub async fn get_or_open(
-        &self,
-        dataset_path: &str,
-        table_branch: Option<&str>,
-        version: u64,
-        e_tag: Option<&str>,
-        location: &str,
-        session: Option<&Arc<Session>>,
-    ) -> Result<Dataset> {
-        let key = TableHandleKey {
-            table_path: dataset_path.to_string(),
-            table_branch: table_branch.map(str::to_string),
-            version,
-            e_tag: e_tag.map(str::to_string),
-        };
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(ds) = inner.entries.get(&key).cloned() {
-                return Ok(ds);
-            }
-        }
-        // Miss: open without holding the lock (the open is async IO). A concurrent
-        // double-miss opens twice and one wins the insert — correct (the dataset
-        // at a version is immutable) and rare.
-        let ds = crate::instrumentation::open_dataset(
-            location,
-            crate::instrumentation::VersionResolution::At(version),
-            session,
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        let mut inner = self.inner.lock().await;
-        if let Some(existing) = inner.entries.get(&key).cloned() {
-            return Ok(existing);
-        }
-        inner.insert(key, ds.clone());
-        Ok(ds)
-    }
-}
-
-impl TableHandleCacheInner {
-    fn insert(&mut self, key: TableHandleKey, value: Dataset) {
-        self.entries.insert(key, value);
-    }
-}
-
-impl Default for TableHandleCacheInner {
-    fn default() -> Self {
-        Self {
-            entries: LruMap::new(TABLE_HANDLE_CACHE_CAP),
-        }
-    }
-}
-
 /// Per-graph read caches handed to a resolved `Snapshot` so its table opens reuse
 /// one shared `Session` (LanceDB's one-session-per-connection pattern) and the
 /// held-handle cache. Manual `Debug` because `lance::session::Session` is not
@@ -425,6 +276,172 @@ impl Default for TableHandleCacheInner {
 pub struct ReadCaches {
     pub session: Arc<Session>,
     pub handles: Arc<TableHandleCache>,
+    /// The accepted catalog built by
+    /// `Omnigraph::accepted_catalog_for_snapshot`, memoized on the
+    /// exact captured manifest image and validated contract row.
+    pub accepted_catalog: AcceptedCatalogMemo,
+    /// Named queries compiled against an accepted catalog.
+    pub compiled_queries: CompiledQueryCache,
+}
+
+/// One accepted row and catalog, with the immutable image that was validated.
+#[derive(Default)]
+pub struct AcceptedCatalogMemo {
+    inner: std::sync::Mutex<Option<Arc<AcceptedCatalogEntry>>>,
+}
+
+pub(crate) struct AcceptedCatalogEntry {
+    pub snapshot: Snapshot,
+    pub row: omnigraph_catalog::SchemaContractRow,
+    pub identity: SchemaContractIdentity,
+    pub catalog: Arc<Catalog>,
+}
+
+impl AcceptedCatalogMemo {
+    pub(crate) fn current(&self) -> Option<Arc<AcceptedCatalogEntry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, identity: &SchemaContractIdentity) -> Option<Arc<Catalog>> {
+        let entry = self.current()?;
+        (entry.identity == *identity).then(|| Arc::clone(&entry.catalog))
+    }
+
+    pub(crate) fn memoize(
+        &self,
+        snapshot: Snapshot,
+        row: omnigraph_catalog::SchemaContractRow,
+        catalog: Arc<Catalog>,
+    ) -> Arc<AcceptedCatalogEntry> {
+        let entry = Arc::new(AcceptedCatalogEntry {
+            identity: SchemaContractIdentity::from(&row.head),
+            snapshot,
+            row,
+            catalog,
+        });
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&entry));
+        entry
+    }
+}
+
+/// Bound on distinct `(query source, query name)` pairs a handle keeps
+/// compiled. Small: a deployment's named queries are a fixed set.
+const COMPILED_QUERY_CACHE_CAP: usize = 256;
+
+/// Named queries compiled against an accepted catalog, keyed on a SHA-256
+/// digest of the source bytes plus the query name (the digest, not the source,
+/// is kept). A hit also needs the entry's `Weak<Catalog>` to upgrade to the
+/// caller's `Arc` (`Arc::ptr_eq`): a rebuilt or dropped catalog never hits.
+pub struct CompiledQueryCache {
+    inner: std::sync::Mutex<LruMap<CompiledQueryKey, CompiledQueryEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CompiledQueryKey {
+    source_digest: [u8; 32],
+    name: String,
+}
+
+/// A compiled read declaration: its IR, and the checked declaration the IR
+/// was lowered from, which plan acceptance derives the query's requirements
+/// from.
+#[derive(Clone)]
+pub(crate) struct CompiledQuery {
+    pub(crate) ir: Arc<QueryIR>,
+    pub(crate) checked: CheckedRead,
+}
+
+/// A compiled read statement: a declaration the door runs for rows, or an
+/// `explain` statement over one, which the door answers with the plan.
+#[derive(Clone)]
+pub(crate) enum CompiledRead {
+    Query(CompiledQuery),
+    Explain(CompiledQuery),
+}
+
+impl CompiledRead {
+    pub(crate) fn query(&self) -> &CompiledQuery {
+        match self {
+            Self::Query(query) | Self::Explain(query) => query,
+        }
+    }
+
+    pub(crate) fn ir(&self) -> &Arc<QueryIR> {
+        &self.query().ir
+    }
+}
+
+struct CompiledQueryEntry {
+    catalog: Weak<Catalog>,
+    compiled: CompiledRead,
+}
+
+impl Default for CompiledQueryCache {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(LruMap::new(COMPILED_QUERY_CACHE_CAP)),
+        }
+    }
+}
+
+impl CompiledQueryCache {
+    pub(crate) fn key_for(source: &str, name: &str) -> CompiledQueryKey {
+        CompiledQueryKey {
+            source_digest: Sha256::digest(source.as_bytes()).into(),
+            name: name.to_string(),
+        }
+    }
+
+    pub(crate) fn get(
+        &self,
+        catalog: &Arc<Catalog>,
+        key: &CompiledQueryKey,
+    ) -> Option<CompiledRead> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .filter(|entry| {
+                entry
+                    .catalog
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, catalog))
+            })
+            .map(|entry| entry.compiled.clone())
+    }
+
+    pub(crate) fn insert(
+        &self,
+        catalog: &Arc<Catalog>,
+        key: CompiledQueryKey,
+        compiled: CompiledRead,
+    ) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key,
+                CompiledQueryEntry {
+                    catalog: Arc::downgrade(catalog),
+                    compiled,
+                },
+            );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 impl std::fmt::Debug for ReadCaches {
@@ -438,6 +455,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::handle_cache::TableHandleKey;
 
     fn key(id: usize) -> GraphIndexCacheKey {
         // Distinct keys via a distinct edge table per id (the key no longer carries
@@ -447,11 +465,53 @@ mod tests {
                 identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
                 table_key: format!("edge:t{id}"),
                 table_version: 1,
+                staged_version: None,
                 table_branch: None,
                 e_tag: None,
                 endpoints: ("A".to_string(), "B".to_string()),
             }],
         }
+    }
+
+    /// Two branches write the same lineage counter to different detached pins
+    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// the only thing that tells the two datasets apart, in both caches.
+    #[test]
+    fn same_counter_different_pin_splits_both_keys_without_etag() {
+        let on_main = GraphIndexTableState {
+            identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
+            table_key: "edge:Knows".to_string(),
+            table_version: 3,
+            staged_version: Some(1 << 63 | 3),
+            table_branch: None,
+            e_tag: None,
+            endpoints: ("Person".to_string(), "Person".to_string()),
+        };
+        let on_branch = GraphIndexTableState {
+            staged_version: Some(1 << 63 | 4),
+            ..on_main.clone()
+        };
+        assert_ne!(
+            GraphIndexCacheKey {
+                edge_tables: vec![on_main]
+            },
+            GraphIndexCacheKey {
+                edge_tables: vec![on_branch]
+            }
+        );
+
+        let handle_on_main = TableHandleKey {
+            table_path: "nodes/person".to_string(),
+            table_branch: None,
+            version: 3,
+            staged_version: Some(1 << 63 | 3),
+            e_tag: None,
+        };
+        let handle_on_branch = TableHandleKey {
+            staged_version: Some(1 << 63 | 4),
+            ..handle_on_main.clone()
+        };
+        assert_ne!(handle_on_main, handle_on_branch);
     }
 
     fn empty_index() -> Arc<GraphIndex> {
@@ -467,6 +527,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 7,
+            staged_version: None,
             table_branch: None,
             e_tag: Some("etag".to_string()),
             endpoints: ("Person".to_string(), "Person".to_string()),
@@ -493,6 +554,7 @@ mod tests {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
             table_key: "edge:Knows".to_string(),
             table_version: 1,
+            staged_version: None,
             table_branch: None,
             e_tag: None,
             endpoints: ("Person".to_string(), "Person".to_string()),
@@ -577,10 +639,15 @@ edge Likes: Person -> Person {}
 {"edge":"Likes","from":"b","to":"a"}"#;
 
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-        crate::loader::load_jsonl(&db, DATA, crate::loader::LoadMode::Overwrite)
+        let db = crate::Session::from_defaults(
+            std::sync::Arc::new(
+                crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        db.load_jsonl(DATA, crate::loader::LoadMode::Overwrite)
             .await
             .unwrap();
         db.optimize().await.unwrap();
@@ -595,11 +662,11 @@ edge Likes: Person -> Person {}
             HashMap::from([(edge.to_string(), (et.from_type.clone(), et.to_type.clone()))])
         };
         let knows = db
-            .graph_index_for_resolved(&resolved, &scope("Knows"))
+            .graph_index_for_resolved(&resolved, &scope("Knows"), catalog.system_columns)
             .await
             .unwrap();
         let likes = db
-            .graph_index_for_resolved(&resolved, &scope("Likes"))
+            .graph_index_for_resolved(&resolved, &scope("Likes"), catalog.system_columns)
             .await
             .unwrap();
         assert!(
@@ -608,5 +675,58 @@ edge Likes: Person -> Person {}
         );
         // Sanity that the shared index really is the artifact's full catalog.
         assert!(knows.csr("Knows").is_some() && knows.csr("Likes").is_some());
+    }
+
+    /// A hit needs the live `Arc<Catalog>` the entry was compiled under: an
+    /// equal catalog under another `Arc` misses; once that `Arc` is dropped the
+    /// entry pins nothing, never hits again, and stays counted until evicted.
+    #[tokio::test]
+    async fn compiled_query_cache_hit_requires_the_live_compiled_under_catalog() {
+        const SCHEMA: &str = "node Person { name: String @key }";
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        let (_, built) = db.capture_current_read_view().await.unwrap();
+        let compile = |catalog: &Catalog, source: &str, name: &str| {
+            let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
+            let checked = CheckedRead::check(catalog, &decl).unwrap();
+            let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
+            CompiledRead::Query(CompiledQuery {
+                ir: Arc::new(ir),
+                checked,
+            })
+        };
+        let cache = CompiledQueryCache::default();
+        let source = "query q() { match { $p: Person } return { $p.name } }";
+        let key = CompiledQueryCache::key_for(source, "q");
+
+        let first = Arc::new((*built).clone());
+        let compiled = compile(&first, source, "q");
+        let ir = Arc::clone(compiled.ir());
+        cache.insert(&first, key.clone(), compiled);
+        assert!(Arc::ptr_eq(cache.get(&first, &key).unwrap().ir(), &ir));
+
+        let equal = Arc::new((*built).clone());
+        assert!(
+            cache.get(&equal, &key).is_none(),
+            "an equal catalog under another Arc must miss"
+        );
+
+        let dropped = Arc::downgrade(&first);
+        drop(first);
+        assert!(
+            dropped.upgrade().is_none(),
+            "the entry must hold no Arc to its catalog"
+        );
+        let source_r = "query r() { match { $p: Person } return { $p.name } }";
+        let key_r = CompiledQueryCache::key_for(source_r, "r");
+        cache.insert(&equal, key_r.clone(), compile(&equal, source_r, "r"));
+        assert!(
+            cache.get(&equal, &key).is_none(),
+            "an entry whose catalog was dropped never hits under a later catalog"
+        );
+        assert!(cache.get(&equal, &key_r).is_some());
+        assert_eq!(cache.len(), 2, "the dead entry stays until evicted");
     }
 }

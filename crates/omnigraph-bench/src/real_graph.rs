@@ -184,6 +184,16 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
         )));
     }
 
+    observe_branch(&db, "main", branches).await
+}
+
+/// Observe one live branch of a quiescent private dataset.
+pub(crate) async fn observe_branch(
+    db: &Omnigraph,
+    branch: &str,
+    branches: Vec<String>,
+) -> RealGraphResult<RealGraphObservationV1> {
+    let native = (branch != "main").then_some(branch);
     let catalog = db.catalog();
     let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
         RealGraphError::new("copied graph catalog is not bound to accepted schema identity")
@@ -209,11 +219,11 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     })?;
 
     let snapshot = db
-        .snapshot_of(ReadTarget::branch("main"))
+        .snapshot_of(ReadTarget::branch(branch))
         .await
         .map_err(|error| RealGraphError::new(format!("capture copied graph main: {error}")))?;
     let graph_manifest_version = snapshot.graph_manifest_version();
-    let main_commit_id = snapshot.graph_head(None).map(str::to_owned);
+    let main_commit_id = snapshot.graph_head(native).map(str::to_owned);
     let expected_table_keys = accepted_ir
         .nodes
         .iter()
@@ -239,14 +249,14 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     let mut edge_tables = Vec::new();
     let mut indexes = Vec::new();
     let mut expected_logical_rows = BTreeMap::new();
-    let mut relocation_self_contained =
-        !db.manifest_has_external_base_paths(None)
-            .await
-            .map_err(|error| {
-                RealGraphError::new(format!(
-                    "inspect graph-manifest relocation metadata: {error}"
-                ))
-            })?;
+    let mut relocation_self_contained = !db
+        .manifest_has_external_base_paths(native)
+        .await
+        .map_err(|error| {
+            RealGraphError::new(format!(
+                "inspect graph-manifest relocation metadata: {error}"
+            ))
+        })?;
     for table_key in &expected_table_keys {
         let entry = snapshot
             .dataset(table_key)
@@ -291,7 +301,7 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
         // each declared node property (probing its actual physical kind), and
         // edge id/src/dst. Unknown raw Lance metadata remains explicitly
         // unverified below rather than being presented as a complete inventory.
-        let mut index_columns = BTreeSet::from(["id".to_string()]);
+        let mut index_columns = BTreeSet::from([catalog.system_columns.id.to_string()]);
         if let Some(declared_indexes) = node_declared_indexes {
             for fields in declared_indexes {
                 let [column] = fields.as_slice() else {
@@ -302,7 +312,10 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
                 index_columns.insert(column.clone());
             }
         } else {
-            index_columns.extend(["src".to_string(), "dst".to_string()]);
+            index_columns.extend([
+                catalog.system_columns.src.to_string(),
+                catalog.system_columns.dst.to_string(),
+            ]);
         }
         let table_has_stale_index = dataset.has_unindexed_fragments().await.map_err(|error| {
             RealGraphError::new(format!("inspect index freshness for {table_key}: {error}"))
@@ -332,30 +345,29 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     indexes.sort();
 
     let history_depth = u64::try_from(
-        db.list_commits(Some("main"))
+        db.list_commits(Some(branch))
             .await
             .map_err(|error| RealGraphError::new(format!("list main history: {error}")))?
             .len(),
     )
     .map_err(|_| RealGraphError::new("main history depth exceeds u64"))?;
     let mut sink = LogicalGraphSink::default();
-    db.export_jsonl_unordered_to_writer("main", &[], &mut sink)
+    db.export_jsonl_unordered_to_writer(branch, &[], &mut sink)
         .await
         .map_err(|error| RealGraphError::new(format!("stream copied graph content: {error}")))?;
     sink.verify_table_counts(&expected_logical_rows)?;
     let content = sink.finish(schema_sha256)?;
     let closing_snapshot = db
-        .snapshot_of(ReadTarget::branch("main"))
+        .snapshot_of(ReadTarget::branch(branch))
         .await
         .map_err(|error| RealGraphError::new(format!("recapture copied graph main: {error}")))?;
     if closing_snapshot.graph_manifest_version() != graph_manifest_version
-        || closing_snapshot.graph_head(None) != main_commit_id.as_deref()
+        || closing_snapshot.graph_head(native) != main_commit_id.as_deref()
     {
         return Err(RealGraphError::new(
             "copied graph main changed while logical evidence was being observed",
         ));
     }
-    drop(db);
 
     Ok(RealGraphObservationV1 {
         version: REAL_GRAPH_OBSERVATION_VERSION,
@@ -458,7 +470,9 @@ async fn observe_engine_index(
     }
     for (present, kind) in [
         (
-            dataset.has_fts_index(column).await.map_err(|error| {
+            // An untrained segment only declares the analyzer; the observed
+            // physical state counts full-text postings.
+            dataset.has_fts_postings(column).await.map_err(|error| {
                 RealGraphError::new(format!("inspect FTS {table_key}.{column}: {error}"))
             })?,
             RealGraphIndexKindV1::Fts,
@@ -569,11 +583,10 @@ impl LogicalGraphSink {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let (table_key, canonical_row, payload_bytes) = if let Some(node) = node_type {
-            let mut data = object
+            let data = object
                 .remove("data")
                 .and_then(|value| value.as_object().cloned())
                 .ok_or_else(|| RealGraphError::new("node export row has no data object"))?;
-            data.remove("id");
             let payload = canonical_json_bytes(&Value::Object(data.clone()))?;
             let mut canonical = Vec::new();
             frame(&mut canonical, b"node");
@@ -591,11 +604,10 @@ impl LogicalGraphSink {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| RealGraphError::new("edge export row has no string to"))?;
-            let mut data = object
+            let data = object
                 .remove("data")
                 .and_then(|value| value.as_object().cloned())
                 .ok_or_else(|| RealGraphError::new("edge export row has no data object"))?;
-            data.remove("id");
             let payload = canonical_json_bytes(&Value::Object(data.clone()))?;
             let mut canonical = Vec::new();
             frame(&mut canonical, b"edge");
@@ -669,7 +681,7 @@ impl Write for LogicalGraphSink {
     }
 }
 
-fn canonical_json_bytes(value: &Value) -> RealGraphResult<Vec<u8>> {
+pub(crate) fn canonical_json_bytes(value: &Value) -> RealGraphResult<Vec<u8>> {
     let mut bytes = Vec::new();
     write_canonical_json(value, &mut bytes)?;
     Ok(bytes)
@@ -777,7 +789,10 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
     use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
-    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::Session;
+    use omnigraph::loader::LoadMode;
+    use omnigraph::settings::SessionSettings;
+    use std::sync::Arc;
 
     fn export_rows(rows: &[&str]) -> LogicalContentSummary {
         let mut sink = LogicalGraphSink::default();
@@ -832,11 +847,11 @@ mod tests {
     #[test]
     fn logical_multiset_omits_generated_ids_preserves_duplicates_and_ignores_order() {
         let edge_a =
-            r#"{"edge":"Transfer","from":"a","to":"b","data":{"id":"generated-a","amount":1}}"#;
+            r#"{"edge":"Transfer","id":"generated-a","from":"a","to":"b","data":{"amount":1}}"#;
         let edge_b =
-            r#"{"edge":"Transfer","from":"a","to":"b","data":{"id":"generated-b","amount":1}}"#;
+            r#"{"edge":"Transfer","id":"generated-b","from":"a","to":"b","data":{"amount":1}}"#;
         let edge_other =
-            r#"{"edge":"Transfer","from":"b","to":"a","data":{"id":"generated-c","amount":2}}"#;
+            r#"{"edge":"Transfer","id":"generated-c","from":"b","to":"a","data":{"amount":2}}"#;
         let left = export_rows(&[edge_a, edge_other]);
         let rebuilt = export_rows(&[edge_other, edge_b]);
         assert_eq!(left.logical_content_sha256, rebuilt.logical_content_sha256);
@@ -850,10 +865,10 @@ mod tests {
     #[test]
     fn canonical_property_order_and_redundant_node_id_do_not_change_content() {
         let first = export_rows(&[
-            r#"{"type":"Person","data":{"id":"physical-a","personId":"p1","active":true}}"#,
+            r#"{"type":"Person","id":"physical-a","data":{"personId":"p1","active":true}}"#,
         ]);
         let second = export_rows(&[
-            r#"{"type":"Person","data":{"active":true,"personId":"p1","id":"physical-b"}}"#,
+            r#"{"type":"Person","id":"physical-b","data":{"active":true,"personId":"p1"}}"#,
         ]);
         assert_eq!(first.logical_content_sha256, second.logical_content_sha256);
         assert_eq!(first.logical_payload_bytes, second.logical_payload_bytes);
@@ -871,7 +886,7 @@ mod tests {
     fn partial_export_cannot_mint_a_logical_digest() {
         let mut sink = LogicalGraphSink::default();
         sink.write_all(
-            br#"{"type":"Person","data":{"id":"p1","personId":"p1"}}
+            br#"{"type":"Person","id":"p1","data":{"personId":"p1"}}
 "#,
         )
         .unwrap();
@@ -896,8 +911,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("graph");
         let uri = root.to_str().unwrap();
-        let db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-        load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, SCHEMA).await.unwrap()),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
         drop(db);
 
         let before =
@@ -911,16 +929,10 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(
             observed.node_tables,
-            vec![
-                GraphTableCountV1 {
-                    name: "OmniActor".to_string(),
-                    rows: 0,
-                },
-                GraphTableCountV1 {
-                    name: "Person".to_string(),
-                    rows: 2,
-                },
-            ]
+            vec![GraphTableCountV1 {
+                name: "Person".to_string(),
+                rows: 2,
+            }]
         );
         assert_eq!(
             observed.edge_tables,

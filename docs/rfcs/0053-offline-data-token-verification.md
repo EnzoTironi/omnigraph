@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-05
+updated: 2026-10-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/633
 supersedes: []
 superseded_by: []
@@ -16,13 +16,17 @@ blocked_on: []
 
 # RFC 0053: Offline data-token verification
 
+> The [identity and applied-policy extension](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+> defines identity-only credentials, automatic acquisition and an offline OAuth
+> resource profile. Native signed data credentials use version 2 only.
+
 ## Summary
 
 Accept bounded, short-lived ES256 data credentials at the existing HTTP
 boundary. An operator supplies public trust at boot; the server verifies every
 credential offline, derives its actor from the authenticated principal, and
-intersects its graph/action grants with the existing Cedar policy. An issuer
-cannot use this credential to bypass graph policy or authorize schema changes.
+requires the existing applied Cedar policy to authorize every protected
+operation. An issuer cannot use this credential to bypass that policy.
 
 The contract is generic OSS behavior. No managed-service library, network
 discovery, token database, engine fork, or graph-storage format is introduced.
@@ -35,7 +39,7 @@ never be forwarded to graph endpoints. Short-lived data credentials let an
 authorized caller query and mutate an existing cluster while serving remains
 independent of the issuer's availability.
 
-Identity, attenuation, expiry, trust custody, and root binding are public
+Identity, expiry, trust custody, and root binding are public
 security contracts. They require a decision before implementation rather than
 an incidental alternative authentication branch.
 
@@ -59,8 +63,9 @@ remaining indistinguishable from missing queries. Denial occurs before graph
 lookup or effect wherever that contract applies.
 
 Token validity is checked at request admission. Expiry does not cancel an
-already admitted mutation or stream. Revocation of a grant or login session
-prevents future issuance; an issued token remains usable until its expiry or
+already admitted mutation or stream. Applied policy changes govern subsequent
+protected operations with the same token. Login-session revocation can prevent
+future issuance; an issued identity remains authenticated until its expiry or
 the serving process restarts with trust that excludes its signing key. There
 is no immediate online revocation promise.
 
@@ -75,12 +80,12 @@ that returns ASN.1 DER must convert it before serialization. `kid` is the
 64-character lowercase hexadecimal SHA-256 of the signing public key's SPKI
 DER representation.
 
-The version 1 claims are a JSON object with these fields, without duplicates
+The version 2 claims are a JSON object with these fields, without duplicates
 or unknown fields:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "iss": "https://control.example",
   "aud": "urn:omnigraph:data:cluster-1",
   "sub": "principal-id",
@@ -91,8 +96,7 @@ or unknown fields:
   "assurance": "verified_human",
   "iat": 1788612000,
   "exp": 1788612900,
-  "jti": "token-id",
-  "grants": [{"graph_id": "knowledge", "actions": ["read", "change"]}]
+  "jti": "token-id"
 }
 ```
 
@@ -120,17 +124,9 @@ including `nbf`, are unsupported in this fixed version and refuse rather than
 being silently ignored. The issuer may issue a shorter token than the caller
 requests according to its current permissions and configured limit.
 
-`grants` contains 1–64 unique graph ids. Each id passes the server's existing
-graph-id validation: 1–64 ASCII letters, digits, or hyphens, excluding
-`policies`, `healthz`, `openapi`, and `graphs`. The managed issuer additionally
-requires Core configuration validity, so it issues only for the intersection
-of those grammars. Core graph names unsupported by existing server routing
-remain unsupported; this increment does not widen routing. Each action set is nonempty,
-contains no duplicate, and uses only these existing exact policy action names:
-`read`, `export`, `change`, `branch_create`, `branch_delete`, `branch_merge`,
-`invoke_query`, `graph_list`. Wildcards, `schema_apply`, `admin`, and unknown
-actions refuse the whole token. There are no implicit action implications or
-branch grants; Cedar retains branch and target-branch policy ownership.
+Credentials contain no grants, roles, actions, or policy membership. Those
+fields and unsupported versions refuse the whole token; a version-1 token
+cannot become a version-2 identity by removing its grants.
 
 ### Public trust and root binding
 
@@ -158,10 +154,12 @@ unknown request `kid` refuses without fetching anything.
 `canonical_root` is nonempty and at most 4,096 bytes. Issuer and endpoint
 origins are at most 2,048 bytes in addition to their containing object bounds.
 The server compares `canonical_root` with the actual root selected by
-`--cluster`. The Core exposes `ServingSnapshot.canonical_root` from the same
-store and snapshot resolution; it does not reparse configuration or reread
-mutable state for this binding. Local file roots are canonical absolute
-paths encoded as file URIs. A mismatched root refuses before graph engines
+`--cluster`. The Core's opt-in `RootBoundServingSnapshot` exposes the canonical
+root alongside the legacy `ServingSnapshot`, from the same store and snapshot
+resolution; it does not reparse configuration or reread mutable state for this
+binding. Ordinary snapshot reads do not require that extra canonicalization.
+Local file roots are canonical absolute paths encoded as file URIs. A
+mismatched root refuses before graph engines
 open. The server does not read or reinterpret a private managed identity
 marker. The authority supplying trust owns verification of that identity and
 the account/cluster/incarnation binding before deployment. In the managed
@@ -178,31 +176,27 @@ the permitted issuance-clock skew. Expiry still has zero leeway.
 
 ### Authorization and compatibility
 
-The bearer boundary produces an authenticated principal and immutable grant
-set. Graph routing narrows it to the selected graph before registry lookup.
-The common policy gate checks the token action ceiling before the existing
-Cedar decision. Signed credentials require an applied policy and explicit
-permit; they never inherit the static-token no-policy read default. An allowed token action is insufficient
-if Cedar denies it or has no corresponding actor. No policy entity is created
+The bearer boundary produces an authenticated principal. The common Cedar
+gate requires applied policy and an explicit permit; signed identities never
+inherit the static-token no-policy read default. No policy entity is created
 from a request or token. Policy bundles explicitly enroll `principal:<sub>`
 through the ordinary cluster configuration and apply path.
 
-| Existing route family | Required action checks |
+| Existing route family | Required applied-policy checks |
 |---|---|
-| Query/read, snapshot, Blob GET/HEAD, schema/catalog, branch/commit/change-feed reads | `read` |
+| Query, snapshot, Blob GET/HEAD, schema/catalog, branch/commit/change-feed reads | `read` |
 | Export and change-feed baseline | `export` |
-| Mutate/change, conditional mutation, load/ingest | `change` |
-| Stored query or mutation | `invoke_query`, then its existing inner `read` or `change` |
-| Load creating a branch | Existing `branch_create` check, then `change` |
+| Mutate, conditional mutation, load | `change` |
+| Stored query or mutation | `invoke_query`, then its inner `read` or `change` |
+| Load creating a branch | `branch_create`, then `change` |
 | Branch create/delete/merge | Corresponding `branch_*` action |
-| Schema apply | Refused by this token profile |
-| Graph registry | Server Cedar `graph_list`, plus per-result `graph_list` grant |
+| Cluster schema/configuration deployment | Existing `schema_apply` and `config_manage` checks |
+| Graph registry | Server `graph_list` |
 
-The graph registry filters both served and quarantined graph ids. A grant on
-one graph never exposes another. Deprecated route aliases and conditional
-variants use the same checks. Merge's optional source deletion keeps its
-existing separate check: a successful merge can report a denied deletion
-through `branch_deleted: false` without falsely failing the durable merge.
+Minimal graph discovery accepts every authenticated identity and carries no
+policy grant. Merge's optional source deletion retains a separate policy
+check: a successful merge can report denied deletion through
+`branch_deleted: false` without falsely failing the durable merge.
 
 Explicit static break-glass credentials may coexist. The existing exact
 constant-time hash match runs first; a configured static credential retains
@@ -214,38 +208,71 @@ Cedar/default-deny semantics.
 ### Managed CLI data access
 
 The companion issuance API supplies a data endpoint and signed credential.
-`omnigraph cluster token --config DIR --graph ID --actions read,change --ttl 1h`
-requests an explicit graph/action subset of the caller's current data grant.
-TTL defaults to 3,600 seconds and must be 60–86,400 seconds; requested authority
-never comes from control-plane admin or apply permission. `--clear` instead
+`omnigraph cluster token --managed --config DIR --ttl 1h` requests a version-2 identity
+credential. TTL defaults to 3,600 seconds and must be 60–86,400 seconds.
+Issuance adds no policy permissions. `--clear` instead
 forgets the selected cluster's local data credential. Token command output is
 metadata only, never the credential.
 
 The CLI stores the result in a separate OS-keychain service under canonical
 API origin plus cluster id. The entry contains the endpoint, credential,
-expiry, key id, and exact grants and is validated before use. It is separate
+expiry, key id, and cluster incarnation and is validated before use. It is separate
 from the control-plane session, so ordinary data requests need no API call.
 Control-plane logout remains unchanged; an issued data credential survives
 until expiry or trust retirement, and local clearing is not server revocation.
 Automation may use the explicit origin-bound control credential to mint into
 the same keychain; unattended raw-token consumers use the issuance API.
 
-With managed context in the exact current directory, `query` and `mutate`
-require `--graph` and use this cached data endpoint/credential. Other data
-verbs refuse as unsupported in this increment. Missing, malformed, expired,
-or under-scoped credentials never fall through to static credentials, a
-profile, or direct storage. Managed data access rejects explicit `--server`,
-`--profile`, `--store`, `--cluster`, and `--as` and ignores inherited legacy
-profiles and token settings. `--direct` becomes a global explicit override;
-existing `cluster --direct` remains compatible. Without context, legacy data
-commands keep their behavior. Managed requests refuse redirects and have a
-10-second deadline and 8 MiB response bound.
+Only implicitly addressed `query`, `mutate`, `load`, `commit list`, and
+`commit show`, plus `graphs list`, consult managed context in the exact current directory. An
+explicit `--server`, `--profile`, `--store`, or `--cluster` retains ordinary
+addressing and command-applicability validation, without reading that context;
+a positional load/commit-list URI or `commit show --uri` does the same. Every other
+graph, storage, alias, or local command retains its existing handler. This does
+not add managed transport support to those commands. Global `--direct` bypasses
+context as before, including for cluster commands.
+
+For these implicit data commands, absent context leaves ordinary resolution
+unchanged; malformed context refuses. Valid context plus a nonempty
+`OMNIGRAPH_PROFILE` or an operator `defaults.server`/`defaults.store` target
+refuses with `managed_target_ambiguous` before keychain access or requests.
+Even a matching-looking URL is insufficient to equate the two authentication
+paths. Select the intended ordinary target explicitly, use `--direct` for
+ordinary ambient resolution, or clear the competing ambient target to use
+the managed folder. Merely defining profiles, presentation defaults, or a
+direct actor preference does not select a target.
+
+An unambiguous graph operation requires explicit `--graph`, rejects explicit
+`--as`, and uses the separately cached data endpoint/credential; discovery
+requires no graph. Missing or expired identity credentials may be acquired
+before the operation. Unsupported or malformed caches refuse. No refusal
+falls through to static credentials, a profile, or direct storage. Ordinary
+token settings never supply managed authority. Managed reads refuse redirects and have a 30-second
+deadline and 8 MiB response bound. Managed `mutate`, including ad-hoc
+mutations, stored mutation invocations and branch-write statements, uses
+the same 30-second request deadline with a 10-second connection bound
+and the same 8 MiB response bound. Managed `commit list` and `commit show`
+use the cached identity, applied `read` policy, and existing native commit
+protocol, with the read deadline and response bound. They permit exact graph
+lineage inspection after an uncertain write without exposing a data
+credential or opening storage directly. Managed `load` uses the existing
+authenticated NDJSON endpoint with `change` authority, additionally requiring
+`branch_create` when it creates the target branch; the server owns Cedar
+authorization, branch creation and graph publication. One managed load accepts at most
+32 MiB of UTF-8 input, retains the 8 MiB response bound, and uses a 300-second
+request deadline with a 10-second connection bound. The existing engine's keyed
+table row and parsed-byte limits remain unchanged. No load request is retried by
+the CLI: a timeout, interrupted response, or unverified receipt requires
+reconciliation of the target branch before a caller decides whether to retry.
+Ordinary direct and profile-based loading keep their existing transport.
+Cluster control dispatch and token issuance retain their existing scope
+requirements. New named managed connections are a separate change.
 
 ## Invariants
 
 Invariant 10 keeps actor identity at the authenticated server boundary and
 retains every engine policy check. Invariant 11 bounds token parsing, trust,
-key search, scope search, and time. Invariant 12 adds no authoritative token
+key search, and time. Invariant 12 adds no authoritative token
 database or mutable cache. Graph publication, accepted snapshots, recovery,
 and direct-engine policy behavior are unchanged. No Lance-shaped behavior is
 changed or relied on, and no Lance documentation domain applies to this HTTP
@@ -254,18 +281,30 @@ authentication work. No deny-list exception is requested.
 ## Compatibility and reversibility
 
 Existing deployments without trust are unchanged. New credentials do not work
-on old servers; they cannot degrade into static credentials. Removing the
-trust flag disables signed credentials deliberately. The trust supplier must
+on old servers; they cannot degrade into static credentials. Version-1 restricted tokens, their public data types, and CLI `--actions` are
+removed. Old caches refuse without replacement; `cluster token --managed` explicitly
+obtains a current credential. Removing the trust flag disables signed credentials deliberately. The trust supplier must
 not leave a token-only deployment in unauthenticated mode after rollback.
 No graph storage, ledger, manifest, policy-file, or managed-marker format
 changes. The public API gains authentication semantics, not a new graph route.
+
+The public `ServerConfig`, `ServingSnapshot`, and `ResolvedActor` retain their
+pre-data-token field shapes, including literal construction and exhaustive
+destructuring. Managed embedders use additive root-bound snapshot and server
+boot entry points. `ResolvedActor` is an identity projection; an opaque
+`AuthenticatedActor` retains verified identity claims through authorization. The existing verifier's identity-only return remains
+available; server middleware uses its authenticated-result counterpart.
+Constructing a public identity, including a signed-looking scope, cannot
+manufacture authenticated request authority. Callers that adopted the interim
+root/trust fields migrate to the additive managed APIs described in the
+[developer guide](../dev/control-plane.md#public-embedding-apis).
 
 ## Alternatives
 
 - Online introspection or JWKS fetching adds a serving dependency and cannot
   preserve the required offline contract.
 - Putting credentials in each graph's static-token store adds rotation and
-  expiry state when signed, expiring capabilities already express the grant.
+  expiry state when signed credentials already bind identity and lifetime.
 - Treating a signature as complete authorization bypasses Cedar and would
   grant actions or branches the graph owner never allowed.
 - Importing private managed identity formats into the server couples OSS
@@ -274,7 +313,7 @@ changes. The public API gains authentication semantics, not a new graph route.
 
 ## Evidence and tests
 
-The existing `auth_policy`, `multi_graph`, `stored_queries`, `boot_settings`,
+Historical version-1 qualification: the existing `auth_policy`, `multi_graph`, `stored_queries`, `boot_settings`,
 `data_routes`, and `openapi` owners plus server unit tests passed 359 checks.
 The eight verifier cases cover the issuer's shared golden signature,
 tampering, wrong algorithms/keys/bindings, duplicate and oversized fields,
@@ -282,7 +321,7 @@ invalid curves, key fingerprints, exact time boundaries, unsupported versions,
 and kind/assurance mismatches. A focused Core regression verifies that directory
 and storage-URI snapshots report the same canonical root and state CAS.
 
-Protected-route tests prove the grant ceiling despite permissive Cedar policy,
+That historical qualification proved the grant ceiling despite permissive Cedar policy,
 Cedar denial despite a valid credential, actor-header spoofing failure,
 stored-read/write double gating, cross-graph and registry isolation, and
 unchanged static/unauthenticated behavior. Denied mutations leave the published
@@ -291,37 +330,20 @@ graph, trust without static credentials, invalid trust, and overlapping keys.
 The CLI passed 99 unit and 133 process tests; strict lint and documentation
 checks passed for the implemented server and client surfaces.
 
-The 2026-09-05 managed pilot used the server implementation at `463290a9` and
-native CLI binary with SHA-256
-`cb464cb72bb0d48ec885896e2361bee46b860b995c457cee9d33f9ca17eace0a`.
-Generated evidence records real WorkOS session issuance through the API and a
-per-cluster AWS KMS key, with a request for an ungranted export action refused.
-The actual operator retained kubelet's final container exit on a Ready node,
-completed its ordinary drain and apply, and verified that serving reported the
-finalized receipt's ledger after trust and Cedar policy were installed.
-
-Seven real-KMS verifier cases produced the expected results: a valid read
-returned 200; expired, wrong-cluster, and wrong-incarnation credentials returned
-401; missing read authority, another graph's grant, and an absent Cedar actor
-returned 403. With the Intent API at zero Pods, the actual CLI inserted one
-node and read it back at the same graph commit with the immutable principal
-actor. Its 60-second credential then produced `data_credential_expired`, and
-the API was restored. This separately exercises server expiry and client cache
-expiry; no credential was included in the generated CLI output.
-
-This qualification covers one existing cluster and one enrolled human
-principal. It does not complete the companion control-plane G4 identity, auth,
-and credential-transport gate or G5 managed-product gate, provide cell
-infrastructure, or qualify backup/restore, distributed writer fencing, or the
-full tenant adversarial matrix. Those boundaries remain outside this RFC.
+Historical provider/KMS interoperability checks covered valid reads, expired
+and mismatched credentials, grant ceilings, missing policy membership, and
+CLI reads and writes while the issuer was unavailable. They covered one
+cluster and one human principal, not a general deployment qualification.
+Backup/restore, distributed writer fencing and tenant-isolation qualification
+remain outside this RFC.
 
 ## Rollout
 
-Record this contract and the companion control-plane decision before code.
+Record this public contract before code.
 Implement and qualify the offline verifier, then deploy prepared trust and
 policy to an existing cluster. Only then enable issuance and client access.
 Keep a deliberate static break-glass path during the controlled transition.
-User docs and release notes must describe the final flag, grant semantics,
+User docs and release notes describe the flag, identity and policy boundary,
 expiry, and controlled key rotation. New engine or storage behavior is out of
 scope, as are full cloud provisioning, online refresh, and dynamic discovery.
 
@@ -332,6 +354,53 @@ qualification remain separate from acceptance.
 
 ## Decision log
 
+2026-10-05: The maintainer requested removal of compatibility interfaces.
+Native verification and CLI issuance now accept only version-2 identities;
+unsupported caches/tokens refuse, and replacement remains explicit. This
+amends the Summary sentence about intersecting grants; the Signed credential
+version, claims example and grant-list rules; the Authorization paragraphs,
+route table and filtered-registry rule; the Managed CLI `--actions`, cache,
+local grant checks and load authorization sentences; and Compatibility's
+retained version-1 types and selected-graph clauses. Earlier version-1 evidence
+is labeled historical. Current verifier, cache, policy and route owners test
+version-1 refusal and preserve identity binding and applied-policy checks;
+this entry does not claim a completed qualification run.
+
+2026-09-08: Managed queries and mutations use a bounded 30-second request
+deadline. Loads retain their separate 300-second deadline. The 10-second
+connection deadline, response limit, redirect refusal and disabled automatic
+retries remain unchanged.
+Managed commit list/show reads use cached `read` authority so callers can
+inspect native lineage when a write response is lost. This adds no new
+protocol, token export or automatic write reconciliation.
+
+2026-09-07: Extended managed CLI routing to implicit `load`, preserving explicit
+ordinary targets and the compatibility repair's ambiguity rules. The existing
+authenticated NDJSON protocol, graph publication, and server policy owners are
+unchanged. This adds a 32 MiB input bound and a separate 300-second load deadline
+while retaining the 8 MiB response bound and requiring branch creation authority
+for `--from`. Transport and authorization tests cover the CLI-to-server
+contract; engine publication and recovery semantics remain unchanged.
+
+2026-09-06: The compatibility repair restores the three public struct shapes
+and isolates canonical-root validation in opt-in managed boot. This replaces
+the Boot trust sentence naming `ServingSnapshot.canonical_root`; root binding
+still comes from the same opened store and must validate before graph open.
+An opaque authenticated-request value preserves signed authorization ceilings
+while the public actor remains constructible. Existing CLI trust flags and
+wire contracts remain unchanged; the additive APIs replace interim field-based
+embedding without claiming compatibility with both conflicting literal shapes.
+
+2026-09-06: Authorized a bounded compatibility repair independently of the
+broader configuration/CLI proposal. This amendment replaces the CLI paragraph
+that refused other data verbs and explicit ordinary selectors in managed
+folders, and the sentence that ignored inherited profiles. Context now gates
+only implicit query/mutate; competing ambient targets refuse before credential
+access rather than silently selecting either destination. Existing unambiguous
+managed access, offline verification, action grants and no-fallback guarantees
+remain. Implementation and regression evidence for this correction must be
+reported separately from the earlier interoperability qualification.
+
 2026-09-05: Recorded the bounded offline verifier before implementation,
 following the existing server policy/action audit. Managed root identity is
 validated by the trust supplier; the OSS server binds that supplied trust to
@@ -339,8 +408,8 @@ the actual resolved serving root and does not import private marker formats.
 
 2026-09-05: Accepted by the maintainer for implementation with the explicit
 wire bounds, static-first exact credential matching, required Cedar permit,
-and same-snapshot canonical root accessor. Companion control-plane DEC-08-23
-owns issuance, permissions, KMS custody, and operator preparation. Qualification
+and same-snapshot canonical root accessor. Issuer implementations own issuance,
+admission, signing-key custody and preparation of public trust. Qualification
 remains required before claiming the implementation complete.
 
 2026-09-05: Retained the existing server graph-id grammar and reserved names.
@@ -349,8 +418,12 @@ remains 64. Managed issuance uses the intersection with Core configuration
 identifiers rather than changing the independent server routing contract.
 
 2026-09-05: Completed the bounded server and CLI implementation after the
-focused regressions and real WorkOS/KMS qualification above. The live pilot
-used the ordinary managed drain, receipt, and readiness path, preserving
-existing engine and storage behavior. The
+focused regressions and provider/KMS interoperability checks above. Existing
+engine and storage behavior was preserved. The
 later CLI diagnostic-redaction fix is covered by its focused regression and
 does not change the successfully qualified data path.
+
+2026-10-06: Managed CLI data access and Compatibility replace the token command
+spelling with `cluster token --managed`, using the explicit service mode from
+[RFC 0052](0052-managed-control-plane-cli.md).
+Credential format, acquisition and authorization are unchanged.

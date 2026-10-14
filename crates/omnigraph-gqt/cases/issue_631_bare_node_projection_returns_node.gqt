@@ -1,6 +1,12 @@
 # issue: 631
 # red_on: 2026-09-05, stock main at 8ca9b12c: `return { $p }` gave `{"p": "alice"}`, the id string, instead of the node object.
 
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
 --- schema
 node Person {
     name: String @key
@@ -21,11 +27,14 @@ query bare_person() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}}
-{"p": {"id": "bob", "name": "bob"}}
+{"p": {"@id": "alice", "name": "alice", "age": 30}}
+{"p": {"@id": "bob", "name": "bob"}}
 
 --- expect shape
 p: Person
+
+--- expect plan
+result columns [p: Person]
 
 --- query
 query friend_of_alice() {
@@ -37,11 +46,14 @@ query friend_of_alice() {
 }
 
 --- expect unordered
-{"p.name": "alice", "f": {"id": "bob", "name": "bob"}}
+{"p.name": "alice", "f": {"@id": "bob", "name": "bob"}}
 
 --- expect shape
 p.name: String
 f: Person
+
+--- expect plan
+result columns [p.name: String, f: Person]
 
 --- query
 query friends_per_person() {
@@ -53,8 +65,11 @@ query friends_per_person() {
 }
 
 --- expect unordered
-{"p": {"id": "alice", "name": "alice", "age": 30}, "friends": 1}
+{"p": {"@id": "alice", "name": "alice", "age": 30}, "friends": 1}
 
 --- expect shape
 p: Person
 friends: I64
+
+--- expect plan
+result columns [p: Person, friends: I64?]

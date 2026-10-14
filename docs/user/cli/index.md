@@ -22,10 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
-For a managed cluster, first select it with `use` and request a scoped data
-credential with `cluster token`. Then run `query` or `mutate` from that folder
-with an explicit `--graph`. See [managed data access](managed-data.md)
-for permissions, expiry, offline operation, and local credential clearing.
+For a managed cluster, select it with `use`. The CLI acquires identity credentials
+when needed. Run `graphs list` to discover graph names, then `query` or `mutate`
+from that folder with an explicit `--graph`. Applied Cedar policy determines your
+permissions. See [managed data access](managed-data.md) for expiry, offline
+operation and credential clearing.
 
 ## Create, load, and query a graph
 
@@ -75,12 +76,58 @@ omnigraph query inspect --query review.gq \
 omnigraph branch merge review/new-data --into main --store ./graph.omni
 ```
 
+Each branch operation is also a GQ statement, run through the same verbs that
+run any `.gq` source: the control writes through `mutate`, the listing through
+`query`. A statement names its branches itself, so it takes no `--branch`:
+
+```bash
+omnigraph mutate -e 'branch create "review/new-data" from main' --store ./graph.omni
+omnigraph query  -e 'branch list' --format table --store ./graph.omni
+omnigraph mutate -e 'branch merge "review/new-data" into main' --store ./graph.omni
+omnigraph mutate -e 'branch delete "review/new-data"' --store ./graph.omni
+```
+
 See [Branches and commits](../branching/index.md) for isolation, history, and
 merge behavior.
 
-## Read Blob values
+## Session settings
 
-Read a managed Blob cell to a file or inspect its metadata:
+`--set NAME=VALUE`, repeatable, gives a [session
+setting](../queries/index.md#session-settings) a value for one invocation; the
+value is spelled as after `=` in a `set` line (`--set merge_lineage=off`). A `set`
+line in the source applies after `--set`, so the file wins.
+
+- `query --set`: applies to the read, `show` included.
+- `mutate --set`: applies to the mutation or branch statement.
+- `branch merge --set`: applies to the merge (`--set merge_lineage=verify`).
+- `commit changes --set`: sent as `set=NAME=VALUE` on the commit's change
+  read. The values are validated and select nothing in this release; a direct
+  run (`--store`) accepts them with no effect.
+- `changes poll --set`: sent as `set=NAME=VALUE` on the change feed read, with
+  the same validation and the same absence of effect.
+- `load --set`: a direct run (`--store`) applies them to the
+  staged write (`--set stage_write_concurrency=16`); a served run refuses any
+  `--set` before sending, since the served load routes carry no
+  `settings` field.
+
+```bash
+omnigraph query reports --query queries.gq --set merge_lineage=off --store ./graph.omni
+omnigraph branch merge review/new-data --into main --set merge_lineage=verify --store ./graph.omni
+```
+
+A direct run (`--store`) is the process, so it accepts a `process` setting
+from `--set`, the file and the environment. A served run (`--server`) sends
+`--set` values in the request's `settings` field, and a `--set` or `set` line
+naming a `process` setting is refused before anything is sent: `setting
+`<name>` is a process setting; it is read from the server's environment, not
+from a request`.
+
+A stored query takes no `--set`: `omnigraph query <name>` without `-e` or
+`--query` runs under the process defaults.
+
+## Read and write Blob values
+
+Read a managed Blob cell to a file, inspect its metadata, or replace it:
 
 ```bash
 omnigraph blob get node Document doc-42 body \
@@ -88,11 +135,16 @@ omnigraph blob get node Document doc-42 body \
 
 omnigraph blob stat node Document doc-42 body \
   --store ./graph.omni --json
+
+omnigraph blob put node Document doc-42 body \
+  --store ./graph.omni --file body.bin
 ```
 
 `blob get` writes bytes to stdout when `--out` is omitted. Add `--offset` and
 `--length` for a range. The CLI reports external references but does not follow
-them. See [Blob values](../blobs.md) for the complete contract.
+them. `blob put` reads stdin when `--file` is omitted, and `blob clear` sets a
+nullable cell to null; both accept `--if-match`. See [Blob values](../blobs.md)
+for the complete contract.
 
 ## Inspect and maintain a graph
 
@@ -133,19 +185,53 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+## Use a server through a Unix socket
+
+A server may also be reached through a Unix-domain socket, for example a local
+gateway in front of `omnigraph-server`. A sandboxed agent that is denied network
+access may still be allowed to connect to one socket path. Address the socket
+with a `unix://` URL followed by its absolute path:
+
+```bash
+omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
+  --server unix:///run/omnigraph/server.sock --graph knowledge
+```
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  local:
+    url: unix:///run/omnigraph/server.sock
+```
+
+The whole path names the socket, so a socket URL has no host, path prefix,
+query or fragment. A path may contain spaces, written as is or as `%20`. The
+CLI sends the same HTTP/1.1 requests over the socket as over TCP: the
+`HEAD /healthz` discovery, the contract header, the bearer token, and no
+redirects or automatic retries. Proxy settings do not apply. `unix://`
+addresses work on Unix platforms only.
+
+A `--server` value or server `url:` must use `http://`, `https://` or
+`unix://`. Any other scheme fails as an invalid server address; use `--store`
+for graph storage.
+
 ## Manage a cluster
 
-Without a managed context, cluster commands read a directory containing
-`cluster.yaml`:
+Self-hosted `cluster` commands read a directory containing `cluster.yaml`, or address
+a running server explicitly. They ignore managed folder context:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan --config ./company-brain
+omnigraph cluster plan --config ./company-brain --as act-alice
 omnigraph cluster apply --config ./company-brain --as act-alice
 ```
 
-They manage graph definitions, schemas, stored queries, and policies—not graph
-data. See [Operating a cluster](../clusters/index.md).
+They manage graph definitions, schemas, stored queries, policies, embedding
+providers and external Blob rules. Plan is always an observation and never takes
+the writer lock. Removing a graph declaration deletes its managed storage and
+history. Apply refuses unmanaged existing roots, missing graphs that remain
+declared, and schema drift; it has no lifecycle or repair override. See
+[deployment boundaries](../clusters/index.md#deployment-boundaries).
 
 For a managed cluster, log in to its Intent API and select the cluster for
 your config directory:
@@ -153,22 +239,23 @@ your config directory:
 ```bash
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
-omnigraph cluster plan --config ./company-brain --json > plan.json
-omnigraph cluster apply --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph cluster history --config ./company-brain --json
+omnigraph cluster plan --managed --config ./company-brain --json > plan.json
+omnigraph cluster apply --managed --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
+omnigraph cluster status --managed --config ./company-brain --json
+omnigraph cluster history --managed --config ./company-brain --json
 omnigraph logout --api https://control.example
 ```
 
 Commit and push external configuration before planning. The API plans its
 bound head, or the pushed revision selected with `--rev`. Apply uses the exact
 saved plan and your current permissions. To release an unused plan, run
-`omnigraph cluster cancel PLAN_RUN_ID --config ./company-brain`; its result
+`omnigraph cluster cancel --managed PLAN_RUN_ID --config ./company-brain`; its result
 remains in history and cannot be applied afterward.
 
-The folder's `.omnigraph/context` selects the managed API. An unavailable API
-or malformed context causes an error. To intentionally use the direct
-`cluster.yaml` path, pass `--direct`. See [Managed cluster commands](reference.md#managed-cluster-commands)
+The explicit `--managed` flag uses the folder's `.omnigraph/context` to select
+the API and cluster. Without it, cluster commands ignore that context.
+Missing or malformed context and unavailable APIs refuse without
+falling back to local deployment. See [Managed cluster commands](reference.md#managed-cluster-commands)
 for credential storage, automation, bounded waits, and exit codes.
 
 ## Validate source before running it
@@ -180,8 +267,3 @@ omnigraph queries validate --cluster ./company-brain --graph knowledge
 
 `lint` checks one `.gq` source. `queries validate` checks the applied stored
 query registry for a cluster graph.
-
-## Deprecated names
-
-`read`, `change`, `check`, and `ingest` remain compatibility shims. New scripts
-should use `query`, `mutate`, `lint`, and `load`.

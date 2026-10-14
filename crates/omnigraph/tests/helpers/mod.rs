@@ -1,17 +1,26 @@
 #![allow(dead_code)]
 
+pub mod collector;
 pub mod cost;
+pub mod expand_projection;
 #[cfg(feature = "failpoints")]
 pub mod failpoint;
 pub mod recovery;
+pub mod transfer_aggregation;
+pub mod wide_rows;
+
+use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
-use omnigraph::changes::{ChangeFilter, ChangeSet};
+pub use omnigraph::Session;
+use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
+pub use omnigraph::settings::Traversal;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
@@ -130,6 +139,87 @@ pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Datase
     }
 }
 
+/// Open a physical HEAD using an exact native ref, without name discovery.
+pub async fn open_dataset_head_exact(uri: &str, branch: Option<&str>) -> lance::Dataset {
+    let dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    match branch {
+        Some(native) => dataset.checkout_branch(native).await.unwrap(),
+        None => dataset,
+    }
+}
+
+/// Open the raw Lance dataset of a branch's table at the version its
+/// registration pins: the detached version under the detached-only switch.
+pub async fn open_pinned_dataset_for_test(
+    db: &Omnigraph,
+    branch: &str,
+    table_key: &str,
+) -> lance::Dataset {
+    let snapshot = snapshot_branch(db, branch).await.unwrap();
+    let entry = snapshot.dataset(table_key).unwrap();
+    let pinned = snapshot
+        .open_dataset(table_key)
+        .await
+        .unwrap()
+        .published_dataset_version();
+    let uri = format!("{}/{}", db.uri().trim_end_matches('/'), entry.dataset_path);
+    open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref())
+        .await
+        .checkout_version(pinned)
+        .await
+        .unwrap()
+}
+
+/// Whether a Lance version number is a detached version (RFC 0067).
+pub fn is_detached_version(version: u64) -> bool {
+    version & lance_table::format::DETACHED_VERSION_MASK != 0
+}
+
+/// The Lance version a branch's registration pins for `table_key`.
+pub async fn pinned_version(db: &Omnigraph, branch: &str, table_key: &str) -> u64 {
+    open_pinned_dataset_for_test(db, branch, table_key)
+        .await
+        .version()
+        .version
+}
+
+/// Commit the branch's pinned `table_key` image as a linear HEAD above
+/// `above` (a Lance restore, then no-op deletes): a row-preserving foreign
+/// commit above the table's last linear version.
+pub async fn forge_linear_head_from_pin(
+    db: &Omnigraph,
+    branch: &str,
+    table_key: &str,
+    above: u64,
+) -> u64 {
+    let pinned = pinned_version(db, branch, table_key).await;
+    let entry = snapshot_branch(db, branch)
+        .await
+        .unwrap()
+        .dataset(table_key)
+        .unwrap()
+        .clone();
+    let uri = format!("{}/{}", db.uri().trim_end_matches('/'), entry.dataset_path);
+    let head = open_dataset_head_exact(&uri, entry.native_dataset_branch.as_deref()).await;
+    let restore = lance::dataset::transaction::Transaction::new(
+        head.version().version,
+        lance::dataset::transaction::Operation::Restore { version: pinned },
+        None,
+    );
+    let mut raw = lance::dataset::CommitBuilder::new(Arc::new(head))
+        .execute(restore)
+        .await
+        .unwrap();
+    while raw.version().version <= above {
+        lance_delete_inline(&mut raw, "1 = 2").await;
+    }
+    raw.version().version
+}
+
 /// Whether `name` is `{logical}` itself or `{logical}.{ULID}` — one
 /// incarnation of the logical branch.
 pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
@@ -157,11 +247,24 @@ pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
 /// bug — fail loudly rather than pick one.
 pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String> {
     let branches = ds.list_branches().await.unwrap();
-    let mut lives: Vec<String> = branches
-        .keys()
-        .filter(|name| is_incarnation_of(name, logical))
-        .cloned()
-        .collect();
+    let mut lives = Vec::new();
+    for (name, contents) in branches {
+        if let Some(marker) = contents.metadata.get("omnigraph.retired_manifest_branch") {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Retirement {
+                version: u32,
+                native_branch: String,
+                identifier: lance::dataset::refs::BranchIdentifier,
+            }
+            let retirement: Retirement = serde_json::from_str(marker).unwrap();
+            assert_eq!(retirement.version, 1);
+            assert_eq!(retirement.native_branch, name);
+            assert_eq!(retirement.identifier, contents.identifier);
+        } else if is_incarnation_of(&name, logical) {
+            lives.push(name);
+        }
+    }
     assert!(
         lives.len() <= 1,
         "ambiguous incarnations for logical branch '{logical}': {lives:?}"
@@ -169,22 +272,29 @@ pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String
     lives.pop()
 }
 
-/// Assert a persisted `native_dataset_branch` names an incarnation of
-/// `logical`: the native ref `{logical}.{ULID}`, or the bare name for a
-/// legacy fork.
+/// Check the naming shape of an already selected published table ref.
+/// This assertion does not discover refs or establish write ownership.
 #[track_caller]
 pub fn assert_native_branch_of(native: Option<&str>, logical: &str) {
     let native = native.unwrap_or_else(|| panic!("expected a fork of '{logical}', got None"));
+    let unique_fork = native.rsplit_once(".m").is_some_and(|(owner, suffix)| {
+        let Some((base, commit)) = suffix.split_once('.') else {
+            return false;
+        };
+        (is_incarnation_of(owner, logical)
+            || owner == "fork.legacy"
+            || is_incarnation_of(owner, "fork"))
+            && base.parse::<u64>().is_ok()
+            && is_incarnation_of(&format!("commit.{commit}"), "commit")
+    });
     assert!(
-        is_incarnation_of(native, logical),
-        "expected an incarnation of '{logical}', got '{native}'"
+        is_incarnation_of(native, logical) || unique_fork,
+        "expected a table fork for '{logical}', got '{native}'"
     );
 }
 
-/// The current incarnation's native ref of a LOGICAL graph branch, read from
-/// the `__manifest` dataset's live refs. Fixtures that forge or inspect
-/// per-table state colliding with the engine's own fork targets must address
-/// this name, not the logical one.
+/// Resolve a logical graph branch in `__manifest`.
+/// Table refs come from their published entry or saved recovery pin.
 pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
     let manifest_uri = format!("{}/__manifest", root_uri.trim_end_matches('/'));
     let ds = lance::dataset::builder::DatasetBuilder::from_uri(&manifest_uri)
@@ -197,13 +307,40 @@ pub async fn graph_native_ref(root_uri: &str, logical: &str) -> String {
         .unwrap_or_else(|| panic!("no live ref for logical branch '{logical}'"))
 }
 
+/// A session with the definition's defaults over a freshly opened handle.
+pub fn session(db: Omnigraph) -> Session {
+    Session::from_defaults(Arc::new(db), SessionSettings::default())
+}
+
+/// The same handle under one setting changed from `db`'s values, the
+/// replacement for a scoped override: run the operation on the returned
+/// session.
+pub fn with_setting(db: &Session, name: &str, value: &str) -> Session {
+    let settings = db
+        .settings()
+        .clone()
+        .with(name, value)
+        .unwrap_or_else(|error| panic!("test setting {name} = {value}: {error}"));
+    Session::from_defaults(Arc::clone(db.db()), settings)
+}
+
+/// The same handle with the harness-only traversal field forced to one expand
+/// path: no setting name carries it, so the typed builder is the only door.
+pub fn with_traversal(db: &Session, mode: Traversal) -> Session {
+    let settings = db.settings().clone().with_traversal(mode);
+    Session::from_defaults(Arc::clone(db.db()), settings)
+}
+
 /// Init a graph and load the standard test data.
-pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
+pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
+    init_and_load_with_schema(dir, TEST_SCHEMA).await
+}
+
+/// The standard rows under a compatible schema, for schema-size instruments.
+pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.
     db.ensure_indices().await.unwrap();
@@ -231,7 +368,7 @@ pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
     let (entity_kind, type_name) = table_key.split_once(':').unwrap();
     for field in &dataset.schema().fields {
         let marker = field.metadata.get("omnigraph.stable_property_id");
-        if matches!(field.name.as_str(), "id" | "src" | "dst") {
+        if matches!(field.name.as_str(), "__id" | "__src" | "__dst") {
             assert!(
                 marker.is_none(),
                 "physical field {table_key}.{} must not carry graph property identity",
@@ -328,7 +465,7 @@ pub fn collect_column_strings(batches: &[RecordBatch], col: &str) -> Vec<String>
 }
 
 pub async fn query_main(
-    db: &mut Omnigraph,
+    db: &Session,
     query_source: &str,
     query_name: &str,
     params: &ParamMap,
@@ -338,7 +475,7 @@ pub async fn query_main(
 }
 
 pub async fn query_branch(
-    db: &mut Omnigraph,
+    db: &Session,
     branch: &str,
     query_source: &str,
     query_name: &str,
@@ -349,7 +486,7 @@ pub async fn query_branch(
 }
 
 pub async fn mutate_main(
-    db: &mut Omnigraph,
+    db: &Session,
     query_source: &str,
     query_name: &str,
     params: &ParamMap,
@@ -358,7 +495,7 @@ pub async fn mutate_main(
 }
 
 pub async fn mutate_branch(
-    db: &mut Omnigraph,
+    db: &Session,
     branch: &str,
     query_source: &str,
     query_name: &str,
@@ -369,7 +506,7 @@ pub async fn mutate_branch(
 
 /// Advance the manifest version `n` times (one commit per insert), building
 /// deep commit history for cost-budget tests (history depth, not row count).
-pub async fn commit_many(db: &mut Omnigraph, n: usize) {
+pub async fn commit_many(db: &Session, n: usize) {
     for i in 0..n {
         mutate_main(
             db,
@@ -384,7 +521,7 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
 
 /// Like [`commit_many`] but every commit carries an actor in its inline
 /// `__manifest` lineage row — the authenticated (server/CLI) write path.
-pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
+pub async fn commit_many_as(db: &Session, n: usize, actor: &str) {
     for i in 0..n {
         db.mutate_as(
             "main",
@@ -419,11 +556,11 @@ pub async fn version_branch(db: &Omnigraph, branch: &str) -> Result<u64> {
         .await
 }
 
-pub async fn sync_main(db: &mut Omnigraph) -> Result<()> {
+pub async fn sync_main(db: &Omnigraph) -> Result<()> {
     db.sync_branch("main").await
 }
 
-pub async fn sync_named_branch(db: &mut Omnigraph, branch: &str) -> Result<()> {
+pub async fn sync_named_branch(db: &Omnigraph, branch: &str) -> Result<()> {
     db.sync_branch(branch).await
 }
 
@@ -431,18 +568,116 @@ pub async fn snapshot_id(db: &Omnigraph, branch: &str) -> Result<SnapshotId> {
     db.resolve_snapshot(branch).await
 }
 
+/// One change of a graph diff flattened for assertions: the entity's kind,
+/// type, id and operation, and an edge's endpoints from its newest image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetChange {
+    pub kind: ChangeEntityKind,
+    pub type_name: String,
+    pub id: String,
+    pub op: ChangeOpKind,
+    pub endpoints: Option<NetEndpoints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetEndpoints {
+    pub src: String,
+    pub dst: String,
+}
+
+impl NetChange {
+    /// `node:<Type>` or `edge:<Type>`.
+    pub fn type_key(&self) -> String {
+        let prefix = match self.kind {
+            ChangeEntityKind::Node => "node",
+            ChangeEntityKind::Edge => "edge",
+        };
+        format!("{prefix}:{}", self.type_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetStats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+/// A whole graph diff: its resolved endpoints and every change of every page.
+#[derive(Debug, Clone)]
+pub struct NetDiff {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    pub changes: Vec<NetChange>,
+    pub stats: NetStats,
+}
+
+/// The graph diff `from` → `to` (branch names or commit ids) within `scope`,
+/// every page.
+pub async fn graph_diff(
+    db: &Omnigraph,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    let mut request = omnigraph::changes::GraphDiffRequest {
+        sides: omnigraph::changes::GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut diff = NetDiff {
+        from_commit_id: String::new(),
+        to_commit_id: String::new(),
+        changes: Vec::new(),
+        stats: NetStats::default(),
+    };
+    loop {
+        let page = db.diff_page(&request).await?;
+        diff.from_commit_id = page.from_commit_id;
+        diff.to_commit_id = page.to_commit_id;
+        for change in page.changes {
+            match change.op {
+                ChangeOpKind::Insert => diff.stats.inserts += 1,
+                ChangeOpKind::Update => diff.stats.updates += 1,
+                ChangeOpKind::Delete => diff.stats.deletes += 1,
+            }
+            let endpoints = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .and_then(|image| image.endpoints.as_ref())
+                .map(|endpoints| NetEndpoints {
+                    src: endpoints.from.clone(),
+                    dst: endpoints.to.clone(),
+                });
+            diff.changes.push(NetChange {
+                kind: change.kind,
+                type_name: change.entity_type.name,
+                id: change.id,
+                op: change.op,
+                endpoints,
+            });
+        }
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(diff),
+        }
+    }
+}
+
+/// The graph diff from `from_snapshot` to the head of `branch`.
 pub async fn diff_since_branch(
     db: &Omnigraph,
     branch: &str,
     from_snapshot: SnapshotId,
-    filter: &ChangeFilter,
-) -> Result<ChangeSet> {
-    db.diff_between(
-        ReadTarget::Snapshot(from_snapshot),
-        ReadTarget::branch(branch),
-        filter,
-    )
-    .await
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    graph_diff(db, from_snapshot.as_str(), branch, scope).await
 }
 
 /// Advance a Lance dataset HEAD directly from tests without going through
@@ -548,4 +783,101 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
         .ok()?
         .as_nanos();
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
+}
+
+/// Append one `Document` row, id and title `ranged`, whose `content` is the
+/// external descriptor `s3://bucket/object` at offset 4, length 8, then
+/// publish that table head. No public write path creates a ranged descriptor,
+/// so the fixture writes it raw. The schema must be exactly
+/// `Document { title: String @key, content: Blob? }`. Returns the table URI.
+#[cfg(feature = "failpoints")]
+pub async fn seed_ranged_external_blob_row(db: &Omnigraph, uri: &str) -> String {
+    write_ranged_external_blob_row(db, uri, 4, 8).await
+}
+
+/// Replace the `ranged` row written by [`seed_ranged_external_blob_row`] with
+/// one naming the same object through another byte range, in one graph
+/// commit. Call it before any engine write to `Document`: it writes the
+/// table's linear head, which is the published version only until then.
+#[cfg(feature = "failpoints")]
+pub async fn replace_ranged_external_blob_range(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    write_ranged_external_blob_row(db, uri, offset, size).await
+}
+
+#[cfg(feature = "failpoints")]
+async fn write_ranged_external_blob_row(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    use arrow_array::ArrayRef;
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.dataset_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    assert_eq!(
+        raw.version().version,
+        entry.published_dataset_version,
+        "the ranged-descriptor fixture writes the linear head, which must be the published version"
+    );
+    raw.delete("__id = 'ranged'").await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset, size }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["__id", "content", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+    table_uri
 }

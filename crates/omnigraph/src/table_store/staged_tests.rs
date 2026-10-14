@@ -24,11 +24,12 @@ use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use crate::storage_layer::{
     IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
+    PendingScanBudget, PendingUsage, ProvenInsertChunk, SnapshotHandle, WriteBudget,
 };
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{ident, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, UpdateMode};
@@ -36,6 +37,7 @@ use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilde
 use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
+use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
 /// and deliberately does not include the shared `helpers` module).
@@ -80,7 +82,7 @@ fn exact_effect_free_commit_adapter_is_the_only_generic_conflict_replay_signal()
         timeout.storage_failure().map(|failure| failure.kind),
         Some(StorageFailureKind::Transient)
     );
-    assert!(!timeout.is_retryable_commit_conflict());
+    assert!(!matches!(timeout, OmniError::RetryableCommitConflict(_)));
 }
 
 fn person_schema() -> Arc<Schema> {
@@ -186,6 +188,74 @@ fn blob_person_pk_batch(id: &str, payload: &[u8]) -> RecordBatch {
     .unwrap()
 }
 
+#[test]
+fn write_max_bytes_separates_only_typed_valid_blob_payloads() {
+    let batch = blob_person_pk_batch("one", &vec![0; 4093]);
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 4093);
+    assert!(usage.rows < 4093);
+    assert!(batch.get_array_memory_size() as u64 > 4093);
+    let content = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let null_content = StructArray::new(
+        content.fields().clone(),
+        content.columns().to_vec(),
+        Some(datafusion::arrow::buffer::NullBuffer::from(vec![false])),
+    );
+    let null_batch = RecordBatch::try_new(
+        batch.schema(),
+        vec![batch.column(0).clone(), Arc::new(null_content)],
+    )
+    .unwrap();
+    assert_eq!(super::write_batch_bytes(&null_batch).unwrap().payload, 0);
+    let ordinary = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "bytes",
+            DataType::LargeBinary,
+            false,
+        )])),
+        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            vec![0; 4094].as_slice(),
+        ]))],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&ordinary).unwrap();
+    assert_eq!(usage.payload, 0);
+    assert!(
+        usage.rows > 4093,
+        "ordinary binary bytes stay in the row account"
+    );
+    let mut builder = lance::blob::BlobArrayBuilder::new(3);
+    for _ in 0..3 {
+        builder.push_bytes(vec![0; 2730]).unwrap();
+    }
+    let content = builder.finish().unwrap();
+    let data = content
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .column_by_name("data")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::LargeBinaryArray>()
+        .unwrap();
+    assert!(
+        data.values().capacity() > 8190,
+        "fixture must retain payload capacity slack"
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![lance::blob::blob_field("content", true)])),
+        vec![content],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 8190);
+    assert!(usage.rows < 8190);
+}
+
 fn staged_key_filter(
     staged: &StagedWrite,
 ) -> &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter {
@@ -203,19 +273,6 @@ fn numbered_person_batch(range: std::ops::Range<i32>) -> RecordBatch {
     let ages: Vec<Option<i32>> = range.map(Some).collect();
     RecordBatch::try_new(
         person_schema(),
-        vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(Int32Array::from(ages)),
-        ],
-    )
-    .unwrap()
-}
-
-fn numbered_person_pk_batch(range: std::ops::Range<i32>) -> RecordBatch {
-    let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
-    let ages: Vec<Option<i32>> = range.map(Some).collect();
-    RecordBatch::try_new(
-        person_pk_schema(),
         vec![
             Arc::new(StringArray::from(ids)),
             Arc::new(Int32Array::from(ages)),
@@ -268,15 +325,22 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
 fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
     PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64,
-        KEYED_WRITE_MAX_BYTES,
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64,
+            bytes: KEYED_WRITE_MAX_BYTES,
+            payload_bytes: 0,
+        },
+        WriteBudget::default(),
     ))
     .expect("the exact keyed row/byte limits are inclusive");
 
     let row_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64 + 1,
-        0,
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64 + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one row over must be rejected");
@@ -291,8 +355,11 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
 
     let byte_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        0,
-        KEYED_WRITE_MAX_BYTES + 1,
+        PendingUsage {
+            bytes: KEYED_WRITE_MAX_BYTES + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one byte over must be rejected");
@@ -302,7 +369,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             ref resource,
             limit: KEYED_WRITE_MAX_BYTES,
             actual,
-        } if resource == "keyed entity bytes for test:people"
+        } if resource == "retained keyed batch bytes per operation"
             && actual == KEYED_WRITE_MAX_BYTES + 1
     ));
 }
@@ -433,6 +500,8 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
             "Person",
             person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -484,6 +553,8 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -513,6 +584,8 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -535,6 +608,8 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             "Person",
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::KnownPresentUpdate,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -567,6 +642,8 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -597,10 +674,6 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
     assert!(
         super::has_insert_absence_certificate(&staged.transaction),
         "an all-new upsert's completed merge proves every inserted id absent from its parent"
-    );
-    assert!(
-        staged.strict_source_ids.is_none(),
-        "certification must not change upsert conflict-normalization semantics"
     );
     assert_eq!(
         staged
@@ -669,6 +742,8 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
             "Person",
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -726,6 +801,8 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             "Person",
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -752,6 +829,8 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             "Person",
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -817,7 +896,11 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
         .commit_staged(Arc::new(ds), staged_index)
         .await
         .unwrap();
-    assert!(!TableStore::has_unindexed_fragments(&ds).await.unwrap());
+    assert!(
+        !crate::dataset_index::has_unindexed_fragments(&ds)
+            .await
+            .unwrap()
+    );
 
     let expected_field_ids = ds
         .schema()
@@ -838,6 +921,8 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 0,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -920,13 +1005,13 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
         other => panic!("persisted proven insert lost its Update/filter shape: {other:?}"),
     }
     assert!(
-        TableStore::has_unindexed_fragments(&committed)
+        crate::dataset_index::has_unindexed_fragments(&committed)
             .await
             .unwrap(),
         "the pre-existing BTREE must not claim the newly inserted fragment"
     );
     assert_eq!(
-        TableStore::first_existing_id(&committed, &["bob".to_string()])
+        TableStore::first_existing_id(&committed, &["bob".to_string()], SYSTEM_COLUMNS_LEGACY)
             .await
             .unwrap(),
         Some("bob".to_string()),
@@ -953,6 +1038,8 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
                 0,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -966,6 +1053,8 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
                 1,
             )
             .unwrap(),
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1011,6 +1100,8 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
             "Person",
             person_pk_batch(&[("carol", Some(40))]),
             KeyedWriteSemantics::StrictInsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1021,7 +1112,12 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
     let version_before_rejection = advanced.version().version;
 
     let error = store
-        .stage_proven_strict_insert(advanced, chunk)
+        .stage_proven_strict_insert(
+            advanced,
+            chunk,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1074,7 +1170,7 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
     let version_before_rejection = target.version().version;
 
     let error = store
-        .stage_proven_strict_insert(target, chunk)
+        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY, WriteBudget::default())
         .await
         .unwrap_err();
     assert!(
@@ -1116,6 +1212,8 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                     0,
                 )
                 .unwrap(),
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1125,6 +1223,8 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 "Person",
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1161,7 +1261,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
 
     let duplicate = person_pk_batch(&[("alice", Some(30)), ("alice", Some(31))]);
     let duplicate_error = store
-        .validate_keyed_write_batch("node:Person", &duplicate)
+        .validate_keyed_write_batch("node:Person", &duplicate, SYSTEM_COLUMNS_LEGACY)
         .unwrap_err();
     assert!(matches!(
         duplicate_error,
@@ -1186,7 +1286,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
     .unwrap();
     assert!(
         store
-            .validate_keyed_write_batch("node:Person", &null_id)
+            .validate_keyed_write_batch("node:Person", &null_id, SYSTEM_COLUMNS_LEGACY)
             .unwrap_err()
             .to_string()
             .contains("null 'id'")
@@ -1206,7 +1306,7 @@ fn keyed_batch_validation_requires_non_null_utf8_unique_physical_ids() {
     .unwrap();
     assert!(
         store
-            .validate_keyed_write_batch("node:Person", &non_utf8)
+            .validate_keyed_write_batch("node:Person", &non_utf8, SYSTEM_COLUMNS_LEGACY)
             .unwrap_err()
             .to_string()
             .contains("not Utf8")
@@ -1229,6 +1329,8 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             "Person",
             person_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -1255,165 +1357,17 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
         .await
         .unwrap();
     let wrong_error = store
-        .stage_keyed_write(wrong, "Person", wrong_batch, KeyedWriteSemantics::Upsert)
+        .stage_keyed_write(
+            wrong,
+            "Person",
+            wrong_batch,
+            KeyedWriteSemantics::Upsert,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
         .await
         .unwrap_err();
     assert!(wrong_error.to_string().contains("got [\"age\"]"));
-}
-
-#[tokio::test]
-async fn keyed_write_stream_stages_source_dataset_without_wide_collection() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let target_uri = format!("{root}/target.lance");
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let target = TableStore::write_dataset(&target_uri, person_pk_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    let source = TableStore::write_dataset(
-        &source_uri,
-        person_pk_batch(&[("bob", Some(25)), ("carol", Some(40))]),
-    )
-    .await
-    .unwrap();
-
-    let staged = store
-        .stage_keyed_write_stream(
-            target.clone(),
-            "Person",
-            &source,
-            KeyedWriteSemantics::StrictInsert,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        staged_key_filter(&staged).field_ids,
-        vec![target.schema().field("id").unwrap().id]
-    );
-    let committed = store.commit_staged(Arc::new(target), staged).await.unwrap();
-    assert_eq!(
-        collect_ids(&store.scan_batches(&committed).await.unwrap()),
-        vec!["alice", "bob", "carol"]
-    );
-    assert_eq!(source.version().version, 1, "source remains read-only");
-}
-
-#[tokio::test]
-async fn proven_insert_delta_scan_is_interval_exact_and_batch_bounded() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(30))]))
-        .await
-        .unwrap();
-    let begin_version = source.version().version;
-    lance_append_inline_local(&mut source, numbered_person_pk_batch(0..10_000)).await;
-    let end_version = source.version().version;
-
-    let external_preflight = super::ExternalBlobPreflight::default();
-    let mut stream = store
-        .scan_proven_insert_delta_bounded(
-            &source,
-            "Person",
-            begin_version,
-            end_version,
-            &external_preflight,
-        )
-        .await
-        .unwrap();
-    let mut rows = 0_usize;
-    let mut batches = 0_usize;
-    while let Some(batch) = stream.try_next().await.unwrap() {
-        assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
-        assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
-        let ids = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert!((0..ids.len()).all(|row| ids.value(row) != "base"));
-        rows += batch.num_rows();
-        batches += 1;
-    }
-    assert_eq!(rows, 10_000);
-    assert_eq!(batches, 2, "10K rows must be emitted as 8192 + 1808");
-    assert_eq!(
-        source.version().version,
-        end_version,
-        "the scan is read-only"
-    );
-}
-
-#[tokio::test]
-async fn proven_insert_delta_scan_normalizes_oversized_raw_emission() {
-    const APPENDS: usize = 9;
-    const ROWS_PER_APPEND: usize = 512;
-
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap();
-    let source_uri = format!("{root}/source.lance");
-    let store = TableStore::new(root, test_session());
-    let mut source = TableStore::write_dataset(&source_uri, person_pk_batch(&[("base", Some(0))]))
-        .await
-        .unwrap();
-    let begin_version = source.version().version;
-    let padding = "x".repeat(8 * 1024);
-    for append in 0..APPENDS {
-        let start = append * ROWS_PER_APPEND;
-        let ids = (start..start + ROWS_PER_APPEND)
-            .map(|row| format!("p{row:05}-{padding}"))
-            .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(
-            person_pk_schema(),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(Int32Array::from(vec![Some(append as i32); ROWS_PER_APPEND])),
-            ],
-        )
-        .unwrap();
-        lance_append_inline_local(&mut source, batch).await;
-    }
-    let end_version = source.version().version;
-
-    let probes = MergeWriteProbes::default();
-    let (rows, normalized_batches) = with_merge_write_probes(probes.clone(), async {
-        let external_preflight = super::ExternalBlobPreflight::default();
-        let mut stream = store
-            .scan_proven_insert_delta_bounded(
-                &source,
-                "Person",
-                begin_version,
-                end_version,
-                &external_preflight,
-            )
-            .await
-            .unwrap();
-        let mut rows = 0_usize;
-        let mut batches = 0_usize;
-        while let Some(batch) = stream.try_next().await.unwrap() {
-            assert!(batch.num_rows() <= KEYED_WRITE_MAX_ROWS);
-            assert!(u64::try_from(batch.get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
-            rows += batch.num_rows();
-            batches += 1;
-        }
-        (rows, batches)
-    })
-    .await;
-
-    assert_eq!(rows, APPENDS * ROWS_PER_APPEND);
-    assert!(
-        normalized_batches >= 2,
-        "the ~36-MiB interval must cross the normalized transaction ceiling"
-    );
-    assert!(probes.proven_insert_raw_batch_calls() > 0);
-    assert!(
-        probes.proven_insert_raw_batch_max_bytes() > KEYED_WRITE_MAX_BYTES,
-        "fixture must expose Lance's approximate byte target before the hard normalizer: max raw batch was {} bytes",
-        probes.proven_insert_raw_batch_max_bytes()
-    );
 }
 
 #[test]
@@ -1430,6 +1384,39 @@ fn proven_insert_delta_scan_never_enables_strict_batch_size() {
         !body.contains(".strict_batch_size("),
         "strict row coalescing can return retained-parent slices; the bounded normalizer owns this boundary"
     );
+}
+
+#[tokio::test]
+async fn write_max_bytes_proven_insert_compacts_a_single_retained_row() {
+    let schema = person_pk_schema();
+    let parent = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "small".to_string(),
+                "x".repeat(5000),
+            ])),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+        ],
+    )
+    .unwrap();
+    let slice = parent.slice(0, 1);
+    let settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "4093")
+        .unwrap();
+    let budget = WriteBudget::from_settings(&settings);
+    let retained = slice.get_array_memory_size() as u64;
+    assert!(retained > budget.bytes() && retained <= 2 * budget.bytes());
+    let reader = arrow_array::RecordBatchIterator::new([Ok(slice)], schema.clone());
+    let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let output: Vec<_> =
+        super::bounded_proven_insert_stream(schema, raw, "Person".to_string(), budget)
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert!(super::write_batch_bytes(&output[0]).unwrap().rows <= budget.bytes());
 }
 
 #[tokio::test]
@@ -1450,11 +1437,15 @@ async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
         .collect::<Vec<_>>();
     let reader = arrow_array::RecordBatchIterator::new(batches, schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let output: Vec<RecordBatch> =
-        super::bounded_proven_insert_stream(schema, raw, "Person".to_string())
-            .try_collect()
-            .await
-            .unwrap();
+    let output: Vec<RecordBatch> = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    )
+    .try_collect()
+    .await
+    .unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 10);
     assert!(u64::try_from(output[0].get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
@@ -1491,7 +1482,12 @@ async fn proven_insert_boundary_normalizer_splits_retained_parent_lazily() {
 
     let reader = arrow_array::RecordBatchIterator::new([Ok(parent)], schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let mut output = super::bounded_proven_insert_stream(schema, raw, "Person".to_string());
+    let mut output = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    );
 
     for _ in 0..3 {
         let batch = output
@@ -1597,7 +1593,11 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 0, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage::default(),
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
@@ -1619,7 +1619,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8190, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8190,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect("projection containing key_column must succeed");
@@ -1640,7 +1647,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8191, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8191,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("pending + unshadowed committed output must share the row budget");
@@ -2496,8 +2510,9 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     // Metadata-only coverage cases, reusing this fixture's typed index
     // inventory. The synthetic empty segment borrows another index UUID;
     // no posting files are opened and these snapshots are never searched.
-    // A scalar's full union is a no-op, but vector segments may still need
-    // partition rebalancing, so preserve their previous per-segment candidacy.
+    // A scalar's full union is a no-op, but a vector index split into
+    // segments costs a nearest scan one probe set per segment, so the fold
+    // still collapses it into one (RFC 0067 rebuilds it whole).
     use lance::index::DatasetIndexExt;
     let inventory = new_ds.load_indices().await.unwrap();
     let mut coverage_ds = new_ds;
@@ -2529,7 +2544,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
             .await
             .unwrap();
         assert!(
-            TableStore::has_unindexed_fragments(&coverage_ds)
+            crate::dataset_index::has_unindexed_fragments(&coverage_ds)
                 .await
                 .unwrap(),
             "fixture must expose per-segment partial coverage for {column}"
@@ -2539,7 +2554,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 .await
                 .unwrap(),
             expected_work,
-            "scalar union coverage must not suppress vector rebalance candidacy on {column}"
+            "scalar union coverage must not suppress the vector segment collapse on {column}"
         );
     }
 }
@@ -2672,10 +2687,10 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    // Stage a delete of alice — writes the deletion file (Phase A) but does
-    // NOT advance HEAD.
+    // Stage a delete of alice — writes the deletion file but does NOT advance
+    // HEAD.
     let staged = store
-        .stage_delete(&ds, "id = 'alice'")
+        .stage_delete(&ds, ident("id").eq(lit("alice")))
         .await
         .unwrap()
         .expect("alice matches → Some(StagedWrite)");
@@ -2707,7 +2722,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
 
     // A 0-row delete is a true no-op: None, no version, no fragments.
     let none = store
-        .stage_delete(&committed, "id = 'nobody'")
+        .stage_delete(&committed, ident("id").eq(lit("nobody")))
         .await
         .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
@@ -2723,7 +2738,7 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     let staged = store
-        .stage_delete(&ds, "age < 10")
+        .stage_delete(&ds, ident("age").lt(lit(10)))
         .await
         .unwrap()
         .expect("delete should match rows");
@@ -2738,197 +2753,6 @@ async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
         .await
         .unwrap();
     assert_eq!(committed.count_rows(None).await.unwrap(), 80);
-}
-
-/// Empirical pin of `Dataset::restore` semantics for the recovery sweep.
-///
-/// The recovery sweep depends on the `restore` invariant: from HEAD =
-/// `h`, calling `Dataset::checkout_version(p).await?` then
-/// `Dataset::restore().await?` produces a NEW commit at HEAD = `h + 1`
-/// with content == content at version `p`.
-///
-/// The Lance source confirms this — `restore()` (no args) takes the
-/// currently-checked-out version's content and applies it via
-/// `apply_commit` against the latest manifest, advancing HEAD by one.
-/// See lance-6.0.1 `src/dataset.rs:1106` and the transaction-spec
-/// example at https://lance.org/format/table/transaction/.
-///
-/// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
-/// signature, the recovery sweep's rollback path breaks; this test
-/// surfaces the regression at compile/test time rather than under
-/// production drift recovery.
-#[tokio::test]
-async fn lance_restore_appends_one_commit_with_checked_out_content() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-
-    // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
-    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-    assert_eq!(ds.version().version, 1);
-
-    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(25))])).await;
-    assert_eq!(ds.version().version, 2);
-
-    lance_append_inline_local(&mut ds, person_batch(&[("carol", Some(40))])).await;
-    assert_eq!(ds.version().version, 3);
-
-    let head_before = ds.version().version;
-
-    // Recovery's rollback shape: open + checkout(p) + restore().
-    let head_ds = Dataset::open(&uri).await.unwrap();
-    let mut to_restore = head_ds.checkout_version(1).await.unwrap();
-    assert_eq!(to_restore.manifest.version, 1);
-    to_restore.restore().await.unwrap();
-
-    // Verify against a fresh open — the previous handle's view doesn't
-    // tell us what other openers see.
-    let post = Dataset::open(&uri).await.unwrap();
-    assert_eq!(
-        post.version().version,
-        head_before + 1,
-        "Dataset::restore must append exactly one commit (HEAD + 1). If \
-         this assertion fires, lance changed restore semantics — re-read \
-         lance src/dataset.rs::restore and update the recovery sweep's \
-         rollback path before proceeding."
-    );
-    assert_eq!(
-        post.manifest.next_row_id, ds.manifest.next_row_id,
-        "restore must not make previously allocated stable row IDs reusable"
-    );
-    assert_eq!(
-        post.manifest.max_fragment_id(),
-        ds.manifest.max_fragment_id(),
-        "restore must retain the historical fragment-ID high-water mark"
-    );
-
-    // Content equality: the restored HEAD must match version 1 (just alice).
-    let scanner = post.scan();
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let ids = collect_ids(&batches);
-    assert_eq!(
-        ids,
-        vec!["alice".to_string()],
-        "post-restore content must equal version 1's content; got {:?}",
-        ids,
-    );
-}
-
-/// Empirical pin of the `Dataset::restore` concurrency hazard that requires
-/// Full recovery to join the root-scoped writer gates and leaves a real
-/// cross-process fencing boundary.
-///
-/// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
-/// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
-/// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
-/// so a Restore commits successfully even with concurrent commits in
-/// flight. The symmetric checks (lines 318, 473, 634, 787, 853, 947, 978,
-/// 1018, 1059, 1115, 1187, 1280) classify Restore as incompatible from
-/// the *other* op's POV — but the *other* op already committed before the
-/// Restore arrived, so it sees no conflict. Net: the Restore appends a
-/// rewind commit AFTER the legitimate concurrent Append, silently
-/// orphaning that Append's data from the active timeline.
-///
-/// Full recovery may invoke Restore on a read-write open, but first joins the
-/// same root-scoped schema → branch → sorted-table gates as live writers and
-/// rechecks that the sidecar still exists after waiting. The in-process healer
-/// is roll-forward-only and never restores beneath live traffic. Together those
-/// rules keep this substrate asymmetry unreachable against another handle in
-/// the same process.
-///
-/// The gates remain process-local. A recovery pass cannot fence a live writer
-/// in another process, so general multi-process write/recovery topologies remain
-/// outside the supported boundary until a distributed fence exists. See
-/// `docs/dev/invariants.md` and `docs/dev/writes.md`.
-///
-/// This test is the load-bearing constraint any future reconciler must
-/// honor.
-#[tokio::test]
-async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-
-    // v1: seed with alice.
-    let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
-        .await
-        .unwrap();
-
-    // Recovery handle: opened at the latest, then checked out at v1 (the
-    // pin we'd "rollback" to in a real recovery scenario). This handle
-    // has NOT yet called restore.
-    let recovery_open = Dataset::open(&uri).await.unwrap();
-    let mut recovery_handle = recovery_open.checkout_version(1).await.unwrap();
-
-    // Concurrent legitimate writer: appends bob, advancing HEAD to v2.
-    // This simulates a per-table-queue model where another tenant wrote
-    // between recovery's open and recovery's restore call.
-    let mut writer_handle = Dataset::open(&uri).await.unwrap();
-    lance_append_inline_local(&mut writer_handle, person_batch(&[("bob", Some(25))])).await;
-    assert_eq!(writer_handle.version().version, 2);
-
-    // Recovery now restores. Because restore's `check_restore_txn` returns
-    // Ok against Append, this commits at v3 with content == v1 (just alice).
-    recovery_handle.restore().await.unwrap();
-
-    // Re-open and inspect: HEAD is v3, content is just alice. Bob is gone
-    // from the active timeline.
-    let post = Dataset::open(&uri).await.unwrap();
-    assert_eq!(
-        post.version().version,
-        3,
-        "Restore commits at HEAD+1 even when a concurrent commit landed \
-         between recovery's open and recovery's restore call. If this \
-         assertion fails, lance changed restore-vs-append conflict \
-         semantics — re-read check_restore_txn and update the recovery \
-         sweep's concurrency analysis."
-    );
-
-    let scanner = post.scan();
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let ids = collect_ids(&batches);
-    assert_eq!(
-        ids,
-        vec!["alice".to_string()],
-        "Concurrent Append's row 'bob' was silently orphaned by the \
-         Restore. Active-timeline contents == v1's contents. Full recovery \
-         must join the root-scoped writer gates before Restore; those gates \
-         remain process-local, so a distributed fence is required before \
-         multi-process recovery can be supported. Got: {:?}",
-        ids,
-    );
-
-    // Sanity: bob's commit IS still readable via explicit checkout_version(2).
-    // The data isn't gone from disk — it's just unreachable from HEAD until
-    // cleanup_old_versions reclaims the orphan.
-    let v2 = Dataset::open(&uri)
-        .await
-        .unwrap()
-        .checkout_version(2)
-        .await
-        .unwrap();
-    let v2_batches: Vec<RecordBatch> = v2
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let v2_ids = collect_ids(&v2_batches);
-    assert_eq!(v2_ids, vec!["alice".to_string(), "bob".to_string()]);
 }
 
 /// Regression for PR #229: `commit_staged` must skip Lance's per-commit
@@ -2982,5 +2806,296 @@ async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
         ds.checkout_version(v1).await.is_ok(),
         "commit_staged must skip Lance auto-cleanup so a pre-bump graph's pinned \
          v{v1} survives; it was GC'd"
+    );
+}
+
+#[test]
+fn compaction_blob_batch_rows_bounds_one_batch() {
+    use crate::table_store::{
+        COMPACTION_BLOB_BATCH_BYTES as BUDGET, COMPACTION_MAX_BATCH_ROWS as MAX_ROWS,
+        compaction_blob_batch_rows,
+    };
+    assert_eq!(compaction_blob_batch_rows(0), MAX_ROWS, "no Blob bytes");
+    assert_eq!(compaction_blob_batch_rows(1), MAX_ROWS, "clamped high");
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 32), 32, "the quotient");
+    assert_eq!(compaction_blob_batch_rows(BUDGET + 1), 1, "clamped low");
+    assert_eq!((BUDGET, MAX_ROWS), (32 << 20, 8192));
+    assert_eq!(compaction_blob_batch_rows(4096), 8192);
+    assert_eq!(compaction_blob_batch_rows(4097), 8190);
+    assert_eq!(compaction_blob_batch_rows(BUDGET), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2 + 1), 1);
+    assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
+}
+
+/// Lance applies a per-run source budget only to the tasks its own planner
+/// returns, so the dropped-column tasks the graph planner appends would run
+/// outside it: options that set any budget are refused before planning.
+#[tokio::test]
+async fn table_compaction_planning_refuses_source_budgets() {
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
+    assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+
+    let budgets = [
+        CompactionOptions {
+            max_source_fragments: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_rows: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_bytes: Some(1),
+            ..CompactionOptions::default()
+        },
+    ];
+    for options in budgets {
+        match TableStore::plan_table_compaction(&ds, &options).await {
+            Err(OmniError::Manifest(manifest))
+                if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+            other => panic!("a source budget must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// The schema-evolution planner reads only the manifest: renames and drops
+/// plan one Project, additions one Merge, both a Project then a Merge, an
+/// unchanged schema nothing; every change that would need a rewrite refuses.
+#[tokio::test]
+async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
+    use crate::db::STABLE_PROPERTY_ID_METADATA_KEY as MARKER;
+
+    fn pk_id() -> Field {
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+    fn marked(name: &str, data_type: DataType, nullable: bool, id: &str) -> Field {
+        Field::new(name, data_type, nullable)
+            .with_metadata([(MARKER.to_string(), id.to_string())].into_iter().collect())
+    }
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("evolve.lance");
+    let schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        ],
+    )
+    .unwrap();
+    let ds = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        uri.to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let age_id = ds.schema().field("age").unwrap().id;
+    let max_id = ds.manifest.max_field_id();
+
+    let mut unchanged = TableStore::plan_schema_evolution(&ds, &schema, &[]).unwrap();
+    assert!(unchanged.project.is_none() && unchanged.merge.is_none());
+    assert!(
+        store
+            .stage_schema_evolution(&ds, &mut unchanged)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let renamed = Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]);
+    let mut plan =
+        TableStore::plan_schema_evolution(&ds, &renamed, &renames(&[("age", "years")])).unwrap();
+    assert!(plan.merge.is_none());
+    let project = plan.project.clone().unwrap();
+    assert_eq!(project.field("years").unwrap().id, age_id);
+    assert!(project.field("note").is_none());
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Project {
+            preserves_nullability: true,
+            ..
+        }
+    ));
+    assert_eq!(staged.transaction.read_version, ds.version().version);
+    // The plan is consumed; a step staged against a dataset the previous
+    // step did not leave refuses.
+    assert!(plan.project.is_none());
+    let error = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the ones the plan expects"),
+        "{error}"
+    );
+
+    let added = Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]);
+    let mut plan = TableStore::plan_schema_evolution(&ds, &added, &[]).unwrap();
+    assert!(plan.project.is_none());
+    let merge = plan.merge.clone().unwrap();
+    assert_eq!(
+        merge
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "age", "city", "note"],
+        "the evolved schema keeps the target's column order"
+    );
+    assert_eq!(merge.field("city").unwrap().id, max_id + 1);
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    match &staged.transaction.operation {
+        Operation::Merge { fragments, .. } => {
+            assert_eq!(fragments.as_slice(), ds.manifest.fragments.as_slice())
+        }
+        other => panic!("expected a Merge, got {other:?}"),
+    }
+
+    let both = Schema::new(vec![
+        pk_id(),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("years", DataType::Int32, true, "1"),
+    ]);
+    let plan =
+        TableStore::plan_schema_evolution(&ds, &both, &renames(&[("age", "years")])).unwrap();
+    let project = plan.project.unwrap();
+    assert_eq!(
+        project
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "years"],
+        "the Project carries the renames and drops, the Merge the additions"
+    );
+    assert!(plan.merge.unwrap().field("city").is_some());
+
+    let refusals = [
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, true, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![
+                pk_id(),
+                marked("age", DataType::Int32, true, "1"),
+                marked("city", DataType::Utf8, false, "3"),
+            ]),
+            Vec::new(),
+            "is not nullable",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "9")]),
+            Vec::new(),
+            "carries property identity 1, not 9",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]),
+            renames(&[("ghost", "years")]),
+            "which the dataset does not have",
+        ),
+    ];
+    for (target, renames, expected) in refusals {
+        let error = TableStore::plan_schema_evolution(&ds, &target, &renames).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected '{expected}', got: {error}"
+        );
+    }
+
+    // A column written before property markers existed adopts its identity
+    // from the target, as the replaced full-table rewrite did.
+    let unmarked_schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let unmarked = Dataset::write(
+        arrow_array::RecordBatchIterator::new(
+            vec![Ok(RecordBatch::try_new(
+                unmarked_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int32Array::from(vec![Some(1)])),
+                ],
+            )
+            .unwrap())],
+            unmarked_schema,
+        ),
+        dir.path().join("unmarked.lance").to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let marked_target = Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "1")]);
+    let adopted = TableStore::plan_schema_evolution(&unmarked, &marked_target, &[])
+        .unwrap()
+        .project
+        .unwrap();
+    assert_eq!(
+        adopted
+            .field("age")
+            .unwrap()
+            .metadata
+            .get(MARKER)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        adopted.field("age").unwrap().id,
+        unmarked.schema().field("age").unwrap().id
     );
 }

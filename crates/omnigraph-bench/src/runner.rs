@@ -19,32 +19,69 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use futures::FutureExt;
+#[cfg(test)]
 use lance::io::WrappingObjectStore;
+#[cfg(test)]
+use omnigraph::Session;
+#[cfg(test)]
 use omnigraph::db::{MergeOutcome, Omnigraph};
+#[cfg(test)]
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
-    with_merge_write_probes, with_query_io_probes,
+    CountingStorageAdapter, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
+use omnigraph::instrumentation::{MergeTimingReading, MergeWriteProbes, StorageReadCounts};
+#[cfg(test)]
+use omnigraph::settings::SessionSettings;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+use crate::branch_merge::FixturePreflight;
+#[cfg(test)]
+use crate::branch_merge::initialize_local_fixture;
+#[cfg(test)]
 use crate::branch_merge::{
-    BranchMergePlan, FixtureBuildSummary, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
-    capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
+    BranchMergePlan, FixtureBuildSummary, SOURCE_BRANCH, TARGET_BRANCH,
+    capture_protected_branch_heads, verify_merged_graph, warm_read_set,
 };
-use crate::case::{
-    Attribution, Backend, CacheCondition, Data, EnginePreparation, FixtureBuilder, LocalFilesystem,
-    LocalStorageClass, MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode,
-    State, WarmupProgram,
-};
-use crate::counting::{LogicalCallCounter, LogicalCallCounts};
-use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
+#[cfg(test)]
+use crate::counting::LogicalCallCounter;
+use crate::counting::LogicalCallCounts;
+use crate::environment::LocalEnvironmentEvidence;
+#[cfg(test)]
+use crate::environment::verify_local_environment;
+#[cfg(test)]
 use crate::fixture_worker::supervise_fixture_build;
-use crate::machine::{MachineIdentityV1, capture_machine_identity};
+use crate::gqt_protocol::{
+    WorkerBuildV1, digest_worker_executable, open_and_digest_worker_executable,
+};
+#[cfg(test)]
+use crate::legacy::case::validate_case;
+#[cfg(test)]
+use crate::legacy::case::{
+    Attribution, Backend, EnginePreparation, LocalFilesystem, LocalStorageClass,
+    MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode, WarmupProgram,
+};
+use crate::legacy::case::{CacheCondition, Data, FixtureBuilder, State};
+#[cfg(test)]
+use crate::legacy::suite::ResolvedRun;
+#[cfg(test)]
+use crate::legacy::suite::ResolvedSuite;
+#[cfg(test)]
+use crate::legacy::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
+use crate::machine::MachineIdentityV1;
+#[cfg(test)]
+use crate::machine::capture_machine_identity;
+#[cfg(test)]
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
+#[cfg(test)]
 use crate::reset::{
     ClonefileTemplate, MetadataDigest, PHYSICAL_TREE_DIGEST_ALGORITHM, PhysicalDigest,
     PlainCopyTemplate, TraversalLimits, accept_clonefile_template_handoff,
@@ -53,12 +90,8 @@ use crate::reset::{
 };
 #[cfg(test)]
 use crate::reset::{digest_metadata_tree, digest_physical_tree, verify_physical_tree};
-use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
+#[cfg(test)]
 use crate::supervisor::{SupervisionInput, supervise_repetition};
-use crate::worker_protocol::{
-    WorkerBuildV1, digest_worker_executable, open_and_digest_worker_executable,
-};
-use crate::{ResolvedRun, ResolvedSuite, validate_case};
 
 pub const RUNNER_OUTPUT_VERSION: u32 = 2;
 pub const FIXTURE_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -79,7 +112,9 @@ const RELEASE_PROFILE_ENVIRONMENT_OVERRIDES: &str =
     env!("OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES");
 const EFFECTIVE_CODEGEN_OPTIONS_PROVED: &str =
     env!("OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED");
+#[cfg(test)]
 const RUN_OWNER_STACK_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const FIXTURE_BUILD_WATCHDOG: Duration = Duration::from_secs(3_600);
 
 /// Invocation-only options. No option may override experiment identity.
@@ -106,6 +141,10 @@ pub struct RunnerError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RunnerErrorContext {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_settled_elapsed_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_partial_run: Option<Box<crate::gqt_runner::RunExecution>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub case_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point_id: Option<String>,
@@ -117,6 +156,8 @@ pub struct RunnerErrorContext {
     pub completed_samples: Vec<RepObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_sample: Option<Box<RepObservation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_settled_sample: Option<Box<crate::gqt_runner::GqtRepObservation>>,
     /// Complete verified prefix plus the identities needed to finalize a
     /// censored durable record. Kept out of the diagnostic envelope because a
     /// successful archive receipt is the authority for those raw samples.
@@ -133,6 +174,16 @@ pub struct RunnerErrorContext {
     pub quarantined_workspace: Option<PathBuf>,
 }
 
+impl RunnerErrorContext {
+    /// Remove completed evidence after a receipt or recovery envelope takes ownership.
+    pub fn clear_completed_prefix(&mut self) {
+        self.completed_runs.clear();
+        self.completed_samples.clear();
+        self.partial_run = None;
+        self.gqt_partial_run = None;
+    }
+}
+
 impl RunnerError {
     pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -142,6 +193,7 @@ impl RunnerError {
         }
     }
 
+    #[cfg(test)]
     fn with_run_identity(mut self, run: &ResolvedRun) -> Self {
         self.context.case_id = Some(run.case.definition.id.clone());
         self.context.point_id = Some(run.case.point_id.clone());
@@ -153,16 +205,19 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_completed_samples(mut self, samples: Vec<RepObservation>) -> Self {
         self.context.completed_samples = samples;
         self
     }
 
+    #[cfg(test)]
     fn with_completed_runs(mut self, runs: Vec<RunExecution>) -> Self {
         self.context.completed_runs = runs;
         self
     }
 
+    #[cfg(test)]
     fn with_partial_worker_identity(
         mut self,
         build: Option<&WorkerBuildV1>,
@@ -173,11 +228,25 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_partial_run(mut self, execution: RunExecution) -> Self {
         self.context.partial_run = Some(Box::new(execution));
         self
     }
 
+    pub(crate) fn with_gqt_settled_elapsed(mut self, elapsed_us: u64) -> Self {
+        self.context.gqt_settled_elapsed_us = Some(elapsed_us);
+        self
+    }
+    pub(crate) fn with_gqt_settled_sample(
+        mut self,
+        sample: crate::gqt_runner::GqtRepObservation,
+    ) -> Self {
+        self.context.gqt_settled_elapsed_us = Some(sample.elapsed_us);
+        self.context.gqt_settled_sample = Some(Box::new(sample));
+        self
+    }
+    #[cfg(test)]
     pub(crate) fn with_settled_sample(mut self, sample: RepObservation) -> Self {
         self.context.settled_sample = Some(Box::new(sample));
         self
@@ -188,6 +257,7 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_quarantined_workspace(mut self, path: PathBuf) -> Self {
         self.context.quarantined_workspace = Some(path);
         self
@@ -337,6 +407,8 @@ pub struct LogicalFixtureIdentityV1 {
     pub data: Data,
     pub state: State,
     pub logical_content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<crate::legacy::case::FixturePreparation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,31 +503,25 @@ impl MergeRouteObservation {
     }
 }
 
-const CURRENT_STABLE_MERGE_PHASES: [&str; 14] = [
+const CURRENT_STABLE_MERGE_PHASES: [&str; 11] = [
     "OuterPrepare",
     "ProvenInsertHistory",
     "ProvenInsertPlanScan",
     "TableWalk",
     "CandidateValidation",
     "FinalRevalidation",
-    "RecoveryArm",
     "PhysicalPublish",
     "KeyedStage",
     "KeyedCommit",
-    "RecoveryConfirm",
     "ManifestPublish",
-    "RecoveryCleanup",
     "OuterRestoreRefresh",
 ];
-const REQUIRED_GENERAL_TOP_LEVEL_PHASES: [&str; 9] = [
+const REQUIRED_GENERAL_TOP_LEVEL_PHASES: [&str; 6] = [
     "OuterPrepare",
     "CandidateValidation",
     "FinalRevalidation",
-    "RecoveryArm",
     "PhysicalPublish",
-    "RecoveryConfirm",
     "ManifestPublish",
-    "RecoveryCleanup",
     "OuterRestoreRefresh",
 ];
 const GENERAL_ROUTE_UNENTERED_PHASES: [&str; 2] = ["ProvenInsertHistory", "ProvenInsertPlanScan"];
@@ -493,13 +559,10 @@ pub(crate) fn test_general_merge_stored_phases(
         phase("TableWalk", 20, 10, table_walk_intervals),
         phase("CandidateValidation", 4, 4, 1),
         phase("FinalRevalidation", 5, 5, 1),
-        phase("RecoveryArm", 2, 2, 1),
         phase("PhysicalPublish", 100, 100, 1),
         phase("KeyedStage", 20, 10, merge_insert_calls),
         phase("KeyedCommit", 30, 15, merge_insert_calls),
-        phase("RecoveryConfirm", 2, 2, 1),
         phase("ManifestPublish", 6, 6, 1),
-        phase("RecoveryCleanup", 1, 1, 1),
         phase("OuterRestoreRefresh", 2, 2, 1),
     ]
 }
@@ -546,7 +609,8 @@ impl Display for MergePhaseTopologyError {
 /// Runner-v1 admits only its declared non-fast-forward general three-way
 /// route. `KeyedStage` and `KeyedCommit` are sub-buckets of
 /// `PhysicalPublish`; their expected interval count is the route's admitted
-/// merge-insert call count. Additive unknown phases remain valid only when
+/// constructive adapter call count (upsert, known-present update, and fenced
+/// insert). Additive unknown phases remain valid only when
 /// observed; a new zero-count phase must be classified here before the compact
 /// stored representation may omit it.
 pub(crate) fn validate_successful_merge_phase_topology(
@@ -564,54 +628,67 @@ pub(crate) fn validate_successful_merge_phase_topology(
             ),
         ));
     }
-    if route.stage_merge_insert_calls < expected_table_walks {
-        return Err(MergePhaseTopologyError::new(
-            "phase_topology_mismatch",
-            format!(
-                "route.stage_merge_insert_calls must be at least the diverged-table count: minimum={expected_table_walks}, observed={}",
-                route.stage_merge_insert_calls
-            ),
-        ));
-    }
-    if route.stage_merge_insert_rows < route.stage_merge_insert_calls {
-        return Err(MergePhaseTopologyError::new(
-            "phase_topology_mismatch",
-            format!(
-                "route.stage_merge_insert_rows must be at least the merge-insert call count: minimum={}, observed={}",
-                route.stage_merge_insert_calls, route.stage_merge_insert_rows
-            ),
-        ));
-    }
-    for (field, observed) in [
+    let mut constructive_calls = 0_u64;
+    let mut constructive_rows = 0_u64;
+    for (adapter, calls, rows) in [
         (
-            "route.stage_known_present_update_calls",
-            route.stage_known_present_update_calls,
+            "stage_merge_insert",
+            route.stage_merge_insert_calls,
+            route.stage_merge_insert_rows,
         ),
         (
-            "route.stage_known_present_update_rows",
+            "stage_known_present_update",
+            route.stage_known_present_update_calls,
             route.stage_known_present_update_rows,
         ),
         (
-            "route.stage_fenced_insert_calls",
+            "stage_fenced_insert",
             route.stage_fenced_insert_calls,
-        ),
-        (
-            "route.stage_fenced_insert_rows",
             route.stage_fenced_insert_rows,
         ),
-        (
-            "route.strict_insert_preflight_calls",
-            route.strict_insert_preflight_calls,
-        ),
     ] {
-        if observed != 0 {
+        if rows < calls || (calls == 0 && rows != 0) {
             return Err(MergePhaseTopologyError::new(
                 "phase_topology_mismatch",
                 format!(
-                    "{field} is not part of the general three-way route: expected=0, observed={observed}"
+                    "route.{adapter}_rows must cover every nonempty call and be zero without calls: calls={calls}, rows={rows}"
                 ),
             ));
         }
+        constructive_calls = constructive_calls.checked_add(calls).ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "phase_topology_overflow",
+                "constructive adapter call total does not fit u64".to_string(),
+            )
+        })?;
+        constructive_rows = constructive_rows.checked_add(rows).ok_or_else(|| {
+            MergePhaseTopologyError::new(
+                "phase_topology_overflow",
+                "constructive adapter row total does not fit u64".to_string(),
+            )
+        })?;
+    }
+    // General fixtures may update existing rows or insert disjoint rows on
+    // diverged sides. Exact-content verification owns those logical results;
+    // this gate requires constructive work plus the declared general walks.
+    if constructive_calls < expected_table_walks {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "constructive adapter calls must be at least the diverged-table count: minimum={expected_table_walks}, observed={constructive_calls}"
+            ),
+        ));
+    }
+    // General-route inserts use exact target preflight. A provenance shortcut
+    // has no preflight and is still refused by this route's phase contract.
+    if route.strict_insert_preflight_calls != route.stage_fenced_insert_calls {
+        return Err(MergePhaseTopologyError::new(
+            "phase_topology_mismatch",
+            format!(
+                "route.strict_insert_preflight_calls must match general-route fenced insert calls: expected={}, observed={}",
+                route.stage_fenced_insert_calls, route.strict_insert_preflight_calls
+            ),
+        ));
     }
 
     let mut by_name = BTreeMap::new();
@@ -750,12 +827,12 @@ pub(crate) fn validate_successful_merge_phase_topology(
     let keyed_commit = by_name.get("KeyedCommit").copied();
     for (name, phase) in [("KeyedStage", keyed_stage), ("KeyedCommit", keyed_commit)] {
         match phase {
-            Some(phase) if phase.interval_count != route.stage_merge_insert_calls => {
+            Some(phase) if phase.interval_count != constructive_calls => {
                 return Err(MergePhaseTopologyError::new(
                     "phase_topology_mismatch",
                     format!(
                         "{name} interval_count mismatch: expected={}, observed={}",
-                        route.stage_merge_insert_calls, phase.interval_count
+                        constructive_calls, phase.interval_count
                     ),
                 ));
             }
@@ -763,8 +840,7 @@ pub(crate) fn validate_successful_merge_phase_topology(
                 return Err(MergePhaseTopologyError::new(
                     "missing_phase_evidence",
                     format!(
-                        "successful general merge has {} merge-insert calls but is missing required phase `{name}`",
-                        route.stage_merge_insert_calls
+                        "successful general merge has {constructive_calls} constructive calls but is missing required phase `{name}`"
                     ),
                 ));
             }
@@ -847,6 +923,7 @@ pub struct WallClockSummary {
 /// pass the output of [`crate::load_suite`]; manually constructed values must
 /// exactly match the suite and case definitions currently loaded from the same
 /// canonical paths.
+#[cfg(test)]
 pub async fn execute_suite(
     suite: &ResolvedSuite,
     options: &RunOptions,
@@ -894,6 +971,7 @@ pub async fn execute_suite(
 }
 
 /// Execute one resolved suite entry.
+#[cfg(test)]
 pub async fn execute_run(run: &ResolvedRun, options: &RunOptions) -> RunnerResult<RunExecution> {
     enforce_release_build().map_err(|error| error.with_run_identity(run))?;
     refuse_unmodeled_runtime_overrides().map_err(|error| error.with_run_identity(run))?;
@@ -903,12 +981,14 @@ pub async fn execute_run(run: &ResolvedRun, options: &RunOptions) -> RunnerResul
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct ExecutionGuards {
     verify_environment: bool,
     isolate_repetitions: bool,
     allow_plain_copy: bool,
 }
 
+#[cfg(test)]
 impl ExecutionGuards {
     fn public() -> Self {
         Self {
@@ -925,7 +1005,7 @@ pub(crate) fn enforce_release_build() -> RunnerResult<()> {
         return Err(RunnerError::new(
             "release_build_required",
             format!(
-                "wall-clock execution requires Cargo profile=release, Cargo-reported opt-level=2, debug-assertions=false, the checked-in release-profile declaration, no build-script-visible encoded Rust flags, and no unsupported release-profile environment overrides: {}; effective LTO/codegen/strip options remain explicitly unproved until a controlled build receipt is available; run `cargo run --release --locked -p omnigraph-bench -- suite run ...`",
+                "wall-clock execution requires Cargo profile=release, Cargo-reported opt-level=2, debug-assertions=false, the checked-in release-profile declaration, no build-script-visible encoded Rust flags, and no unsupported release-profile environment overrides: {}; effective LTO/codegen/strip options remain explicitly unproved until a controlled build receipt is available; run `RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- suite run ...` (the workspace .cargo/config.toml sets --cfg tokio_unstable for development builds; the empty RUSTFLAGS clears it)",
                 configuration.message
             ),
         ));
@@ -952,11 +1032,11 @@ pub(crate) fn refuse_unmodeled_runtime_overrides() -> RunnerResult<()> {
     validate_runtime_overrides(std::env::vars_os())
 }
 
-fn is_omnigraph_runtime_override(name: &OsStr) -> bool {
+pub(crate) fn is_omnigraph_runtime_override(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("OMNIGRAPH_")
 }
 
-fn is_lance_runtime_override(name: &OsStr) -> bool {
+pub(crate) fn is_lance_runtime_override(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("LANCE_")
 }
 
@@ -1151,7 +1231,7 @@ fn expected_build_attestation_environment(name: &OsStr) -> Option<&'static str> 
     }
 }
 
-fn build_evidence(worker: Option<&WorkerBuildV1>) -> RunnerResult<BuildEvidence> {
+pub(crate) fn build_evidence(worker: Option<&WorkerBuildV1>) -> RunnerResult<BuildEvidence> {
     let build = match worker {
         Some(worker) => worker.clone(),
         None => worker_build_attestation(String::new())?,
@@ -1419,7 +1499,7 @@ fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct BoundWorkerSource {
+pub(crate) struct BoundWorkerSource {
     configured_executable: PathBuf,
     executable_file: Arc<File>,
     executable_bytes: u64,
@@ -1427,12 +1507,13 @@ struct BoundWorkerSource {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedWorker {
-    executable: PathBuf,
-    executable_sha256: String,
+pub(crate) struct ResolvedWorker {
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
 }
 
-fn validate_production_reset(case: &crate::case::CaseV1) -> RunnerResult<()> {
+#[cfg(test)]
+fn validate_production_reset(case: &crate::legacy::case::CaseV1) -> RunnerResult<()> {
     let linux_xfs_process_cold = cfg!(target_os = "linux")
         && matches!(
             &case.environment.backend,
@@ -1456,13 +1537,14 @@ fn validate_production_reset(case: &crate::case::CaseV1) -> RunnerResult<()> {
             "unsupported_runner_axis",
             "plain-copy requires verified Linux XFS instance-store NVMe with the process-fresh, preparation-only, page-cache-uncontrolled cache declaration",
         )),
-        ResetMode::S3Versioning => Err(RunnerError::new(
+        ResetMode::None | ResetMode::S3Versioning => Err(RunnerError::new(
             "unsupported_runner_axis",
             "runner-v1 does not implement S3 reset",
         )),
     }
 }
 
+#[cfg(test)]
 async fn execute_run_inner(
     run: &ResolvedRun,
     options: &RunOptions,
@@ -1533,6 +1615,7 @@ async fn execute_run_inner(
     })?
 }
 
+#[cfg(test)]
 async fn execute_owned_run(
     run: ResolvedRun,
     options: RunOptions,
@@ -1621,7 +1704,7 @@ async fn execute_owned_run(
                         RunnerError::new("fixture_handoff_failed", error.to_string())
                     })?,
                 ),
-                ResetMode::S3Versioning => {
+                ResetMode::None | ResetMode::S3Versioning => {
                     return Err(RunnerError::new(
                         "unsupported_runner_axis",
                         "local runner cannot accept an S3 reset handoff",
@@ -1788,7 +1871,8 @@ async fn execute_owned_run(
     })
 }
 
-fn unix_time_millis() -> RunnerResult<u64> {
+#[cfg(test)]
+pub(crate) fn unix_time_millis() -> RunnerResult<u64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {
@@ -1805,6 +1889,7 @@ fn unix_time_millis() -> RunnerResult<u64> {
     })
 }
 
+#[cfg(test)]
 fn stamp_frozen_fixture(
     run: &ResolvedRun,
     build: &FixtureBuildSummary,
@@ -1829,6 +1914,7 @@ fn stamp_frozen_fixture(
             data: run.case.definition.fixture.data.clone(),
             state: run.case.definition.fixture.state.clone(),
             logical_content_sha256: build.logical_content_sha256.clone(),
+            preparation: run.case.definition.fixture.preparation,
         },
         physical: PhysicalFixtureIdentityV1 {
             digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),
@@ -1852,6 +1938,7 @@ fn stamp_frozen_fixture(
     })
 }
 
+#[cfg(test)]
 fn validate_execution_run(run: &ResolvedRun) -> RunnerResult<()> {
     if !(1..=MAX_REPETITIONS_PER_CASE).contains(&run.repetitions) {
         return Err(RunnerError::new(
@@ -1888,8 +1975,9 @@ fn validate_execution_run(run: &ResolvedRun) -> RunnerResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_execution_suite(suite: &ResolvedSuite) -> RunnerResult<()> {
-    let sealed = crate::load_suite(&suite.suite_path)
+    let sealed = crate::legacy::suite::load_suite(&suite.suite_path)
         .into_result()
         .map_err(|diagnostics| {
             RunnerError::new(
@@ -1918,6 +2006,7 @@ fn validate_execution_suite(suite: &ResolvedSuite) -> RunnerResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_worker(
     options: &RunOptions,
     guards: ExecutionGuards,
@@ -1934,7 +2023,7 @@ fn resolve_worker(
     resolve_bound_worker(executable).map(Some)
 }
 
-fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
+pub(crate) fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
     let executable = std::fs::canonicalize(executable).map_err(|error| {
         RunnerError::new(
             "worker_executable_error",
@@ -1991,7 +2080,10 @@ fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
     })
 }
 
-fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResult<ResolvedWorker> {
+pub(crate) fn stage_bound_worker(
+    source: BoundWorkerSource,
+    workspace: &Path,
+) -> RunnerResult<ResolvedWorker> {
     let executable = workspace.join("bound-worker-v1");
     let mut input = source.executable_file.try_clone().map_err(|error| {
         RunnerError::new(
@@ -2137,11 +2229,13 @@ fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResu
     })
 }
 
+#[cfg(test)]
 enum FrozenTemplate {
     Clonefile(ClonefileTemplate),
     PlainCopy(PlainCopyTemplate),
 }
 
+#[cfg(test)]
 impl FrozenTemplate {
     fn physical_digest(&self) -> &PhysicalDigest {
         match self {
@@ -2183,6 +2277,7 @@ impl FrozenTemplate {
     }
 }
 
+#[cfg(test)]
 fn run_supervised_repetitions(
     workspace: &tempfile::TempDir,
     template: FrozenTemplate,
@@ -2256,6 +2351,8 @@ fn run_supervised_repetitions(
                 .map(Duration::from_secs),
             #[cfg(test)]
             auxiliary_deadline_override: None,
+            #[cfg(test)]
+            post_settle_deadline_override: None,
         });
 
         if result
@@ -2357,6 +2454,7 @@ fn run_supervised_repetitions(
     Ok((samples, attested_build, attested_machine))
 }
 
+#[cfg(test)]
 fn supervised_prefix_error(
     error: RunnerError,
     samples: Vec<RepObservation>,
@@ -2368,6 +2466,7 @@ fn supervised_prefix_error(
         .with_partial_worker_identity(build, machine)
 }
 
+#[cfg(test)]
 fn supervise_workspace(
     workspace: tempfile::TempDir,
     template: FrozenTemplate,
@@ -2413,6 +2512,7 @@ fn supervise_workspace(
     }
 }
 
+#[cfg(test)]
 fn containment_proven(error: &RunnerError) -> bool {
     error
         .context
@@ -2425,6 +2525,7 @@ fn containment_proven(error: &RunnerError) -> bool {
         })
 }
 
+#[cfg(test)]
 async fn run_in_process_repetitions(
     _workspace: &tempfile::TempDir,
     template: &FrozenTemplate,
@@ -2462,6 +2563,7 @@ async fn run_in_process_repetitions(
     Ok(samples)
 }
 
+#[cfg(test)]
 fn remove_active_tree(active_root: &Path) -> RunnerResult<()> {
     match std::fs::symlink_metadata(active_root) {
         Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(active_root)
@@ -2486,6 +2588,7 @@ fn remove_active_tree(active_root: &Path) -> RunnerResult<()> {
     }
 }
 
+#[cfg(test)]
 fn scratch_workspace(options: &RunOptions) -> RunnerResult<tempfile::TempDir> {
     match &options.scratch_root {
         Some(root) => tempfile::Builder::new()
@@ -2503,6 +2606,7 @@ fn scratch_workspace(options: &RunOptions) -> RunnerResult<tempfile::TempDir> {
     })
 }
 
+#[cfg(test)]
 fn local_environment(
     run: &ResolvedRun,
     scratch_path: &Path,
@@ -2547,6 +2651,7 @@ pub(crate) fn phase_observations(readings: Vec<MergeTimingReading>) -> Vec<Phase
 /// A sample carries measurements, not the engine's complete stable-phase
 /// enumeration. This filter is valid only after the raw snapshot passes
 /// [`validate_successful_merge_phase_topology`].
+#[cfg(test)]
 fn observed_phase_evidence(phases: Vec<PhaseObservation>) -> Vec<PhaseObservation> {
     phases
         .into_iter()
@@ -2554,6 +2659,7 @@ fn observed_phase_evidence(phases: Vec<PhaseObservation>) -> Vec<PhaseObservatio
         .collect()
 }
 
+#[cfg(test)]
 async fn execute_rep(
     repetition: u32,
     root: &Path,
@@ -2578,12 +2684,14 @@ async fn execute_rep(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum CachePreparationAction {
     PreparationOnly,
     WarmSameHandle { iterations: u32 },
     WarmThenReopen { iterations: u32 },
 }
 
+#[cfg(test)]
 fn cache_preparation_action(condition: &CacheCondition) -> RunnerResult<CachePreparationAction> {
     match (
         condition.process,
@@ -2629,8 +2737,10 @@ pub(crate) trait MeasurementSignals {
     fn settled(&mut self, elapsed_us: u64) -> RunnerResult<()>;
 }
 
+#[cfg(test)]
 struct ImmediateMeasurementSignals;
 
+#[cfg(test)]
 impl MeasurementSignals for ImmediateMeasurementSignals {
     fn ready(&mut self) -> RunnerResult<()> {
         Ok(())
@@ -2642,6 +2752,7 @@ impl MeasurementSignals for ImmediateMeasurementSignals {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
     repetition: u32,
     root: &Path,
@@ -2679,6 +2790,7 @@ pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_rep_body<S: MeasurementSignals>(
     repetition: u32,
     root: &Path,
@@ -2774,7 +2886,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     let manifest_calls = manifest_counter.take();
     let table_calls = table_counter.take();
     let control_calls = control_before.delta(ControlSnapshot::read(&control_counts))?;
-    if outcome != MergeOutcome::Merged {
+    if outcome.outcome != MergeOutcome::Merged {
         return Err(RunnerError::new(
             "vacuous_merge",
             format!(
@@ -2859,9 +2971,10 @@ async fn execute_rep_body<S: MeasurementSignals>(
     }
 }
 
+#[cfg(test)]
 async fn open_counting(
     root_uri: &str,
-) -> RunnerResult<(Omnigraph, Arc<StorageReadCounts>, PreparationWriteGate)> {
+) -> RunnerResult<(Session, Arc<StorageReadCounts>, PreparationWriteGate)> {
     let storage = omnigraph::storage::storage_for_uri(root_uri).map_err(|error| {
         RunnerError::new(
             "storage_open_failed",
@@ -2870,19 +2983,24 @@ async fn open_counting(
     })?;
     let (storage, preparation_gate) = guard_preparation_writes(storage, root_uri);
     let (storage, counts) = CountingStorageAdapter::new(storage);
-    let db = Omnigraph::open_with_storage(root_uri, storage)
-        .await
-        .map_err(|error| {
-            RunnerError::new(
-                "engine_open_failed",
-                format!("could not open repetition store {root_uri}: {error}"),
-            )
-        })?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open_with_storage(root_uri, storage)
+                .await
+                .map_err(|error| {
+                    RunnerError::new(
+                        "engine_open_failed",
+                        format!("could not open repetition store {root_uri}: {error}"),
+                    )
+                })?,
+        ),
+        SessionSettings::default(),
+    );
     Ok((db, counts, preparation_gate))
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ControlSnapshot {
+pub(crate) struct ControlSnapshot {
     read_text: u64,
     read_text_if_exists: u64,
     read_text_versioned: u64,
@@ -2894,7 +3012,7 @@ struct ControlSnapshot {
 }
 
 impl ControlSnapshot {
-    fn read(counts: &StorageReadCounts) -> Self {
+    pub(crate) fn read(counts: &StorageReadCounts) -> Self {
         Self {
             read_text: counts.read_text(),
             read_text_if_exists: counts.read_text_if_exists(),
@@ -2907,7 +3025,7 @@ impl ControlSnapshot {
         }
     }
 
-    fn delta(self, after: Self) -> RunnerResult<ControlCallObservation> {
+    pub(crate) fn delta(self, after: Self) -> RunnerResult<ControlCallObservation> {
         fn checked(after: u64, before: u64, field: &str) -> RunnerResult<u64> {
             after.checked_sub(before).ok_or_else(|| {
                 RunnerError::new(
@@ -2938,6 +3056,7 @@ impl ControlSnapshot {
     }
 }
 
+#[cfg(test)]
 fn summarize_wall_clock(samples: &[RepObservation]) -> RunnerResult<WallClockSummary> {
     if samples.is_empty() {
         return Err(RunnerError::new(
@@ -2964,6 +3083,7 @@ fn summarize_wall_clock(samples: &[RepObservation]) -> RunnerResult<WallClockSum
     })
 }
 
+#[cfg(test)]
 fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     debug_assert!(!sorted.is_empty());
     debug_assert!((1..=100).contains(&percentile));
@@ -2975,6 +3095,7 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     sorted[rank]
 }
 
+#[cfg(test)]
 fn utf8_path<'a>(path: &'a Path, label: &str) -> RunnerResult<&'a str> {
     path.to_str().ok_or_else(|| {
         RunnerError::new(
@@ -2989,7 +3110,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::parse_case;
+    use crate::legacy::case::parse_case;
 
     fn general_route(merge_insert_calls: u64) -> MergeRouteObservation {
         test_general_merge_route(2, merge_insert_calls)
@@ -3179,23 +3300,116 @@ mod tests {
             MergePhaseEvidenceForm::StoredSample,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("stage_merge_insert_calls"));
+        assert!(error.to_string().contains("constructive adapter calls"));
 
-        let mut wrong_route = general_route(2);
-        wrong_route.stage_known_present_update_calls = 1;
-        wrong_route.stage_known_present_update_rows = 1;
+        for (upserts, updates, inserts) in [(2, 0, 0), (0, 2, 0), (0, 0, 2), (0, 2, 2), (1, 1, 1)] {
+            let mut split_route = general_route(upserts);
+            split_route.stage_known_present_update_calls = updates;
+            split_route.stage_known_present_update_rows = updates;
+            split_route.stage_fenced_insert_calls = inserts;
+            split_route.stage_fenced_insert_rows = inserts;
+            split_route.strict_insert_preflight_calls = inserts;
+            let keyed_calls = upserts + updates + inserts;
+            let split_phases = test_general_merge_stored_phases(2, keyed_calls);
+            validate_successful_merge_phase_topology(
+                &split_phases,
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap();
+            let mut raw_split_phases = split_phases;
+            raw_split_phases.push(phase("ProvenInsertHistory", 0, 0, 0));
+            raw_split_phases.push(phase("ProvenInsertPlanScan", 0, 0, 0));
+            validate_successful_merge_phase_topology(
+                &raw_split_phases,
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::RawSnapshot,
+            )
+            .unwrap();
+        }
+
+        let mut wrong_keyed_count = general_route(2);
+        wrong_keyed_count.stage_known_present_update_calls = 1;
+        wrong_keyed_count.stage_known_present_update_rows = 1;
         let error = validate_successful_merge_phase_topology(
             &phases,
-            &wrong_route,
+            &wrong_keyed_count,
             2,
             MergePhaseEvidenceForm::StoredSample,
         )
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("stage_known_present_update_calls")
-        );
+        assert!(error.to_string().contains("KeyedStage interval_count"));
+
+        let mut insufficient_constructive_work = general_route(0);
+        insufficient_constructive_work.stage_fenced_insert_calls = 1;
+        insufficient_constructive_work.stage_fenced_insert_rows = 1;
+        insufficient_constructive_work.strict_insert_preflight_calls = 1;
+        let error = validate_successful_merge_phase_topology(
+            &phases,
+            &insufficient_constructive_work,
+            2,
+            MergePhaseEvidenceForm::StoredSample,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("diverged-table count"));
+
+        let mut split_route = general_route(0);
+        split_route.stage_known_present_update_calls = 2;
+        split_route.stage_known_present_update_rows = 2;
+        split_route.stage_fenced_insert_calls = 2;
+        split_route.stage_fenced_insert_rows = 2;
+        for preflights in [0, 1, 3] {
+            split_route.strict_insert_preflight_calls = preflights;
+            let error = validate_successful_merge_phase_topology(
+                &test_general_merge_stored_phases(2, 4),
+                &split_route,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("strict_insert_preflight_calls"));
+        }
+        split_route.strict_insert_preflight_calls = 2;
+        for (updates, update_rows, inserts, insert_rows, field) in [
+            (2, 0, 2, 2, "stage_known_present_update_rows"),
+            (0, 2, 2, 2, "stage_known_present_update_rows"),
+            (2, 2, 2, 0, "stage_fenced_insert_rows"),
+            (2, 2, 0, 2, "stage_fenced_insert_rows"),
+        ] {
+            let mut invalid = split_route.clone();
+            invalid.stage_known_present_update_calls = updates;
+            invalid.stage_known_present_update_rows = update_rows;
+            invalid.stage_fenced_insert_calls = inserts;
+            invalid.stage_fenced_insert_rows = insert_rows;
+            let error = validate_successful_merge_phase_topology(
+                &phases,
+                &invalid,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
+        for (calls, rows, expected) in [
+            (u64::MAX, u64::MAX, "call total"),
+            (1, u64::MAX, "row total"),
+        ] {
+            let mut overflow = general_route(calls);
+            overflow.stage_merge_insert_rows = rows;
+            overflow.stage_known_present_update_calls = 1;
+            overflow.stage_known_present_update_rows = 1;
+            let error = validate_successful_merge_phase_topology(
+                &phases,
+                &overflow,
+                2,
+                MergePhaseEvidenceForm::StoredSample,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "phase_topology_overflow");
+            assert!(error.to_string().contains(expected));
+        }
 
         let mut zero_rows = general_route(2);
         zero_rows.stage_merge_insert_rows = 0;
@@ -3851,7 +4065,7 @@ version: 1
 id: tiny-runner
 scenario: branch-merge-v1
 fixture:
-  builder: { kind: synthetic-branch-merge, version: 2, seed: 0 }
+  builder: { kind: synthetic-branch-merge, version: 3, seed: 0 }
   data:
     provenance: synthetic
     tables: 2
@@ -4024,7 +4238,7 @@ protocol:
 
     fn checked_catalog_run(repetitions: u32) -> ResolvedRun {
         let case = parse_case(include_str!(
-            "../../../benchmarks/cases/branch-merge-d50-warm.case-v1.yaml"
+            "../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"
         ))
         .into_result()
         .unwrap();
@@ -4035,13 +4249,23 @@ protocol:
         }
     }
 
-    fn checked_catalog_suite() -> ResolvedSuite {
-        crate::load_suite(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/suites/local-smoke.suite-v1.yaml"),
+    fn checked_catalog_suite() -> (tempfile::TempDir, ResolvedSuite) {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = directory.path().join("cases");
+        let suites = directory.path().join("suites");
+        std::fs::create_dir(&cases).unwrap();
+        std::fs::create_dir(&suites).unwrap();
+        std::fs::write(
+            cases.join("legacy.case-v1.yaml"),
+            include_str!("../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"),
         )
-        .into_result()
-        .unwrap()
+        .unwrap();
+        let path = suites.join("legacy.suite-v1.yaml");
+        std::fs::write(&path, "version: 1\nname: legacy-smoke\nruns:\n  - { case: ../cases/legacy.case-v1.yaml, repetitions: 5 }\n").unwrap();
+        let suite = crate::legacy::suite::load_suite(&path)
+            .into_result()
+            .unwrap();
+        (directory, suite)
     }
 
     #[test]
@@ -4061,7 +4285,7 @@ protocol:
 
     #[test]
     fn execution_reseals_the_complete_resolved_suite() {
-        let suite = checked_catalog_suite();
+        let (_directory, suite) = checked_catalog_suite();
         validate_execution_suite(&suite).unwrap();
 
         let mut mislabeled = suite.clone();

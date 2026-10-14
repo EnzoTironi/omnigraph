@@ -1,6 +1,8 @@
 <!--
   Thanks for contributing! See CONTRIBUTING.md and GOVERNANCE.md.
   A substantive PR needs a backing accepted issue or accepted RFC.
+  Title: `type(scope)!: lowercase description` (types and examples in
+  CONTRIBUTING.md, Pull Requests); the `PR Title` check refuses anything else.
 -->
 
 ## What & why
@@ -13,8 +15,8 @@
 
 - [ ] Fixes an **accepted** issue: Closes #
       (a fix under `crates/`, `tools/`, or the root manifests carries an `issue_N_*.gqt` case or an `issue_N` test in the diff, or asks a maintainer for the `no-repro` label; `Fix Regression Gate` checks, `docs/dev/ci.md`)
-- [ ] Is an RFC PR, or implements an **accepted** RFC: <link to docs/rfcs/NNNN-*.md>
-- [ ] **Trivial fast-lane** (typo / docs / dependency bump / comment / one-line CI) — no issue/RFC required
+- [ ] Is an RFC PR, or implements an **accepted** RFC: <link to the RFC file under docs/rfcs/>
+- [ ] **Trivial fast-lane** (typo / docs / dependency bump without a `deny.toml` edit / comment / one-line CI) — no issue/RFC required
 
 ## Checklist
 

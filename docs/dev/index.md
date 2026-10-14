@@ -24,7 +24,6 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Three-way branch integration | [Merge](merge.md) |
 | Managed and external Blob boundaries | [Blob internals](blob.md) |
 | Cluster apply, serving snapshots, and writer ownership | [Control plane](control-plane.md) |
-| Configuration authority, CLI operations, and coherence review | [Configuration and CLI framework](config-cli-framework.md) |
 | Bounded graph-batch ingestion | [Ingestion](ingestion.md) |
 | Release, wire, storage, and dependency compatibility | [Versioning](versioning.md) |
 
@@ -34,7 +33,7 @@ change boundaries, and test ownership. Design history and proposals belong in
 |---|---|
 | Find the owning suite, helpers, failpoints, and cloud gates | [Testing](testing.md) |
 | Understand PR and release workflows | [CI and releases](ci.md) |
-| Change required checks or repository policy | [Branch protection](branch-protection.md) |
+| Change required checks, repository policy, or who is requested to review | [Branch protection](branch-protection.md) |
 | Write or reorganize documentation | [Documentation guide](documentation.md) |
 | Review a parser boundary regression example | [Camel-case filtering case study](case-studies/camel-case-filtering.md) |
 

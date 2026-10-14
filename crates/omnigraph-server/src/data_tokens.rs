@@ -5,30 +5,20 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use color_eyre::eyre::{Result, bail, eyre};
-use omnigraph_policy::PolicyAction;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use p256::pkcs8::{DecodePublicKey, EncodePublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::graph_id::GraphId;
-use crate::identity::{AuthSource, ResolvedActor, Scope};
+use crate::identity::{AuthenticatedActor, ResolvedActor};
 
 pub const MAX_TOKEN_BYTES: usize = 8_192;
 pub const MAX_TRUST_BYTES: usize = 65_536;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DataGrant {
-    pub graph_id: GraphId,
-    pub actions: Vec<PolicyAction>,
-}
 
 /// Only authenticated, non-development principal classes enter this profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,10 +35,11 @@ pub enum DataAssurance {
     VerifiedWorkload,
 }
 
-/// Parsed claims are authenticated only after `DataTokenTrust::verify_at`.
+/// Version 2 authenticates identity only. All graph permissions come from
+/// applied policy; strict parsing refuses permission or membership claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DataTokenClaims {
+pub struct IdentityTokenClaims {
     pub version: u8,
     pub iss: String,
     pub aud: String,
@@ -61,7 +52,6 @@ pub struct DataTokenClaims {
     pub iat: u64,
     pub exp: u64,
     pub jti: String,
-    pub grants: Vec<DataGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,10 +190,19 @@ impl DataTokenTrust {
         })
     }
 
-    /// Verify using an explicit admission time. Failure is deliberately opaque:
-    /// callers must not log a credential or expose its unverified claims.
+    /// Verify and return the identity projection. For authenticated
+    /// claims and request authorization, use [`Self::verify_authenticated_at`].
     #[must_use]
     pub fn verify_at(&self, token: &str, now: u64) -> Option<ResolvedActor> {
+        self.verify_authenticated_at(token, now)
+            .map(|actor| actor.actor().clone())
+    }
+
+    /// Verify using an explicit admission time and retain the exact signed
+    /// identity. Failure is deliberately opaque: callers
+    /// must not log a credential or expose its unverified claims.
+    #[must_use]
+    pub fn verify_authenticated_at(&self, token: &str, now: u64) -> Option<AuthenticatedActor> {
         if token.len() > MAX_TOKEN_BYTES {
             return None;
         }
@@ -228,63 +227,31 @@ impl DataTokenTrust {
         )
         .ok()?;
         let claims_bytes = URL_SAFE_NO_PAD.decode(claims_part).ok()?;
-        let claims: DataTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
-        if !self.valid_claims(&claims, now) {
-            return None;
-        }
-        Some(ResolvedActor {
-            actor_id: Arc::from(format!("principal:{}", claims.sub)),
-            tenant_id: None,
-            scopes: vec![Scope::DataToken],
-            source: AuthSource::SignedData,
-            data_token: Some(Arc::new(claims)),
-            selected_graph: None,
-        })
+        let claims: IdentityTokenClaims = serde_json::from_slice(&claims_bytes).ok()?;
+        self.valid_identity_claims(&claims, now)
+            .then(|| AuthenticatedActor::signed_identity(claims))
     }
 
-    fn valid_claims(&self, claims: &DataTokenClaims, now: u64) -> bool {
+    fn valid_identity_claims(&self, claims: &IdentityTokenClaims, now: u64) -> bool {
         let Some(ttl) = claims.exp.checked_sub(claims.iat) else {
             return false;
         };
-        if claims.version != 1
-            || claims.iss != self.issuer
-            || claims.aud != self.audience
-            || claims.account_id != self.account_id
-            || claims.cluster_id != self.cluster_id
-            || claims.cluster_incarnation != self.cluster_incarnation
-            || !valid_id(&claims.sub)
-            || !valid_id(&claims.jti)
-            || !(60..=86_400).contains(&ttl)
-            || claims.exp <= now
-            || claims.iat > now.saturating_add(30)
-            || !(1..=64).contains(&claims.grants.len())
-            || !matches!(
+        claims.version == 2
+            && claims.iss == self.issuer
+            && claims.aud == self.audience
+            && claims.account_id == self.account_id
+            && claims.cluster_id == self.cluster_id
+            && claims.cluster_incarnation == self.cluster_incarnation
+            && valid_id(&claims.sub)
+            && valid_id(&claims.jti)
+            && (60..=86_400).contains(&ttl)
+            && claims.exp > now
+            && claims.iat <= now.saturating_add(30)
+            && matches!(
                 (claims.principal_kind, claims.assurance),
                 (PrincipalKind::Human, DataAssurance::VerifiedHuman)
                     | (PrincipalKind::Automation, DataAssurance::VerifiedWorkload)
             )
-        {
-            return false;
-        }
-        let mut graphs = HashSet::new();
-        claims.grants.iter().all(|grant| {
-            let mut actions = HashSet::new();
-            graphs.insert(grant.graph_id.as_str())
-                && (1..=8).contains(&grant.actions.len())
-                && grant.actions.iter().all(|action| {
-                    matches!(
-                        action,
-                        PolicyAction::Read
-                            | PolicyAction::Export
-                            | PolicyAction::Change
-                            | PolicyAction::BranchCreate
-                            | PolicyAction::BranchDelete
-                            | PolicyAction::BranchMerge
-                            | PolicyAction::InvokeQuery
-                            | PolicyAction::GraphList
-                    ) && actions.insert(action)
-                })
-        })
     }
 }
 

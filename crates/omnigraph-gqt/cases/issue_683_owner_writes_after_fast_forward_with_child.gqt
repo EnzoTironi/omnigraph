@@ -1,0 +1,104 @@
+# red_on: 5c4ca700d9dc5470bac4fd8d6a7f534699a2b137
+# issue: 683
+# notes: After main fast-forwards into b0, b0 writes on a fresh table fork.
+# notes: The lazy child b1 keeps its former b0 rows across a restart;
+# notes: the new b0 write remains isolated from both b1 and main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query b0_n1() {
+    insert Person { name: "n1" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create b1 from b0
+
+--- expect ok
+
+--- mutate
+branch merge b0
+
+--- expect outcome: fast_forward
+
+--- mutate
+query main_n0() {
+    insert Person { name: "n0" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge main into b0
+
+--- expect outcome: fast_forward
+
+--- mutate branch: b0
+query b0_n2() {
+    insert Person { name: "n2" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query branch: b1
+query b1_persons() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"a"}
+{"p.name":"n1"}
+
+--- expect shape
+p.name: String
+
+--- query branch: b0
+query b0_reads_its_fresh_fork() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"a"}
+{"p.name":"n1"}
+{"p.name":"n0"}
+{"p.name":"n2"}
+
+--- expect shape
+p.name: String
+
+--- query branch: main
+query main_kept_its_rows() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"a"}
+{"p.name":"n1"}
+{"p.name":"n0"}
+
+--- expect shape
+p.name: String

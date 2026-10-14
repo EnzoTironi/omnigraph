@@ -13,22 +13,25 @@
 //! `(entity kind: nodes first, opaque type identity, id, operation rank)`;
 //! the continuation key inside a page token names a position in that order.
 
-use std::collections::BTreeSet;
-
 use lance::Dataset;
+use omnigraph_compiler::SystemColumns;
 
 use super::candidate_scan::{CandidatePlan, EmitSource};
 use super::model::{
     COMMIT_CHANGES_MAX_BYTES, ChangeEntityKind, ChangeFeedScope, ChangeOpKind, EntityEndpoints,
     EntityImage, GraphEntityChange, GraphTypeRef,
 };
-use super::row_compare::{OrderedRows, RawRow, ScanTargets, rows_equal, user_schema_fingerprint};
+use super::row_compare::{
+    OrderedRows, RawRow, ScanTargets, rows_equal_across_vintages, user_schema_fingerprint,
+};
 use super::token::{cursor_rejected, opaque_type_id};
 use super::{changed_table_intervals, parse_table_key};
 use crate::db::DatasetEntry;
+use crate::db::Snapshot;
 use crate::db::logical_row_image;
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::system_columns_at_image;
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 use crate::table_store::TableStore;
 
 /// Validate caller-supplied page limits against the server-owned ceilings.
@@ -122,22 +125,26 @@ pub(crate) enum CommitEnumeration {
 /// Materialize the exact logical image for one row entering the page: the
 /// commit-era flat row image with the logical `id` hoisted out and, for
 /// edges, `src`/`dst` hoisted into public `{from, to}` endpoints. This is the
-/// only place Blob payloads are read for emitted changes.
+/// only place Blob payloads are read for emitted changes. Each managed Blob
+/// column takes one batched read of this row alone: the page admits one change
+/// at a time against its byte budget, so reading the next rows' payloads ahead
+/// could fetch values a closed page discards.
 async fn emitted_image(
     dataset: &Dataset,
     raw: &RawRow,
     kind: ChangeEntityKind,
+    system_columns: SystemColumns,
 ) -> Result<EntityImage> {
     crate::instrumentation::record_change_image_materialized();
-    let mut properties = logical_row_image(dataset, &raw.slice, 0).await?;
-    properties.remove("id");
+    let mut properties = logical_row_image(dataset, &raw.slice, 0, system_columns.id).await?;
+    properties.remove(system_columns.id);
     let endpoints = if kind == ChangeEntityKind::Edge {
         let from = properties
-            .remove("src")
+            .remove(system_columns.src)
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| OmniError::manifest_internal("edge image is missing src"))?;
         let to = properties
-            .remove("dst")
+            .remove(system_columns.dst)
             .and_then(|value| value.as_str().map(str::to_string))
             .ok_or_else(|| OmniError::manifest_internal("edge image is missing dst"))?;
         Some(EntityEndpoints { from, to })
@@ -173,6 +180,9 @@ pub(crate) async fn next_emit(
     from: &mut OrderedRows,
     to: &mut OrderedRows,
     scope: &ChangeFeedScope,
+    from_columns: SystemColumns,
+    to_columns: SystemColumns,
+    is_edge: bool,
 ) -> Result<Option<Emit>> {
     loop {
         let left_id = from.peek().await?.map(|row| row.id.clone());
@@ -190,7 +200,17 @@ pub(crate) async fn next_emit(
             (Some(_), Some(_)) => {
                 let left = from.pop().await?.expect("peeked row present");
                 let right = to.pop().await?.expect("peeked row present");
-                if rows_equal(from.dataset(), &left, to.dataset(), &right).await? {
+                if rows_equal_across_vintages(
+                    from.dataset(),
+                    &left,
+                    to.dataset(),
+                    &right,
+                    from_columns,
+                    to_columns,
+                    is_edge,
+                )
+                .await?
+                {
                     continue;
                 }
                 Emit::Update {
@@ -217,9 +237,13 @@ pub(crate) struct IntervalPlan {
     type_name: String,
     /// The paired manifest entries (begin/end version, branch, identity).
     pub(crate) from_entry: DatasetEntry,
-    pub(crate) to_entry: DatasetEntry,
     pub(crate) from_dataset: Dataset,
     pub(crate) to_dataset: Dataset,
+    /// The system column spellings each side's image carries, resolved from
+    /// the image (RFC 0040 Historical reads); the two differ only across the
+    /// upgrade commit.
+    pub(crate) from_columns: SystemColumns,
+    pub(crate) to_columns: SystemColumns,
     /// The candidate-pruning decision, computed by `plan_intervals` BEFORE the
     /// final post-open head witness. The adjacent transaction is referenced by
     /// the already-pinned child manifest, and `Some` stores the complete
@@ -242,12 +266,29 @@ async fn resolve_digest_position(
     key: &ContinuationKey,
 ) -> Result<String> {
     debug_assert!(key.position.is_digest());
-    let mut left =
-        OrderedRows::open(plan.from_dataset.clone(), Some(key.position.scan_after())).await?;
-    let mut right =
-        OrderedRows::open(plan.to_dataset.clone(), Some(key.position.scan_after())).await?;
+    let mut left = OrderedRows::open(
+        plan.from_dataset.clone(),
+        Some(key.position.scan_after()),
+        plan.from_columns.id,
+    )
+    .await?;
+    let mut right = OrderedRows::open(
+        plan.to_dataset.clone(),
+        Some(key.position.scan_after()),
+        plan.to_columns.id,
+    )
+    .await?;
     let mut resolved: Option<String> = None;
-    while let Some(emit) = next_emit(&mut left, &mut right, scope).await? {
+    while let Some(emit) = next_emit(
+        &mut left,
+        &mut right,
+        scope,
+        plan.from_columns,
+        plan.to_columns,
+        plan.kind == ChangeEntityKind::Edge,
+    )
+    .await?
+    {
         let (id, operation_rank) = match &emit {
             Emit::Insert(row) | Emit::Delete(row) => (row.id.as_str(), emit.op().rank()),
             Emit::Update { after, .. } => (after.id.as_str(), emit.op().rank()),
@@ -283,6 +324,26 @@ fn schema_boundary(graph_commit_id: &str, table_key: &str) -> OmniError {
     }
 }
 
+decide_seam! {
+    /// A change-feed poll has passed the final post-open logical head witness
+    /// for one commit, and is about to plan each interval's emitter. Tests
+    /// delete and recreate a named branch here: any live read of the branch's
+    /// numeric-path history after this point (the replaceable read — version
+    /// manifests sit at numeric paths, unlike UUID-named data and transaction
+    /// files) would classify the interval from the REPLACEMENT branch's
+    /// transactions and can silently omit the original commit's deletes.
+    pub static CHANGE_FEED_POST_HEAD_WITNESS = ("change_feed.post_head_witness", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// A change-feed poll has reopened and re-proven a commit's manifest
+    /// snapshot, but has not yet opened the per-table datasets it names. Tests
+    /// delete and recreate a named branch here to prove the physical table open
+    /// re-proves the branch incarnation (via the manifest e_tag) rather than
+    /// reading the replacement branch's rows at the same path and version.
+    pub static CHANGE_FEED_PRE_TABLE_OPEN = ("change_feed.pre_table_open", Unreachable, [Fail]);
+}
+
 /// Prove the P→C pair compatible for entity diff and open every surviving
 /// paired lifetime, in the frozen `(kind rank, published type id)` order —
 /// the same opaque identity the emitted changes and continuation keys carry,
@@ -311,11 +372,9 @@ async fn plan_intervals(
     // (defense-in-depth; unavailable on an e_tag-less store) and the logical
     // post-open `reprove_named_branch_heads` below (load-bearing on every
     // store). Tests park here to exercise the window.
-    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_PRE_TABLE_OPEN)?;
+    fail(&CHANGE_FEED_PRE_TABLE_OPEN)?;
 
     let mut plans = Vec::with_capacity(intervals.len());
-    let mut parent_branches: BTreeSet<String> = BTreeSet::new();
-    let mut child_branches: BTreeSet<String> = BTreeSet::new();
     for interval in intervals {
         let table_key = interval.type_key();
         match (interval.from, interval.to) {
@@ -332,13 +391,17 @@ async fn plan_intervals(
             (Some(from), Some(to)) => {
                 let from_dataset = store.open_at_entry_verified(from).await?;
                 let to_dataset = store.open_at_entry_verified(to).await?;
-                if let Some(branch) = from.native_dataset_branch.as_deref() {
-                    parent_branches.insert(branch.to_string());
-                }
-                if let Some(branch) = to.native_dataset_branch.as_deref() {
-                    child_branches.insert(branch.to_string());
-                }
-                if user_schema_fingerprint(&from_dataset) != user_schema_fingerprint(&to_dataset) {
+                let from_columns = system_columns_at_image(from_dataset.schema(), table_key)?;
+                let to_columns = system_columns_at_image(to_dataset.schema(), table_key)?;
+                if user_schema_fingerprint(
+                    &from_dataset,
+                    from_columns,
+                    crate::db::manifest::is_edge_table_key(table_key),
+                ) != user_schema_fingerprint(
+                    &to_dataset,
+                    to_columns,
+                    crate::db::manifest::is_edge_table_key(table_key),
+                ) {
                     return Err(schema_boundary(graph_commit_id, table_key));
                 }
                 let (kind, type_name) = parse_table_key(table_key);
@@ -365,37 +428,24 @@ async fn plan_intervals(
                     kind,
                     type_name: type_name.to_string(),
                     from_entry: from.clone(),
-                    to_entry: to.clone(),
                     from_dataset,
                     to_dataset,
+                    from_columns,
+                    to_columns,
                     candidate_plan,
                 });
             }
             (None, None) => unreachable!("changed intervals have at least one endpoint"),
         }
     }
-    // The load-bearing second-window witness. The per-table opens above happen
-    // AFTER the commit's manifest-head proof and are keyed only by (branch
-    // path, numeric version), so a named branch deleted and recreated in that
-    // window retargets them to the replacement branch's rows. Re-prove each
-    // opened named branch LOGICALLY after all opens: a fresh, cache-bypassing
-    // manifest snapshot at the same pinned version must still report the same
-    // `graph_head` this enumeration's snapshot captured. A recreated fork's
-    // manifest at that version carries different lineage commit ids (or lacks
-    // the version entirely), so this fails closed on every store — including
-    // one that persists no table e_tags; the per-open e_tag comparison is
-    // defense-in-depth, not the witness. Ordering makes this sound: a
-    // recreation before any table open is detected here, and a recreation
-    // after this proof cannot have affected the already-opened handles. Main
-    // cannot undergo branch-name ABA and pays no extra manifest resolution.
-    reprove_named_branch_heads(store, parent, &parent_branches).await?;
-    reprove_named_branch_heads(store, child, &child_branches).await?;
+    reprove_named_branch_heads(store, parent).await?;
+    reprove_named_branch_heads(store, child).await?;
     // Nothing after this witness may read the branch's numeric-path history
     // live: version manifests sit at replaceable numeric paths (unlike
     // UUID-named data and transaction files), so a later live read would see a
     // recreated branch's history under this commit's label. Tests park here
     // and recreate the branch to pin that contract.
-    crate::failpoints::maybe_fail(crate::failpoints::names::CHANGE_FEED_POST_HEAD_WITNESS)?;
+    fail(&CHANGE_FEED_POST_HEAD_WITNESS)?;
     // The opaque ids are domain-scoped SHA-256 projections of distinct
     // immutable identities, so this order is total and deterministic.
     plans.sort_by(|left, right| {
@@ -407,32 +457,24 @@ async fn plan_intervals(
     Ok(plans)
 }
 
-/// Fail closed unless every named branch whose tables this enumeration just
-/// opened still resolves — via a fresh manifest open at the snapshot's pinned
-/// version — to the same `graph_head` the captured snapshot carries. See the
-/// call site in [`plan_intervals`] for the window this closes.
-async fn reprove_named_branch_heads(
-    store: &TableStore,
-    snapshot: &Snapshot,
-    branches: &BTreeSet<String>,
-) -> Result<()> {
-    for branch in branches {
-        // `branches` holds native fork refs; graph heads are keyed by the
-        // logical branch those forks belong to.
-        let branch = crate::branch_names::logical_branch_name(branch);
-        let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
-            store.root_uri(),
-            Some(branch),
-            snapshot.graph_manifest_version(),
-        )
-        .await?;
-        if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
-            return Err(OmniError::manifest(format!(
-                "change feed branch '{branch}' has no persisted native-branch \
-                 incarnation witness after the per-table opens; the branch was \
-                 deleted and recreated during the poll"
-            )));
-        }
+/// Reprove the captured graph branch after table opens, including on stores
+/// without table ETags. Table-fork ownership does not identify this graph branch.
+async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> Result<()> {
+    let Some(branch) = snapshot.graph_branch() else {
+        return Ok(());
+    };
+    let fresh = crate::db::manifest::ManifestCoordinator::snapshot_at(
+        store.root_uri(),
+        Some(branch),
+        snapshot.graph_manifest_version(),
+    )
+    .await?;
+    if fresh.graph_head(Some(branch)) != snapshot.graph_head(Some(branch)) {
+        return Err(OmniError::manifest(format!(
+            "change feed branch '{branch}' has no persisted native-branch \
+             incarnation witness after the per-table opens; the branch was \
+             deleted and recreated during the poll"
+        )));
     }
     Ok(())
 }
@@ -512,13 +554,14 @@ pub(crate) async fn enumerate_commit_changes(
         // live history read happens here.
         let mut source = EmitSource::plan(
             &plan.from_entry,
-            &plan.to_entry,
             plan.from_dataset,
             plan.to_dataset,
             plan.candidate_plan,
             after_id.as_deref(),
             scope,
             ScanTargets::for_page(budget.remaining_rows, budget.remaining_bytes),
+            plan.from_columns,
+            plan.to_columns,
         )
         .await?;
 
@@ -539,18 +582,28 @@ pub(crate) async fn enumerate_commit_changes(
             let op = emit.op();
             let (id, before, after) = match emit {
                 Emit::Insert(raw) => {
-                    let image = emitted_image(source.child_dataset(), &raw, plan.kind).await?;
+                    let image =
+                        emitted_image(source.child_dataset(), &raw, plan.kind, plan.to_columns)
+                            .await?;
                     (raw.id, None, Some(image))
                 }
                 Emit::Delete(raw) => {
-                    let image = emitted_image(source.parent_dataset(), &raw, plan.kind).await?;
+                    let image =
+                        emitted_image(source.parent_dataset(), &raw, plan.kind, plan.from_columns)
+                            .await?;
                     (raw.id, Some(image), None)
                 }
                 Emit::Update { before, after } => {
-                    let before_image =
-                        emitted_image(source.parent_dataset(), &before, plan.kind).await?;
+                    let before_image = emitted_image(
+                        source.parent_dataset(),
+                        &before,
+                        plan.kind,
+                        plan.from_columns,
+                    )
+                    .await?;
                     let after_image =
-                        emitted_image(source.child_dataset(), &after, plan.kind).await?;
+                        emitted_image(source.child_dataset(), &after, plan.kind, plan.to_columns)
+                            .await?;
                     (after.id, Some(before_image), Some(after_image))
                 }
             };

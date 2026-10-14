@@ -1,17 +1,14 @@
 # issue: none
-# notes: one 60-doc fixture, two edge types, three filter positions beside a hop.
-# notes: Knows leaves 10, 20, 30, 40, 50 (5 of 60 = 8.3%, gate prefilters); Likes
-# notes: leaves every 5th doc from 5 (11 of 60 = 18%, Threshold fallback).
-# notes: Step 1 `$d.n > 15  $d knows $t`, limit 2: the pushed filter AND the
-# notes: gate's id list on one scan; 20, 30, 40, 50 survive both (4 > 2): d020,
-# notes: d030. Step 2 `$d knows $t  $t.n > 25`, limit 2: the target filter cannot
-# notes: be pushed, the gate's ids over-admit (10 and 20 have targets 11, 21),
-# notes: the first prefiltered pass holds 10, 20 and loses both; the overfetch
-# notes: rerun under the same id list reaches 30, 40, 50 (3 > 2): d030, d040.
-# notes: Step 3 `$d.n > 15  $d likes $t`, limit 2: above the fence, so the
-# notes: filter is pushed and the traversal drops rows above an unfiltered scan;
-# notes: k 2 (16, 17) and 8 (16..23: one source, 20) are short, k 32 fills:
-# notes: d020, d025. Three different answers, one per path.
+# notes: Keep 60 docs: Knows has 5/60 sources (gate prefilter); Likes has 11/60 (above the 10% threshold).
+# notes: Source filter with Knows: intersect the numeric filter and eligible IDs.
+# notes: Target filter with Knows: the first two candidates fail; retry under the same eligible IDs.
+# notes: Source filter with Likes: k = 2 and 8 underfill; k = 32 finds both nearest sources.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Doc {
@@ -88,25 +85,25 @@ edge Likes: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d057","n":57,"name":"doc-057","embedding":[57.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d058","n":58,"name":"doc-058","embedding":[58.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d059","n":59,"name":"doc-059","embedding":[59.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d010","to":"d011","data":{"id":"e010_0"}}
-{"edge":"Knows","from":"d020","to":"d021","data":{"id":"e020_0"}}
-{"edge":"Knows","from":"d030","to":"d031","data":{"id":"e030_0"}}
-{"edge":"Knows","from":"d040","to":"d041","data":{"id":"e040_0"}}
-{"edge":"Knows","from":"d050","to":"d051","data":{"id":"e050_0"}}
-{"edge":"Likes","from":"d005","to":"d006","data":{"id":"l005"}}
-{"edge":"Likes","from":"d010","to":"d011","data":{"id":"l010"}}
-{"edge":"Likes","from":"d015","to":"d016","data":{"id":"l015"}}
-{"edge":"Likes","from":"d020","to":"d021","data":{"id":"l020"}}
-{"edge":"Likes","from":"d025","to":"d026","data":{"id":"l025"}}
-{"edge":"Likes","from":"d030","to":"d031","data":{"id":"l030"}}
-{"edge":"Likes","from":"d035","to":"d036","data":{"id":"l035"}}
-{"edge":"Likes","from":"d040","to":"d041","data":{"id":"l040"}}
-{"edge":"Likes","from":"d045","to":"d046","data":{"id":"l045"}}
-{"edge":"Likes","from":"d050","to":"d051","data":{"id":"l050"}}
-{"edge":"Likes","from":"d055","to":"d056","data":{"id":"l055"}}
+{"edge":"Knows","id":"e010_0","from":"d010","to":"d011","data":{}}
+{"edge":"Knows","id":"e020_0","from":"d020","to":"d021","data":{}}
+{"edge":"Knows","id":"e030_0","from":"d030","to":"d031","data":{}}
+{"edge":"Knows","id":"e040_0","from":"d040","to":"d041","data":{}}
+{"edge":"Knows","id":"e050_0","from":"d050","to":"d051","data":{}}
+{"edge":"Likes","id":"l005","from":"d005","to":"d006","data":{}}
+{"edge":"Likes","id":"l010","from":"d010","to":"d011","data":{}}
+{"edge":"Likes","id":"l015","from":"d015","to":"d016","data":{}}
+{"edge":"Likes","id":"l020","from":"d020","to":"d021","data":{}}
+{"edge":"Likes","id":"l025","from":"d025","to":"d026","data":{}}
+{"edge":"Likes","id":"l030","from":"d030","to":"d031","data":{}}
+{"edge":"Likes","id":"l035","from":"d035","to":"d036","data":{}}
+{"edge":"Likes","id":"l040","from":"d040","to":"d041","data":{}}
+{"edge":"Likes","id":"l045","from":"d045","to":"d046","data":{}}
+{"edge":"Likes","id":"l050","from":"d050","to":"d051","data":{}}
+{"edge":"Likes","id":"l055","from":"d055","to":"d056","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_source_filter($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15
@@ -128,7 +125,7 @@ query scenario($q: Vector(4)) {
 d.slug: String
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_target_filter($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t
@@ -150,7 +147,7 @@ query scenario($q: Vector(4)) {
 d.slug: String
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_with_source_filter_above_gate($q: Vector(4)) {
     match {
         $d: Doc
         $d.n > 15

@@ -10,12 +10,66 @@ omnigraph branch merge review/2026-04-25 --into main \
 
 The source is positional. `--into` defaults to `main`.
 
+The same merge as a GQ statement, sent to `POST /mutate` with no request
+target, name, or parameters:
+
+```text
+branch merge "review/2026-04-25" into main
+```
+
+`into` defaults to `main`; a name with `/`, `-`, or `.` is quoted, a bare
+identifier such as `main` is not. The answer is a `ChangeOutput` with
+`outcome.kind = "merged"` and `outcome.merge` one of `already_up_to_date`,
+`fast_forward`, or `merged`; after a `fast_forward` or `merged` result,
+`commit` identifies that merge's own publication, even if another writer has
+since advanced the target. The statement has no `--delete-branch`
+composition: follow it with `branch delete <source>`. A merge statement takes
+no commit precondition -- `POST /mutate/if-graph-commit` and `--if-commit`
+refuse one beside it -- and no front offers a conditional merge today.
+
+A merge preserves changes already integrated into a branch when you later
+merge that branch back. For example, after merging a new edge from `main`
+into `review`, editing only a node on `review` and merging it into `main`
+preserves that edge. A merge whose source and target tables reached the same
+version count on different branches fast-forwards; earlier releases refused
+it with a `table version … already exists` error.
+
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
-- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Fast-forward**: the target still has the merge base's schema and table
+  versions, so it takes the source's state. The check reads state, not
+  history: a target merged again from a branch it fast-forwarded before, with
+  no write in between, fast-forwards again. One exception: when a
+  fast-forward into `main` carried a table whose changes cancel out on the
+  branch, or a table on a fork left by a branch created before storage format
+  v11, `main` ends on its own version of that table, so a later merge from
+  that branch can report **Merged**. The merged data is the same.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
+
+`branch merge --json`, the HTTP merge route and the GQ merge statement all
+return `commit` with the exact commit id, manifest version, parents, branch,
+actor and creation timestamp (Unix microseconds). Fast-forward returns the new
+target commit; its merged parent identifies the source head. An already-up-to-date
+merge publishes nothing and returns `commit: null`.
+
+If a remote response is lost or incomplete, the merge may have committed. The
+CLI does not resubmit it automatically. Inspect the intended target changes and
+relevant history before deciding what to do next; a later head alone cannot
+identify the missing merge receipt.
+
+When only the source changed a table since the merge base, a merge into a
+named branch can adopt that exact table snapshot without copying its rows.
+This also works when the target already has its own table history. Tables
+changed on both sides still use the normal three-way merge and constraint
+checks.
+
+The target can continue writing after adoption. Other live branches keep their
+current table snapshots through those target writes and cleanup;
+creating a replacement branch is unnecessary. Cleanup retains the underlying
+histories they still need. Avoiding a table copy does not eliminate the reads
+needed to validate a merge.
 
 The source branch is unchanged by the merge. Use `--delete-branch` for the
 normal review-branch lifecycle:
@@ -27,11 +81,36 @@ omnigraph branch merge review/2026-04-25 --into main --delete-branch \
 
 Deletion happens after a successful merge and has its own authorization check.
 If deletion is denied or the source still has descendants, the merge remains
-successful and durable; the CLI prints a warning and the HTTP response reports
-the deletion failure. You can delete the branch later.
+successful and durable. The CLI exits 0 and warns in human output; HTTP and CLI
+JSON preserve `commit`, report `branch_deleted: false` and include the structured
+`branch_delete_error_details` (`error`, plus typed `code` and details where available).
+Successful deletion reports `branch_deleted: true`; without `--delete-branch`,
+both deletion fields are absent. v0.12 removes the old `branch_delete_error`
+string. Inspect and retry deletion separately; do not replay a successful merge.
 
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.
+
+## Preview a merge
+
+```bash
+omnigraph branch merge feature --into main --dry-run --store graph.omni --json
+```
+
+A dry run runs the merge through classification and constraint validation,
+then stops. It reports the outcome the merge would have now, or fails with the
+same structured conflict list, and writes nothing: `commit` is `null` and
+`dry_run` is `true`. It is a read of both branches, so it needs `read` on each
+and no `branch_merge` grant. It refuses `--as-commit` and `--delete-branch`.
+Over HTTP, send `dry_run: true` to `POST /graphs/{graph_id}/branches/merge`.
+The GQ statement `branch merge feature into main dry run` is the same read at
+`POST /query`: it answers one row with `source`, `target` and `outcome`, and a
+conflict is the 409 a merge answers.
+
+A dry run answers whether the merge would succeed. To see what it would change,
+use [`branch diff`](changes.md#review-a-branch). To review the exact result
+before it lands, merge `--as-commit` and inspect the proposal with
+`commit changes`; the proposal expires once the target branch moves.
 
 ## Conflicts
 
@@ -48,27 +127,76 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
+A merge classifies both sides against their merge base, the newest commit
+both branches descend from, counting a merged branch as an ancestor: a
+commit both branches descend from that no other such commit descends from.
+When two such commits are each not an ancestor of the other, the base is the
+one nearest the two heads (the fewest commits between it and the heads,
+summed), then the one with the higher generation (its distance from the
+first commit along the longest path), then the one with the smaller commit
+id. Two branches that
+each merged the same third branch therefore share that branch's commit as
+their base, and an entity only one of them changed after that import merges
+cleanly. The record of such a commit lives in the branch
+it was merged from, and the merge can read it from a live branch or retained
+retired history. Cleanup preserves the exact selected base and the retired
+histories needed to resolve it. Recreating the logical branch name cannot
+substitute the replacement branch's same-numbered snapshot.
+
 Each conflict identifies the affected type and, when applicable, entity id. The
-HTTP server returns conflicts with status `409`. Reconcile the data on one or
-both branches, then run the merge again.
+HTTP server returns conflicts with status `409`, the same answer for
+`POST /branches/merge` and for a `branch merge` statement on `POST /mutate`.
+Reconcile the data on one or both branches, then run the merge again.
+
+### Edges inserted on both sides
+
+Whether the same edge added on both branches converges depends on the edge
+type's declared identity:
+
+- No declaration: edge ids are generated, so each side's insert is its own
+  row and the merge keeps both. This is the documented multiset default;
+  parallel edges are legitimate data.
+- `@unique(@src, @dst)`: each branch's write succeeds on its own, and the
+  merge reports `unique_violation`. Releases before edge keys provide this
+  guard as `@unique(src, dst)`; from 0.11 it is spelled
+  `@unique(@src, @dst)`.
+- `@key(@src, @dst)`: both sides derive the same id, so identical inserts
+  converge to one row with no conflict. If the sides disagree on a non-key
+  property, the merge reports `divergent_insert` on the edge type with the
+  derived id as the entity id (for `@key(@src, @dst)` a JSON array such as
+  `["Alice","Bob"]`; the elements are the endpoint node ids, so they are
+  generated ids when the endpoint type declares no key). Reconcile it like any divergent insert: align the
+  property on one branch (insert the same key again with the agreed
+  values; the insert upserts), then merge again.
 
 ## Merge classification mode
 
-`OMNIGRAPH_MERGE_LINEAGE` selects how a branch merge finds what changed. `on`
+The `merge_lineage` [session setting](../queries/index.md#session-settings)
+(`request` scope; `set merge_lineage = off;` before the statement, `--set
+merge_lineage=off`, or the request's `settings` field; process default
+`OMNIGRAPH_MERGE_LINEAGE`) selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
-fragment lists and deletion files — and reads only the changed data, so merge
-cost tracks the delta size instead of the dataset size; a fail-closed
+fragment lists and deletion files — and compares candidate rows. Known deleted
+row positions use bounded direct reads. Candidate filtering may still scan data
+when an applicable index is absent; a fail-closed
 precondition gate falls back to the full three-way scan whenever any
 assumption cannot be proven (Blob-bearing schema, differing schemas or storage
 paths across the pins, version pins not matching the manifest entries, missing
-stable identifiers or the exact-id primary-key contract, non-linear history,
-or a candidate set past its byte budget). `off` forces the full three-way scan
-everywhere — the operational fallback if merge results are ever in question.
+stable identifiers or the exact-id primary-key contract, or a candidate set
+past its byte budget). The table version a side pins need not descend from
+the one the merge base pins, so merging a branch back after an earlier merge
+still qualifies. `off` forces the full three-way scan everywhere — the
+operational fallback if merge results are ever in question.
 `verify` runs both, compares their decisions entity by entity, publishes the
 scan's result, and fails the merge loudly on any divergence (the debug-build
 default, used for validation; it costs both paths). A merge that succeeds
 produces the same result in every mode; only cost differs. An unrecognized
-value logs a warning and behaves as `off`.
+value is refused where it arrives: in the environment it refuses startup, in
+a request or a file it refuses that request.
+
+Later writes create fresh table storage when needed and leave unused former
+storage for explicit cleanup. They do not reclaim a previous table history as
+part of preparing the write or merge.
 
 ## After a large merge
 
@@ -76,5 +204,8 @@ Indexes do not define merge correctness. Newly merged entities remain queryable 
 when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
+
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

@@ -7,6 +7,14 @@ pub mod parser;
 /// `omnigraph-compiler` deliberately has no storage-substrate dependency. The
 /// engine's Lance surface guards pin the five surveyed upstream constants;
 /// every Lance bump still requires a source audit for newly added names.
+/// The reserved system namespace: every property name starting with `_`
+/// (RFC 0040). Covers Lance's virtual columns and OmniGraph's own implicit
+/// stored columns, present and future; enforced at schema admission and
+/// again for current-version IRs in `validate_schema_ir`.
+pub fn is_reserved_system_column_name(name: &str) -> bool {
+    name.starts_with('_')
+}
+
 /// These five cannot exist inside a stored schema (Lance itself would have
 /// collided), so this predicate is safe to enforce at every IR validation,
 /// including stored-catalog load.
@@ -28,5 +36,7 @@ pub(crate) fn is_reserved_storage_system_column(name: &str) -> bool {
 /// they are enforced only where a NEW declaration enters (`.pg` parse), never
 /// against a stored catalog — an existing graph keeps opening.
 pub(crate) fn is_reserved_search_output_column(name: &str) -> bool {
-    matches!(name, "_distance" | "_score")
+    name == crate::query::ast::DISTANCE_COLUMN
+        || name == crate::query::ast::SCORE_COLUMN
+        || name == crate::query::ast::RRF_COLUMN
 }

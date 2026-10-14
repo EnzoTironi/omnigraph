@@ -15,13 +15,21 @@ for nearest-neighbor ordering.
 | `bm25($d.body, $q)` | BM25 relevance score. |
 | `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
 
+Search arguments use their declared types. `fuzzy` defaults `max_edits` to 2
+when omitted; a supplied value must be an integer from 0 to 4,294,967,295.
+`rrf` defaults `k` to 60 when omitted; a supplied value must be an integer
+from 1 to 4,294,967,295. A supplied null is an error, including a nullable
+parameter that was omitted from the parameter map. Query text and vectors
+must also be non-null; vector elements must convert to finite F32 values.
+
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
-A `bm25()` ordering with a `limit` reads only the top-scoring matches (a small
-multiple of the limit) instead of every matching entity; when traversals or
-filters leave the limit unfilled, the query automatically rescans without the
-bound, so results are never truncated. Full-text rankings inside `rrf()` are
+A `bm25()` ordering reads every matching entity before applying the final
+limit. Equal scores are then ordered by entity identity, including when the
+smallest identity lies beyond the first search candidates.
+
+Full-text rankings inside `rrf()` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
@@ -75,18 +83,23 @@ traversal that drops the arm's rows shortens the fused answer. As with every
 IVF search, a full candidate count does not make the ANN ranking exact; the
 cap remains a recall/latency tradeoff.
 
-| Variable | Meaning |
+| Setting or variable | Meaning |
 |---|---|
-| `OMNIGRAPH_ANN_NPROBES` | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value is the default with a warning |
+| `ann_nprobes` ([session setting](../queries/index.md#session-settings), `request` scope; process default `OMNIGRAPH_ANN_NPROBES`) | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value refuses startup |
 | `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf()` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
 | `OMNIGRAPH_RRF_GATE_MAX_IDS` | Largest eligible set the gate pushes into the scan; default 100000, `0` turns the gate off, an invalid value is the default |
-| `OMNIGRAPH_RRF_PLAN` | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |
+| `rrf_plan` ([session setting](../queries/index.md#session-settings), `process` scope; process default `OMNIGRAPH_RRF_PLAN`) | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |
 
 ## Full-text search
 
 Use full-text functions for token search, fuzzy terms, and relevance. Use the
 query language's exact `contains` and `starts_with` predicates for literal,
 case-sensitive substring and prefix matching.
+
+`search`, `match_text`, and `fuzzy` are positive predicates in `match`: use
+a standalone call or compare the call to literal `true` with `=`. Other
+comparisons, including `= false`, `!= true`, a Boolean parameter, and a
+call on the right side, are refused at type checking (`T38`).
 
 ```gq
 query relevant($q: String) {
@@ -96,6 +109,18 @@ query relevant($q: String) {
   limit 10
 }
 ```
+
+`score` is the relevance the ordering used, one computation observed twice:
+the projected `bm25(...)` must repeat the leading `order` key (`T33`), and
+`nearest(...)` projects its distance the same way; that distance is the
+squared L2 distance Lance ranks by. Without an alias the column is
+`d._score` or `d._distance`. `rrf(...)` projects the fused score under the
+same rule, an `F64` named `d._rrf` after its first arm's binding without an
+alias. A `nearest(...)` or `bm25(...)` that appears only as an `rrf` arm is
+refused (`T33`), and so are the predicates `search(...)`, `fuzzy(...)` and
+`match_text(...)` (`T35`). A relevance ranking orders most relevant first:
+`asc` on a `bm25(...)` or `rrf(...)` order key is refused (`T54`), as any
+modifier on `nearest(...)` is at parse time.
 
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with`, or literal substring `contains`.
@@ -116,7 +141,10 @@ query hybrid($vector: Vector(4), $text: String) {
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
-secondary keys and the entity-id tie-break applied after the score. The full
+secondary keys and the entity-id tie-break applied after the score. A fused
+order sorts every row by the fused score, then the keys written after
+`rrf(...)`, then every binding's id, and `limit` counts rows after that order;
+an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
 ## Indexes
@@ -136,7 +164,8 @@ declarations do not currently create property indexes.
 
 Indexes are derived performance data. A new declaration may still be pending,
 and newly written entities may fall outside existing coverage. Queries remain
-correct by scanning missing or uncovered data; vector search falls back to an
+correct by scanning missing or uncovered data: full-text functions match the
+scanned rows with the index's analyzer, and vector search falls back to an
 exact scan when needed. Run:
 
 ```bash

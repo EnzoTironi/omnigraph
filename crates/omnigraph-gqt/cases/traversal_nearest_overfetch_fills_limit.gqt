@@ -1,12 +1,13 @@
 # issue: none
-# notes: `$d knows $t` over 20 docs with edges leaving 2, 5, 8, 11: 4 of 20 (20%,
-# notes: still 15% with one fewer) fails the gate's 10% fence, so the scan is
-# notes: unfiltered and the traversal drops rows above it. Limit 3: the first
-# notes: pass (rows 0..2) keeps one source, short; the x4 rerun asks for 12 of
-# notes: the 20 live rows (12 < 20, so a wider rung, not the exact pass) and
-# notes: holds four sources (4 > 3): the loop stops there with d002, d005, d008.
-# notes: Rust twin (probes: one overfetch, no exact pass):
-# notes: issue_567_nearest_gate_falls_back_above_the_ratio.
+# notes: Keep 20 docs: 4/20 edge sources exceeds the 10% gate threshold.
+# notes: At limit 3, the first scan finds only d002; k = 12 finds all four sources without an exact pass.
+# notes: Rust probe: issue_567_nearest_gate_falls_back_above_the_ratio.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
 
 --- schema
 node Doc {
@@ -40,13 +41,13 @@ edge Knows: Doc -> Doc {
 {"type":"Doc","data":{"slug":"d017","n":17,"name":"doc-017","embedding":[17.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d018","n":18,"name":"doc-018","embedding":[18.0,0.0,0.0,0.0]}}
 {"type":"Doc","data":{"slug":"d019","n":19,"name":"doc-019","embedding":[19.0,0.0,0.0,0.0]}}
-{"edge":"Knows","from":"d002","to":"d003","data":{"id":"e002_0"}}
-{"edge":"Knows","from":"d005","to":"d006","data":{"id":"e005_0"}}
-{"edge":"Knows","from":"d008","to":"d009","data":{"id":"e008_0"}}
-{"edge":"Knows","from":"d011","to":"d012","data":{"id":"e011_0"}}
+{"edge":"Knows","id":"e002_0","from":"d002","to":"d003","data":{}}
+{"edge":"Knows","id":"e005_0","from":"d005","to":"d006","data":{}}
+{"edge":"Knows","id":"e008_0","from":"d008","to":"d009","data":{}}
+{"edge":"Knows","id":"e011_0","from":"d011","to":"d012","data":{}}
 
 --- query
-query scenario($q: Vector(4)) {
+query nearest_fills_limit($q: Vector(4)) {
     match {
         $d: Doc
         $d knows $t

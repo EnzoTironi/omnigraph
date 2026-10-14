@@ -17,7 +17,15 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed (per-query `mcp:`/expose flags are a planned phase).
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq` or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
+directory: a `..` segment fails with `config_path_escape`, and a symbolic link
+on the path (or a symlinked discovered `.gq` file) fails with
+`config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--cluster` server type-checks and serves every applied query. Every applied query is listed.
+
+A standalone `branch create`, `branch delete`, `branch merge`, or `branch list`
+statement cannot be registered as a stored query. Registry files must contain
+named `query` declarations; `lint`, `cluster validate`, and server registry
+loading reject branch-statement files.
 
 ## CLI
 
@@ -44,7 +52,18 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
 | `GET /graphs/{id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
 | `POST /graphs/{id}/queries/{name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
-`?branch=` / `?snapshot=` query params apply to `POST /graphs/{id}/queries/{name}` reads; branch/snapshot access stays enforced by the inner `read`/`change` gate (`invoke_query` itself is graph-scoped, not branch-scoped).
+The JSON body carries `params` and optionally `branch` (default `main`; the
+write target for a stored mutation) or `snapshot` (reads only); `branch` and
+`snapshot` are mutually exclusive. There are no `?branch=`/`?snapshot=` query
+parameters. Branch/snapshot access stays enforced by the inner `read`/`change`
+gate (`invoke_query` itself is graph-scoped, not branch-scoped). The
+conditional form is `POST /graphs/{id}/queries/{name}/if-graph-commit`; see
+[`remote-ops.md`](remote-ops.md).
+
+Stored reads share the [query result contract](queries.md#system-fields-and-result-values):
+system identities use `@id`, bare node projections return objects, null fields
+are omitted from JSON rows, and DateTime strings are UTC without a trailing
+`Z`. Check consumer expectations when upgrading the stored-query surface.
 
 ## Policy gating (`invoke_query`)
 
@@ -57,8 +76,11 @@ omnigraph queries list --cluster . --graph dev     # names and typed params
 
 ## MCP exposure
 
-Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool. Per-query exposure controls (`mcp.expose`, `tool_name`) are a planned phase — there is no per-query `mcp:` flag in cluster mode today.
+Every applied query is listed in `GET /graphs/{id}/queries` as a typed MCP tool.
+There is no per-query `mcp:` flag in cluster mode.
 
 ## Note on per-query authorization
 
-The catalog is **not** Cedar-filtered per query yet: a caller with `read` but not `invoke_query` can *list* a query it cannot *invoke* (invocation would 404). Per-query authorization is future work; for now the catalog is a discovery surface and `invoke_query` is the invocation gate.
+The catalog is not Cedar-filtered per query: a caller with `read` but not
+`invoke_query` can list a query it cannot invoke (invocation would 404).
+The catalog is a discovery surface and `invoke_query` is the invocation gate.

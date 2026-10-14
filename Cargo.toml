@@ -3,7 +3,12 @@ resolver = "2"
 members = [
     "crates/omnigraph-compiler",
     "crates/omnigraph-storage",
+    "crates/omnigraph-seams",
+    "crates/omnigraph-core",
+    "crates/omnigraph-catalog",
+    "crates/omnigraph-planner",
     "crates/omnigraph",
+    "crates/omnigraph-reference-engine",
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",
@@ -13,6 +18,8 @@ members = [
     "crates/omnigraph-server",
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",
+    "crates/omnigraph-gqt-core",
+    "crates/omnigraph-gqt-served",
     "tools/omnigraph-vocabulary-guard",
 ]
 default-members = [
@@ -43,8 +50,8 @@ datafusion-functions-aggregate = "54"
 # late-payload KNN ordering fence remain required; see docs/dev/lance.md.
 lance = { version = "=11.0.0", default-features = false, features = ["aws", "azure"] }
 lance-core = "=11.0.0"
-# lance-io + rand: consumed only by omnigraph-dst (fault injection at the
-# Lance IO seam; the harness PRNG seeds).
+# lance-io: the engine's `dst` object-store seam (provider trait) and
+# omnigraph-dst's fault injection; rand: the harness PRNG seeds.
 lance-io = { version = "=11.0.0", default-features = false }
 rand = "0.9"
 # RowAddrTreeMap moved from lance-core::utils::mask to the new lance-select crate in 9.x.
@@ -65,6 +72,7 @@ unicode-normalization = "=0.1.25"
 
 ulid = "1"
 futures = "0.3"
+globset = "0.4"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
@@ -73,8 +81,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+yaml_serde = "0.10.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower = "0.5"
@@ -82,6 +90,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 color-eyre = "0.6"
 tempfile = "3"
 ahash = "0.8"
+aho-corasick = "1"
 arc-swap = "1"
 base64 = "0.22"
 bytes = "1"
@@ -89,11 +98,7 @@ ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 object_store = { version = "0.13.2", default-features = false, features = ["aws", "azure", "fs"] }
-# fail-parallel instead of fail: the failpoint registry becomes a value
-# (SlateDB precedent) instead of a process-global, so a test harness can
-# own faults per-universe.
-fail-parallel = "0.6"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3.47", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 url = "2"
@@ -107,6 +112,9 @@ walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 hmac = "0.12"
 httpdate = "1"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
 
 [workspace.lints.clippy]
 # Nested guards often read clearer than one merged condition (Polars allows this too).

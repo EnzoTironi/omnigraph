@@ -1,0 +1,114 @@
+# issue: none
+# notes: Four alpha leaders have no edge; named, alternative and wildcard traversals must refill both BM25 arms.
+# notes: Complete rankings make x win; losing the alpha arm flips the winner to n without changing the row count.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index
+}
+
+node Artifact {
+    slug: String @key
+}
+
+edge ChunkOfArtifact: Chunk -> Artifact
+
+--- seed
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Chunk","data":{"slug":"decoy-1","text":"alpha alpha alpha alpha alpha alpha alpha beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-2","text":"alpha alpha alpha alpha alpha alpha beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-3","text":"alpha alpha alpha alpha alpha beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"decoy-4","text":"alpha alpha alpha alpha beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"x","text":"alpha alpha alpha beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"y","text":"alpha alpha beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"type":"Chunk","data":{"slug":"n","text":"alpha beta beta beta beta beta beta beta filler filler filler filler filler filler filler filler filler filler filler filler"}}
+{"edge":"ChunkOfArtifact","id":"e-x","from":"x","to":"art-0"}
+{"edge":"ChunkOfArtifact","id":"e-y","from":"y","to":"art-0"}
+{"edge":"ChunkOfArtifact","id":"e-n","from":"n","to":"art-0"}
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+
+--- query
+query recall_alternation($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c (chunkOfArtifact | chunkOfArtifact) $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection alternation [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+expand $c $a: mode indexed_scan ran indexed_scan
+
+--- query
+query recall_wildcard($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c * $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection wildcard [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+expand $c $a: mode indexed_scan ran indexed_scan

@@ -35,11 +35,17 @@ use object_store::{
 
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{
-    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+    MergeWriteProbes, ProbedStores, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
-use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
+
+/// The deep point of every depth-swept cost gate (the shallow point stays per
+/// test): a per-commit regression over the span to this depth still exceeds
+/// every gate's slack, and each gate builds in well under a second.
+pub const DEEP_HISTORY_DEPTH: u64 = 40;
 
 /// Open a Lance dataset with its object-store tracker installed before the
 /// first manifest load. Cost fixtures must use this seam for cold-open evidence;
@@ -238,6 +244,9 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// `__manifest` object-store writes: published versions, transaction files
+    /// and tags (merge-input holds and proposals among them).
+    pub manifest_writes: u64,
     /// Bytes returned by those real object-store reads. This distinguishes a
     /// physical-address take from scanning a compacted history-sized fragment
     /// even when both use a similar number of requests.
@@ -450,7 +459,7 @@ impl ObjectStore for PrefixCountingStore {
 // `incremental_stats()` per request (`rust/lance/src/dataset/tests/dataset_io.rs`).
 // We do the same for `__manifest`: `cost_harness` installs ONE persistent tracker for
 // a whole test body, so the graph opens UNDER it and every coordinator handle — the
-// init handle and each post-publish/refresh reassignment (`db/manifest.rs` keeps
+// init handle and each post-publish/refresh reassignment (`omnigraph-catalog/src/lib.rs` keeps
 // `self.dataset = …`) — carries the same tracker. `manifest_reads` is then ground
 // truth (warm probe + cold scans), handle-age-irrelevant, instead of only the reads
 // on handles a single measured op happened to open. Data/commit-graph/probe/open
@@ -492,6 +501,40 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
         .await
 }
 
+/// Build persistent data and manifest probes whose counters a caller can extend.
+pub fn raw_io_probes(table: &IOTracker, manifest: &IOTracker) -> QueryIoProbes {
+    QueryIoProbes {
+        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    }
+}
+
+/// IO totals including Lance's direct local reader and writer.
+#[derive(Default)]
+pub struct ProbedIoCounts {
+    pub read_iops: u64,
+    pub read_bytes: u64,
+    pub write_iops: u64,
+    pub written_bytes: u64,
+}
+
+/// Use the same accounting as the concurrent-writes benchmark. Each store's
+/// tracker sees both object-store calls and direct local IO. The wrapper is
+/// drained only to bound its request log; adding it would double-count IO.
+pub fn drain_probed_io(wrapper: &IOTracker, stores: &ProbedStores) -> ProbedIoCounts {
+    let _ = wrapper.incremental_stats();
+    let mut totals = ProbedIoCounts::default();
+    for store in stores.stores() {
+        let stats = store.io_stats_incremental();
+        totals.read_iops += stats.read_iops;
+        totals.read_bytes += stats.read_bytes;
+        totals.write_iops += stats.write_iops;
+        totals.written_bytes += stats.written_bytes;
+    }
+    totals
+}
+
 /// Run a body with persistent raw Lance trackers for the data-table and graph-
 /// manifest stores. This is the shared wiring seam for instruments that need
 /// request-path attribution beyond [`IoCounts`] (for example recovery-object,
@@ -502,12 +545,7 @@ pub async fn with_raw_io_trackers<F: Future>(
     manifest: &IOTracker,
     body: F,
 ) -> F::Output {
-    let probes = QueryIoProbes {
-        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
-        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
-        ..Default::default()
-    };
-    with_query_io_probes(probes, body).await
+    with_query_io_probes(raw_io_probes(table, manifest), body).await
 }
 
 /// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,
@@ -604,6 +642,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_writes: manifest.write_iops,
             manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
@@ -708,7 +747,7 @@ pub fn assert_grows(
 /// Measure one committing `insert_person` to `main` — the canonical write the cost
 /// gates sweep over commit-history depth. Shared by `write_cost.rs` and
 /// `write_cost_s3.rs` so the measured write is defined once.
-pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
+pub async fn measure_insert(db: &omnigraph::Session, tag: &str) -> IoCounts {
     let (res, io) = measure(db.mutate(
         "main",
         MUTATION_QUERIES,
@@ -723,7 +762,7 @@ pub async fn measure_insert(db: &mut Omnigraph, tag: &str) -> IoCounts {
 /// Like [`measure_insert`] but carries an actor — the authenticated (server/CLI)
 /// write path. The actor is written inline with the graph-lineage rows in
 /// `__manifest` (RFC-013 Phase 7), so its scan is part of `IoCounts::manifest_reads`.
-pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> IoCounts {
+pub async fn measure_insert_as(db: &omnigraph::Session, tag: &str, actor: &str) -> IoCounts {
     let (res, io) = measure(db.mutate_as(
         "main",
         MUTATION_QUERIES,
@@ -739,23 +778,28 @@ pub async fn measure_insert_as(db: &mut Omnigraph, tag: &str, actor: &str) -> Io
 // ── Backend fixtures — one knob, store-agnostic body ──
 
 /// Local tempdir graph (default; deterministic, every-PR).
-pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
+pub async fn local_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
     init_and_load(dir).await
 }
 
 /// Emulated-S3 graph, bucket-gated. Returns `None` **only** when
 /// `OMNIGRAPH_S3_TEST_BUCKET` is unset, so the caller logs + skips — the
-/// `tests/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
+/// `tests/integration/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
 /// (the rustfs CI job), any `init`/seed failure is a real failure and panics
 /// rather than silently skipping — otherwise a down/misconfigured store would let
 /// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.
-pub async fn s3_graph(name: &str) -> Option<Omnigraph> {
+pub async fn s3_graph(name: &str) -> Option<omnigraph::Session> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let uri = format!("s3://{bucket}/cost-tests/{name}-{}", std::process::id());
-    let db = Omnigraph::init(&uri, TEST_SCHEMA)
-        .await
-        .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed");
-    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
+    let db = omnigraph::Session::from_defaults(
+        Arc::new(
+            Omnigraph::init(&uri, TEST_SCHEMA)
+                .await
+                .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed"),
+        ),
+        SessionSettings::default(),
+    );
+    db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)

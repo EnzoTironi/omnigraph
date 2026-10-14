@@ -29,6 +29,71 @@ fn parse_failure_returns_structured_error_output() {
 }
 
 #[test]
+fn branch_statement_is_refused_as_a_parse_family_finding() {
+    let output = lint_query_file(
+        &catalog("node Person { name: String }"),
+        "branch merge b0 into main",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(output.queries_processed, 0);
+    assert_eq!(output.errors, 1);
+    assert!(output.results.is_empty());
+    assert_eq!(output.findings.len(), 1);
+    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(
+        output.findings[0].message,
+        "`branch merge` is a branch statement, not a query declaration"
+    );
+}
+
+#[test]
+fn explain_statement_lints_its_wrapped_declaration() {
+    let schema = catalog("node Person { name: String }");
+    let output = lint_query_file(
+        &schema,
+        "explain query names() { match { $p: Person } return { $p.name } }",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    assert_eq!(output.status, QueryLintStatus::Ok, "{:?}", output.findings);
+    assert_eq!(output.queries_processed, 1);
+    assert_eq!(output.results[0].name, "names");
+
+    let output = lint_query_file(
+        &schema,
+        "explain query add() { insert Person { name: \"Ada\" } }",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(
+        output.findings[0].message,
+        "`explain` applies to a read query; 'add' contains mutations"
+    );
+}
+
+#[test]
+fn refused_set_line_is_reported_with_its_position() {
+    let output = lint_query_file(
+        &catalog("node Person { name: String }"),
+        "set merge_lineage = v3;\n",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(output.queries_processed, 0);
+    assert_eq!(output.findings.len(), 1);
+    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    let message = &output.findings[0].message;
+    assert!(message.starts_with("line 1, column "), "{message}");
+    assert!(message.contains("unknown value `v3`"), "{message}");
+}
+
+#[test]
 fn mixed_valid_and_invalid_queries_preserve_per_query_results() {
     let output = lint_query_file(
         &catalog(
@@ -335,28 +400,33 @@ match {
 }
 return { $p.name }
 }
+
+
 "#,
         "/tmp/queries.gq",
         QueryLintSchemaSource::file("/tmp/schema.pg"),
     );
 
-    assert_eq!(
-        output.results[0].operation.as_ref().unwrap().reads,
-        vec![
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Node,
-                type_name: "Company".to_string(),
-            },
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Node,
-                type_name: "Person".to_string(),
-            },
-            QueryGraphFact {
-                kind: QueryGraphFactKind::Edge,
-                type_name: "WorksAt".to_string(),
-            },
-        ]
-    );
+    assert_eq!(output.results.len(), 1);
+    for result in &output.results {
+        assert_eq!(
+            result.operation.as_ref().unwrap().reads,
+            vec![
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Company".to_string(),
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Person".to_string(),
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "WorksAt".to_string(),
+                },
+            ]
+        );
+    }
 }
 
 #[test]
@@ -513,4 +583,42 @@ return {
             "nullable": false
         })
     );
+}
+
+#[test]
+fn selected_scopes_contribute_every_read_fact_issue_659() {
+    let schema = catalog(
+        "node Person { name: String } node Company { name: String } edge WorksAt: Person -> Company edge Employs: Company -> Person",
+    );
+    for selector in ["(worksAt | employs)", "*"] {
+        let output = lint_query_file(
+            &schema,
+            &format!(
+                "query q() {{ match {{ $p: Person not {{ $p {selector} $c $c: Company }} }} return {{ $p.name }} }}"
+            ),
+            "/tmp/queries.gq",
+            QueryLintSchemaSource::file("/tmp/schema.pg"),
+        );
+        assert_eq!(
+            output.results[0].operation.as_ref().unwrap().reads,
+            vec![
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Company".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Node,
+                    type_name: "Person".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "Employs".into()
+                },
+                QueryGraphFact {
+                    kind: QueryGraphFactKind::Edge,
+                    type_name: "WorksAt".into()
+                },
+            ]
+        );
+    }
 }

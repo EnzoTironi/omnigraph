@@ -17,6 +17,10 @@ pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub path: String,
     pub message: String,
+    /// The compiler's own diagnostic (code, position or stage, expectation,
+    /// fix) when the subject is a stored query the compiler refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Box<omnigraph_compiler::QueryDiagnostic>>,
 }
 
 impl Diagnostic {
@@ -30,7 +34,16 @@ impl Diagnostic {
             severity: DiagnosticSeverity::Error,
             path: path.into(),
             message: message.into(),
+            detail: None,
         }
+    }
+
+    pub(crate) fn with_detail(
+        mut self,
+        detail: Option<omnigraph_compiler::QueryDiagnostic>,
+    ) -> Self {
+        self.detail = detail.map(Box::new);
+        self
     }
 
     pub(crate) fn warning(
@@ -43,6 +56,7 @@ impl Diagnostic {
             severity: DiagnosticSeverity::Warning,
             path: path.into(),
             message: message.into(),
+            detail: None,
         }
     }
 }
@@ -147,20 +161,14 @@ pub enum PlanOperation {
     Delete,
 }
 
-/// How `cluster apply` treats a planned change in the current stage.
-///
-/// `Applied` changes execute (config-only query/policy catalog writes).
-/// `Derived` marks a `graph.<id>` composite-digest update that converges
-/// automatically once its applied query digests land in state. `Deferred`
-/// changes need a later phase (graph/schema lifecycle or schema content).
-/// `Blocked` query/policy changes are gated by an unapplied or missing
-/// dependency.
+/// Expected disposition of a plan change; this is not an execution receipt.
+/// `Derived` is a graph composite that follows its accepted child resources;
+/// `Blocked` means v2 preflight forbids the complete proposed deployment.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyDisposition {
     Applied,
     Derived,
-    Deferred,
     Blocked,
 }
 
@@ -187,9 +195,12 @@ pub struct PlanChange {
     pub metadata_change: Option<PlanMetadataChange>,
     /// For schema updates: the engine's migration plan against the live
     /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
-    /// unavailable (warning `schema_preview_unavailable`).
+    /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+    /// Removing a declared graph deletes its managed root and retained history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -197,7 +208,6 @@ pub struct PlanChange {
 pub enum PlanMetadataChange {
     PolicyBindings,
     EmbeddingProfile,
-    ActorProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -206,28 +216,22 @@ pub struct BlastRadius {
     pub affected: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ApprovalRequirement {
-    pub resource: String,
-    pub reason: String,
-    /// True when a valid (digest-matching, unconsumed) approval artifact is
-    /// pending for this change.
-    pub satisfied: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanOutput {
     pub ok: bool,
-    /// Whether this plan held the cluster lock or only observed the ledger.
+    /// Plans are observations and never reserve writer authority.
     pub authority: LedgerAuthority,
     pub config_dir: String,
     pub desired_revision: DesiredRevision,
+    /// Immutable captured input identity, when capture succeeded. This is an
+    /// observation, not a reservation or permission to execute it later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_digest: Option<String>,
     pub resource_digests: BTreeMap<String, String>,
     pub dependencies: Vec<Dependency>,
     pub state_observations: StateObservations,
     pub changes: Vec<PlanChange>,
     pub blast_radius: Vec<BlastRadius>,
-    pub approvals_required: Vec<ApprovalRequirement>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -245,9 +249,7 @@ pub struct StatusOutput {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateSyncOperation {
-    Refresh,
-    Import,
-    /// `refresh` without the lock, the sweep, or the write (RFC 0049).
+    /// Read-only current-state observation.
     Observe,
 }
 
@@ -264,13 +266,6 @@ pub enum LedgerAuthority {
     /// The command took no lock and wrote nothing. Its findings are a
     /// point-in-time observation; `state_cas` names the ledger it read.
     Observed,
-}
-
-/// Options for [`crate::plan_config_dir_with_options`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PlanOptions {
-    /// Plan without the cluster lock and label the output `observed`.
-    pub observe: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,77 +291,12 @@ pub struct ForceUnlockOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Output of config-only `cluster apply`. "Applied" means recorded in the
-/// local cluster catalog (`__cluster/`); nothing applied here serves traffic —
-/// the server still boots from `omnigraph.yaml` until the server-boot stage.
-#[derive(Debug, Clone, Serialize)]
-pub struct ApplyOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    pub desired_revision: DesiredRevision,
-    pub state_observations: StateObservations,
-    /// Every planned change, with `disposition`/`reason` always populated.
-    pub changes: Vec<PlanChange>,
-    pub applied_count: usize,
-    /// Deferred + Blocked changes (Derived composite updates count as neither).
-    pub deferred_count: usize,
-    /// True when state matches the desired revision after this apply.
-    pub converged: bool,
-    /// False for a no-op re-apply: state bytes (and revision) were left untouched.
-    pub state_written: bool,
-    /// The statuses as persisted: post-apply on success, the pre-apply on-disk
-    /// snapshot when the state write fails (never unpersisted in-memory state).
-    pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-/// A digest-bound human approval for an irreversible operation (RFC-004
-/// §D4). Written by `cluster approve`, consumed by apply. The file is never
-/// deleted on consumption — it is rewritten with `consumed_at` and also
-/// summarized into the state ledger's `approval_records`, so the audit fact
-/// survives the loss of either store (axiom 11).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApprovalArtifact {
-    pub(crate) schema_version: u32,
-    pub(crate) approval_id: String,
-    pub(crate) resource: String,
-    pub(crate) operation: String,
-    pub(crate) reason: String,
-    pub(crate) bound_config_digest: String,
-    #[serde(default)]
-    pub(crate) bound_before_digest: Option<String>,
-    #[serde(default)]
-    pub(crate) bound_after_digest: Option<String>,
-    pub(crate) approved_by: String,
-    pub(crate) created_at: String,
-    #[serde(default)]
-    pub(crate) consumed_at: Option<String>,
-    #[serde(default)]
-    pub(crate) consumed_by_operation: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ApproveOutput {
-    pub ok: bool,
-    pub config_dir: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<PlanOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approved_by: Option<String>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct DesiredCluster {
     pub(crate) config_dir: PathBuf,
     pub(crate) config_digest: String,
+    /// Canonical parsed source semantics, excluding referenced resource bytes.
+    pub(crate) config_semantics: String,
     /// The declared `storage:` root, if any (None ⇒ the config dir itself).
     pub(crate) storage_root: Option<String>,
     pub(crate) state_lock: bool,
@@ -383,7 +313,6 @@ pub(crate) struct DesiredCluster {
 pub(crate) struct DesiredGraph {
     pub(crate) id: String,
     pub(crate) schema_digest: String,
-    pub(crate) actor_provenance: Option<bool>,
     pub(crate) embedding_provider: Option<String>,
     pub(crate) external_blob_policy: omnigraph::ExternalBlobPolicy,
 }
@@ -457,10 +386,6 @@ pub(crate) struct ProvidersConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GraphConfig {
     pub(crate) schema: PathBuf,
-    /// Desired provenance setting. Omission preserves an existing graph and
-    /// uses the engine initialization default for a new graph.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) actor_provenance: Option<bool>,
     #[serde(default)]
     pub(crate) queries: QueriesDecl,
     /// Optional reference to a top-level `providers.embedding.<name>` profile.
@@ -601,11 +526,9 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .strip_prefix("${")
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
+        // Never echo the value: an inline one is the secret itself.
         .ok_or_else(|| {
-            format!(
-                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
-                value.trim()
-            )
+            "embedding api_key must be a ${NAME} env reference, not an inline secret".to_string()
         })
 }
 
@@ -631,13 +554,21 @@ pub(crate) struct PolicyConfig {
     pub(crate) applies_to: Vec<String>,
 }
 
-// Stage 2A/2B accept these forward-compatible state sections so existing
-// ledgers won't churn while approval/recovery semantics are staged later.
+// Historical audit sections survive explicit v1 conversion as data only.
+// No approval or recovery sidecar authorizes a v2 operation.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClusterState {
     pub(crate) version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outstanding: Option<crate::deployment::OutstandingDeployment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deployment_results: Option<Vec<crate::deployment::DeploymentResult>>,
     #[serde(default)]
     pub(crate) state_revision: u64,
     pub(crate) applied_revision: AppliedRevisionState,
@@ -654,6 +585,10 @@ pub(crate) struct ClusterState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AppliedRevisionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) schema_contracts: Option<BTreeMap<String, omnigraph::db::SchemaContractDigest>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) result_revision: Option<u64>,
     #[serde(default)]
     pub(crate) config_digest: Option<String>,
     #[serde(default)]
@@ -664,10 +599,6 @@ pub(crate) struct AppliedRevisionState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateResource {
     pub(crate) digest: String,
-    /// Schema resources only: last accepted setting observed during apply or
-    /// refresh. Serving never reads this projection as graph authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) actor_provenance: Option<bool>,
     /// Policy resources only: the applied `applies_to` bindings, normalized
     /// to typed refs (`cluster` | `graph.<id>`). Recorded so the state
     /// ledger is serving-sufficient for the Phase-5 server boot (RFC-005
@@ -692,6 +623,12 @@ pub(crate) struct StateResource {
     pub(crate) external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
 }
 
+impl ClusterState {
+    pub(crate) fn outstanding_deployment_id(&self) -> Option<&str> {
+        self.outstanding.as_ref().map(|pending| pending.id.as_str())
+    }
+}
+
 /// Recovery-intent record for a graph-moving apply operation (RFC-004 §D2).
 /// Written under the state lock before the engine call that can create or
 /// move a graph manifest; deleted only after the cluster state CAS that
@@ -712,10 +649,6 @@ pub(crate) struct RecoverySidecar {
     #[serde(default)]
     pub(crate) expected_manifest_version: Option<u64>,
     pub(crate) desired_schema_digest: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) observed_actor_provenance: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) desired_actor_provenance: Option<bool>,
     #[serde(default)]
     pub(crate) state_cas_base: Option<String>,
     /// For graph_delete: the approval this operation consumes; lets a sweep
@@ -730,20 +663,6 @@ pub(crate) enum RecoverySidecarKind {
     GraphCreate,
     SchemaApply,
     GraphDelete,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct SweepOutcome {
-    /// Graphs whose sidecar was kept (rows 5/6): graph-moving work for them
-    /// is blocked until the operator repairs and re-observes.
-    pub(crate) pending_graphs: BTreeSet<String>,
-    /// Sidecars whose outcome is recorded (rows 2/4): deleted only after the
-    /// command's state write lands, so a CAS failure re-sweeps them.
-    /// Store URIs (the storage layer addresses everything by URI).
-    pub(crate) completed_sidecars: Vec<String>,
-    /// Approval artifacts consumed by a roll-forward (delete row 7b): their
-    /// files are rewritten with consumed_at only after the state write lands.
-    pub(crate) consumed_approvals: Vec<String>,
 }
 
 #[cfg(test)]
@@ -776,6 +695,10 @@ mod embedding_provider_config_tests {
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("${NAME}"), "got: {err}");
+        assert!(
+            !err.contains("sk-inline"),
+            "the refusal echoed the key: {err}"
+        );
     }
 
     #[test]

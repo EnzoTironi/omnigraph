@@ -1,9 +1,18 @@
 use super::*;
+use crate::AuthSource;
 use p256::ecdsa::{SigningKey, signature::Signer};
 use serde_json::{Value, json};
 
 fn golden() -> Value {
-    serde_json::from_str(include_str!("../../tests/fixtures/data-token-v1.json")).unwrap()
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/data-token-v1.json")).unwrap();
+    fixture["claims"]["version"] = json!(2);
+    fixture["claims"].as_object_mut().unwrap().remove("grants");
+    fixture["token"] = json!(sign_raw(
+        &fixture["header"].to_string(),
+        &fixture["claims"].to_string()
+    ));
+    fixture
 }
 
 fn document() -> Value {
@@ -38,77 +47,92 @@ fn sign(claims: &Value) -> String {
 }
 
 #[test]
-fn issuer_golden_signature_and_per_graph_ceiling() {
+fn signed_identity_is_reusable_and_retired_profile_is_refused() {
     let fixture = golden();
     let trust = trust();
     let now = fixture["verification_time"].as_u64().unwrap();
-    let mut actor = trust
-        .verify_at(fixture["token"].as_str().unwrap(), now)
+    let actor = trust
+        .verify_authenticated_at(fixture["token"].as_str().unwrap(), now)
         .unwrap();
     assert_eq!(
         actor.actor_id_str(),
         format!("principal:{}", fixture["claims"]["sub"].as_str().unwrap())
     );
     assert_eq!(actor.source, AuthSource::SignedData);
-    assert_eq!(
-        serde_json::to_value(actor.data_claims().unwrap()).unwrap(),
-        fixture["claims"]
-    );
-    assert!(actor.select_graph(&GraphId::try_from("graph-a").unwrap()));
-    assert!(actor.permits_action(PolicyAction::Change));
-    assert!(actor.select_graph(&GraphId::try_from("reports").unwrap()));
-    assert!(actor.permits_action(PolicyAction::Read));
-    assert!(!actor.permits_action(PolicyAction::Change));
-    assert!(!actor.select_graph(&GraphId::try_from("other").unwrap()));
-    // Tokens are reusable capabilities, not an invented one-use token ledger.
+    let projected: ResolvedActor = trust
+        .verify_at(fixture["token"].as_str().unwrap(), now)
+        .unwrap();
+    assert_eq!(projected.actor_id, actor.actor().actor_id);
+    assert_eq!(projected.source, actor.source);
+    let retired: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/data-token-v1.json")).unwrap();
     assert!(
         trust
-            .verify_at(fixture["token"].as_str().unwrap(), now)
-            .is_some()
+            .verify_authenticated_at(retired["token"].as_str().unwrap(), now)
+            .is_none()
     );
 }
 
 #[test]
-fn signed_profile_rejects_invalid_authority_and_unsupported_claims() {
+fn identity_profile_preserves_bindings_and_rejects_permissions() {
     let fixture = golden();
     let now = fixture["verification_time"].as_u64().unwrap();
     let trust = trust();
+    let mut claims = fixture["claims"].clone();
+    claims["version"] = json!(2);
+    claims.as_object_mut().unwrap().remove("grants");
+    let actor = trust.verify_authenticated_at(&sign(&claims), now).unwrap();
+    assert_eq!(
+        serde_json::to_value(actor.identity_claims().unwrap()).unwrap(),
+        claims
+    );
     for (field, value) in [
-        ("version", json!(2)),
+        ("grants", json!([{"graph_id":"graph-a","actions":["read"]}])),
+        ("grants", json!([])),
+        ("roles", json!(["admin"])),
+        ("actions", json!(["read"])),
+        ("groups", json!(["admins"])),
+        ("version", json!(1)),
+        ("version", json!(3)),
         ("iss", json!("https://other.example")),
-        ("aud", json!([fixture["claims"]["aud"]])),
+        ("aud", json!("urn:omnigraph:data:other")),
         ("account_id", json!("other")),
         ("cluster_id", json!("other")),
         ("cluster_incarnation", json!("other")),
         ("sub", json!("email@example.com")),
-        ("sub", json!("a".repeat(129))),
         ("jti", json!("")),
         ("principal_kind", json!("development")),
         ("assurance", json!("verified_workload")),
         ("iat", json!(now + 31)),
-        ("iat", json!(-1)),
         ("exp", json!(now)),
+        ("exp", json!(claims["iat"].as_u64().unwrap() + 86401)),
+    ] {
+        let mut bad = claims.clone();
+        bad[field] = value;
+        assert!(
+            trust.verify_authenticated_at(&sign(&bad), now).is_none(),
+            "accepted {field}"
+        );
+    }
+    let duplicate = claims.to_string().replacen('{', "{\"version\":2,", 1);
+    assert!(
+        trust
+            .verify_at(&sign_raw(&fixture["header"].to_string(), &duplicate), now)
+            .is_none()
+    );
+}
+
+#[test]
+fn signed_profile_rejects_unsupported_claims_and_malformed_identity() {
+    let fixture = golden();
+    let now = fixture["verification_time"].as_u64().unwrap();
+    let trust = trust();
+    for (field, value) in [
+        ("aud", json!([fixture["claims"]["aud"]])),
+        ("sub", json!("a".repeat(129))),
+        ("iat", json!(-1)),
         ("nbf", json!(now + 1)),
         ("actor", json!("admin")),
-        ("grants", json!([])),
-        (
-            "grants",
-            json!([{"graph_id":"graph-a","actions":["admin"]}]),
-        ),
-        (
-            "grants",
-            json!([{"graph_id":"graph-a","actions":["schema_apply"]}]),
-        ),
-        (
-            "grants",
-            json!([{"graph_id":"graph-a","actions":["read","read"]}]),
-        ),
-        ("grants", json!([{"graph_id":"graph-a","actions":["*"]}])),
-        ("grants", json!([{"graph_id":"graph_a","actions":["read"]}])),
-        (
-            "grants",
-            json!([{"graph_id":"policies","actions":["read"]}]),
-        ),
     ] {
         let mut claims = fixture["claims"].clone();
         claims[field] = value;
@@ -117,24 +141,6 @@ fn signed_profile_rejects_invalid_authority_and_unsupported_claims() {
             "accepted {field}: {claims}"
         );
     }
-    let mut claims = fixture["claims"].clone();
-    let duplicate = claims["grants"][0].clone();
-    claims["grants"].as_array_mut().unwrap().push(duplicate);
-    assert!(trust.verify_at(&sign(&claims), now).is_none());
-    claims["grants"] = Value::Array(
-        (0..65)
-            .map(|i| json!({"graph_id":format!("g{i}"),"actions":["read"]}))
-            .collect(),
-    );
-    assert!(trust.verify_at(&sign(&claims), now).is_none());
-    let duplicate = fixture["claims"]
-        .to_string()
-        .replacen('{', "{\"version\":1,", 1);
-    assert!(
-        trust
-            .verify_at(&sign_raw(&fixture["header"].to_string(), &duplicate), now)
-            .is_none()
-    );
 }
 
 #[test]
@@ -305,38 +311,6 @@ fn rotation_accepts_each_installed_key_without_online_discovery() {
             )
             .is_some()
     );
-}
-
-#[test]
-fn action_ceiling_has_no_implicit_permissions() {
-    let fixture = golden();
-    let trust = trust();
-    let now = fixture["verification_time"].as_u64().unwrap();
-    let actions = [
-        PolicyAction::Read,
-        PolicyAction::Change,
-        PolicyAction::Export,
-        PolicyAction::BranchCreate,
-        PolicyAction::BranchDelete,
-        PolicyAction::BranchMerge,
-        PolicyAction::InvokeQuery,
-        PolicyAction::GraphList,
-    ];
-    for allowed in actions {
-        let mut claims = fixture["claims"].clone();
-        claims["grants"] = json!([{"graph_id":"graph-a","actions":[allowed]}]);
-        let mut actor = trust.verify_at(&sign(&claims), now).unwrap();
-        assert!(actor.select_graph(&GraphId::try_from("graph-a").unwrap()));
-        for checked in actions {
-            assert_eq!(
-                actor.permits_action(checked),
-                allowed == checked,
-                "{allowed} vs {checked}"
-            );
-        }
-        assert!(!actor.permits_action(PolicyAction::SchemaApply));
-        assert!(!actor.permits_action(PolicyAction::Admin));
-    }
 }
 
 #[test]

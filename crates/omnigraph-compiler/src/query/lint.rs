@@ -5,7 +5,8 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::query::ast::{Mutation, QueryDecl};
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
-use crate::query::parser::parse_query;
+use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::parser::parse_query_diagnostic;
 
 const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";
@@ -120,13 +121,17 @@ pub fn lint_query_file(
     schema_source: QueryLintSchemaSource,
 ) -> QueryLintOutput {
     let query_path = query_path.into();
-    match parse_query(query_source) {
-        Ok(parsed) => {
-            let queries_processed = parsed.queries.len();
+    let parsed = match parse_query_diagnostic(query_source) {
+        Ok(file) => file.body.into_read_declarations(),
+        Err(diagnostic) => Err(parse_error_message(diagnostic)),
+    };
+    match parsed {
+        Ok(queries) => {
+            let queries_processed = queries.len();
             let mut results = Vec::with_capacity(queries_processed);
             let mut coverage = BTreeMap::<String, UpdateCoverage>::new();
 
-            for query in &parsed.queries {
+            for query in &queries {
                 let kind = query_kind(query);
                 let warnings = per_query_warnings(query);
                 match describe_query_operation(catalog, query) {
@@ -194,7 +199,7 @@ pub fn lint_query_file(
                 findings,
             }
         }
-        Err(err) => QueryLintOutput {
+        Err(message) => QueryLintOutput {
             status: QueryLintStatus::Error,
             schema_source,
             query_path,
@@ -206,12 +211,25 @@ pub fn lint_query_file(
             findings: vec![QueryLintFinding {
                 severity: QueryLintSeverity::Error,
                 code: PARSE_ERROR_CODE.to_string(),
-                message: err.to_string(),
+                message,
                 type_name: None,
                 property: None,
                 query_names: Vec::new(),
             }],
         },
+    }
+}
+
+/// The parse message with its position, `line <n>, column <c>: <message>`,
+/// so a refused `set` line is reported where it stands; a spanless
+/// diagnostic keeps its message.
+fn parse_error_message(diagnostic: QueryDiagnostic) -> String {
+    let QueryDiagnostic {
+        message, position, ..
+    } = diagnostic;
+    match position {
+        Some(at) => format!("line {}, column {}: {message}", at.line, at.column),
+        None => message,
     }
 }
 

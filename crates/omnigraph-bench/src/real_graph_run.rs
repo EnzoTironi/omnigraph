@@ -12,11 +12,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use omnigraph::Session;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, Snapshot};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::settings::SessionSettings;
+use omnigraph_compiler::catalog::schema_ir::SYSTEM_COLUMNS_META;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -64,11 +68,11 @@ const TARGET_EDGE: &str = "omnigraph-bench-fin-v1-tgt-transfer";
 
 const SOURCE_BATCH: &str = r#"{"type":"Account","data":{"accountId":"omnigraph-bench-fin-v1-src-a","createTime":"2020-01-01T00:00:00Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
 {"type":"Account","data":{"accountId":"omnigraph-bench-fin-v1-src-b","createTime":"2020-01-01T00:00:00Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
-{"edge":"AccountTransferAccount","from":"omnigraph-bench-fin-v1-src-a","to":"omnigraph-bench-fin-v1-src-b","data":{"id":"omnigraph-bench-fin-v1-src-transfer","amount":1.25,"createTime":"2020-01-01T00:00:00Z","orderNum":"omnigraph-bench-fin-v1-src-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
+{"edge":"AccountTransferAccount","id":"omnigraph-bench-fin-v1-src-transfer","from":"omnigraph-bench-fin-v1-src-a","to":"omnigraph-bench-fin-v1-src-b","data":{"amount":1.25,"createTime":"2020-01-01T00:00:00Z","orderNum":"omnigraph-bench-fin-v1-src-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
 
 const TARGET_BATCH: &str = r#"{"type":"Account","data":{"accountId":"omnigraph-bench-fin-v1-tgt-a","createTime":"2020-01-01T00:00:01Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
 {"type":"Account","data":{"accountId":"omnigraph-bench-fin-v1-tgt-b","createTime":"2020-01-01T00:00:01Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
-{"edge":"AccountTransferAccount","from":"omnigraph-bench-fin-v1-tgt-a","to":"omnigraph-bench-fin-v1-tgt-b","data":{"id":"omnigraph-bench-fin-v1-tgt-transfer","amount":2.5,"createTime":"2020-01-01T00:00:01Z","orderNum":"omnigraph-bench-fin-v1-tgt-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
+{"edge":"AccountTransferAccount","id":"omnigraph-bench-fin-v1-tgt-transfer","from":"omnigraph-bench-fin-v1-tgt-a","to":"omnigraph-bench-fin-v1-tgt-b","data":{"amount":2.5,"createTime":"2020-01-01T00:00:01Z","orderNum":"omnigraph-bench-fin-v1-tgt-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -285,7 +289,7 @@ impl RealGraphTemplate {
                 sync_plain_copy_filesystem(frozen.template_root())?;
                 Ok(Self::PlainCopy(frozen))
             }
-            ResetMode::S3Versioning => Err(std::io::Error::new(
+            ResetMode::None | ResetMode::S3Versioning => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "real-graph execution supports only local reset modes",
             )),
@@ -638,12 +642,15 @@ fn diagnostics_error(code: &'static str, diagnostics: Vec<Diagnostic>) -> RealGr
 
 async fn prepare_finbench_delta(root: &Path) -> Result<(), RealGraphRunError> {
     let uri = path_utf8(root)?;
-    let db = Omnigraph::open(uri).await.map_err(|error| {
-        RealGraphRunError::new(
-            "real_graph_prepare_failed",
-            format!("open disposable FinGraph copy: {error}"),
-        )
-    })?;
+    let db = Session::from_defaults(
+        Arc::new(Omnigraph::open(uri).await.map_err(|error| {
+            RealGraphRunError::new(
+                "real_graph_prepare_failed",
+                format!("open disposable FinGraph copy: {error}"),
+            )
+        })?),
+        SessionSettings::default(),
+    );
     let mut branches = db.branch_list().await.map_err(engine_prepare_error)?;
     branches.sort();
     if branches != ["main"] {
@@ -879,9 +886,14 @@ async fn execute_worker(
             "worker operation deadline is out of range",
         ));
     }
-    let db = Omnigraph::open(path_utf8(&request.root)?)
-        .await
-        .map_err(engine_worker_error)?;
+    let db = Session::from_defaults(
+        Arc::new(
+            Omnigraph::open(path_utf8(&request.root)?)
+                .await
+                .map_err(engine_worker_error)?,
+        ),
+        SessionSettings::default(),
+    );
     let main_before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -924,7 +936,7 @@ async fn execute_worker(
             ),
         ));
     }
-    if outcome != MergeOutcome::Merged {
+    if outcome.outcome != MergeOutcome::Merged {
         return Err(RealGraphRunError::new(
             "real_graph_vacuous_merge",
             format!("expected Merged, observed {outcome:?}"),
@@ -1188,7 +1200,7 @@ fn verify_account(
         )));
     }
     for (field, expected) in [
-        ("id", json!(id)),
+        (SYSTEM_COLUMNS_META.id, json!(id)),
         ("accountId", json!(id)),
         ("isBlocked", json!(false)),
         ("accountType", json!("internet_account")),
@@ -1234,9 +1246,9 @@ fn verify_transfer(
     }
     let source_side = id == SOURCE_EDGE;
     for (field, expected) in [
-        ("id", json!(id)),
-        ("src", json!(source)),
-        ("dst", json!(target)),
+        (SYSTEM_COLUMNS_META.id, json!(id)),
+        (SYSTEM_COLUMNS_META.src, json!(source)),
+        (SYSTEM_COLUMNS_META.dst, json!(target)),
         ("amount", json!(amount)),
         ("payType", json!("bank_transfer")),
         ("goodsType", json!("bank_transfer")),
@@ -1415,7 +1427,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omnigraph::loader::load_jsonl;
 
     #[test]
     fn run_spec_is_strict_and_bounded() {
@@ -1572,13 +1583,18 @@ mod tests {
         "#;
         const BASE: &str = r#"{"type":"Account","data":{"accountId":"existing-a","createTime":"2019-01-01T00:00:00Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
 {"type":"Account","data":{"accountId":"existing-b","createTime":"2019-01-01T00:00:00Z","isBlocked":false,"accountType":"internet_account","freqLoginType":"ipv4","accountLevel":"basic"}}
-{"edge":"AccountTransferAccount","from":"existing-a","to":"existing-b","data":{"id":"existing-transfer","amount":9.0,"createTime":"2019-01-01T00:00:00Z","orderNum":"existing-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
+{"edge":"AccountTransferAccount","id":"existing-transfer","from":"existing-a","to":"existing-b","data":{"amount":9.0,"createTime":"2019-01-01T00:00:00Z","orderNum":"existing-order","payType":"bank_transfer","goodsType":"bank_transfer"}}"#;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("active");
-        let db = Omnigraph::init(root.to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap();
-        load_jsonl(&db, BASE, LoadMode::Overwrite).await.unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(root.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(BASE, LoadMode::Overwrite).await.unwrap();
         drop(db);
 
         prepare_finbench_delta(&root).await.unwrap();

@@ -2,6 +2,9 @@
 
 A schema declares the node and edge types a graph accepts. OmniGraph validates
 the same schema and constraints for mutation queries, loads, and branch merges.
+Actor attribution on a commit does not create a graph node. Applications may
+declare their own `Actor`, `OmniActor`, or other provenance types; these are
+ordinary customer-owned types with no automatic rows or permission grants.
 
 ```pg
 node Person {
@@ -18,7 +21,7 @@ node Company {
 
 edge WorksAt: Person -> Company @card(0..) {
   role: String?
-  @unique(src, dst)
+  @unique(@src, @dst)
 }
 ```
 
@@ -46,19 +49,32 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `U32`, `U64` | Unsigned integers |
 | `F32`, `F64` | Floating-point numbers |
 | `Date` | Calendar date |
-| `DateTime` | Timestamp |
+| `DateTime` | Timestamp with millisecond precision |
 | `Vector(N)` | `N` 32-bit floating-point values |
 | `Blob` | Managed bytes or an external reference; see [Blobs](../blobs.md) |
 | `enum(a, b, ...)` | One of the declared strings |
 | `[T]` | A list of scalar `T` values |
 | `T?` | A nullable value |
 
-The names `_rowid`, `_rowaddr`, `_rowoffset`,
-`_row_created_at_version`, and `_row_last_updated_at_version` are reserved.
+Property names starting with `_` are reserved for system columns and are
+rejected when a schema is admitted. The reserved namespace covers Lance's
+virtual system columns (`_rowid`, `_rowaddr`, `_rowoffset`,
+`_row_created_at_version`, `_row_last_updated_at_version`) and OmniGraph's
+own implicit stored columns, spelled `__id` on nodes and edges and
+`__src`/`__dst` on edges for newly created graphs.
+Supported existing graphs without the `system-columns` feature keep the earlier spellings `id`, `src`,
+and `dst` for their implicit columns. They reserve `id` on nodes and edges,
+and `src`/`dst` on edges. On current graphs all three names are ordinary
+property names. Query meta-fields use `@id`, `@src`, and `@dst`; projected
+node objects use `@id`, and JSONL exports use a top-level `id`. The schema
+endpoint (`GET /schema`) reports the physical spellings in `system_columns`.
 `_distance` and `_score` are also reserved for new declarations: search-ordered
 queries rank results by those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
+
+On edge types the names `from` and `to` are also reserved: they are the
+insert parameters that name the endpoints.
 
 ## Constraints
 
@@ -67,8 +83,8 @@ also have a single-property shorthand.
 
 | Constraint | Applies to | Meaning |
 |---|---|---|
-| `@key(p, ...)` | node | The ordered property tuple identifies the node. Key properties must be non-null scalar values. |
-| `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `src` and `dst`. |
+| `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
+| `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
 | `@range(p, min..max)` | node | Restricts a numeric property; either bound may be omitted. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
@@ -86,16 +102,28 @@ See [Search](../search/index.md#indexes).
 
 ## IDs
 
-Every node and edge has a String `id` in load and export data.
+Every node and edge has a String id. On the wire it rides at the top level of
+the load or export envelope, under the fixed key `id`, beside `type` (nodes) or
+`edge`; `data` holds user properties. Legacy-vintage graphs also accept
+`data.id` as identity when the top-level `id` is absent; providing both is
+refused. In queries the id is the meta-field
+`$p.@id` and an edge's endpoints are `$e.@src` and `$e.@dst`
+([system fields](../queries/index.md#system-fields)); a bare `id` in a query
+is always a user property of that name.
 
 - A node with `@key` derives its id from the complete typed key tuple. Renaming a
   key property with `@rename_from` does not change existing ids.
 - A node without a key receives a generated id unless input supplies one.
-- Edges use generated or supplied ids and store their endpoints as `src` and
-  `dst`.
+- An edge with `@key` derives its id the same way, in the catalog's key
+  order: `@src`, then `@dst`, then any scalar members. A composite id encodes
+  as a JSON array of the member values, for example `["Alice","Bob"]`.
+- An edge without a key uses generated or supplied ids. Edges store their
+  endpoints as the graph's endpoint columns, `__src` and `__dst` on graphs
+  created by this binary.
 
-For hand-authored load data, omit a keyed node's `data.id` and let OmniGraph
-derive it. Export includes ids so a graph can be rebuilt without losing edge
+For hand-authored load data, omit a keyed node's or keyed edge's top-level `id`
+and let OmniGraph derive it; a supplied id on a keyed edge must equal the
+derived id exactly. Export includes ids so a graph can be rebuilt without losing edge
 references.
 
 ## Annotations
@@ -124,62 +152,51 @@ omnigraph schema apply --schema next.pg graph.omni
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
-soft-dropping node, edge, or property declarations.
+dropping node, edge, or property declarations.
+
+None of these changes rewrites existing rows. Adding a nullable property,
+renaming a property, or dropping a property changes only the table's metadata:
+existing rows read the new property as null, no stored value or Blob is read,
+and existing indexes keep covering the rows they covered. The time and memory
+the apply takes therefore do not grow with the number of rows or the size of
+their values. They still grow with the table's metadata: its columns, its
+indexes and its fragments, of which a table written by many small commits has
+more until `omnigraph optimize` compacts them.
+
+Applying changed schema text, including comments or formatting, records the new
+source in one graph commit even when no table changes are needed. Applying the
+same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, changing a
 node's implemented interfaces, and adding or removing most constraints are
 rejected. The plan reports the exact unsupported step before anything changes.
 
-A normal drop removes the declaration from the current schema while older
-commits remain readable until destructive cleanup removes their storage.
-`schema apply --allow-data-loss` makes drops immediately destructive. Review its
-plan carefully; it cannot be undone.
+A drop removes the declaration from the current schema and reclaims no storage
+at apply. Older commits still read the dropped data until `omnigraph cleanup`
+stops retaining them. Re-adding a property under a dropped name starts a new
+property, so a historical query never reads the dropped values through it; see
+[historical reads](../branching/index.md#historical-reads). A dropped type's data is reclaimed by that cleanup. A
+dropped property's values also stay in the table's current data files, beside
+the properties that remain, until the next `omnigraph optimize`: every
+optimize rewrites each fragment of a table that still stores a dropped
+property's values, copying only the remaining properties. Optimize rewrites
+main only, and cleanup deletes the old files only once nothing it retains
+references them: a live branch keeps the commit it was created from and its
+head, a tag keeps the snapshot it names, and the retention policy keeps older
+commits. Merging a branch releases none of its files; only deleting the branch
+does. To erase dropped data, run optimize after the drop, delete every branch
+created from a commit before that optimize and every tag naming such a commit,
+then run cleanup with a retention that excludes the commits before the
+optimize, for example `--keep 1`; after that, the dropped data cannot be
+recovered. Review the plan carefully, and treat that cleanup as the step that
+cannot be undone. See [optimize](../operations/maintenance.md#optimize) and
+[cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
 
-## Actor provenance
-
-New graphs include the protected `OmniActor` node with `actorId: String @key`.
-The first successful attributed content write creates its actor alongside the
-customer data in the same graph commit. Unattributed writes, reads, login, and
-zero-effect mutations create no actor. Customer-defined `Actor` types remain
-independent; declaring an unbound `OmniActor` conflicts with enabling this
-feature and must be renamed first.
-
-Use `omnigraph init --actor-provenance false` to create a graph without the
-built-in. Existing graphs keep their accepted setting until an explicit schema
-migration changes it:
-
-```bash
-omnigraph schema plan --schema current.pg --actor-provenance true graph.omni
-omnigraph schema apply --schema current.pg --actor-provenance true graph.omni
-```
-
-Pass `false` to stop automatic creation. Existing actor rows and their stable
-table identity remain queryable and protected; re-enabling reuses them. The
-customer source does not declare the built-in: the accepted schema IR owns its
-binding and setting. A bound graph uses schema IR version 3 and requires a
-compatible reader/writer even after automatic creation is disabled. Existing
-unbound version-2 graphs keep their legacy representation.
-
-Ordinary mutations and loads cannot modify the protected actor table. When
-automatic provenance is enabled, an attributed schema change that rewrites or
-removes existing content requires its actor to exist already. A missing actor
-returns `actor_provenance_unsupported_schema_write` before schema or table effects.
-Metadata changes, enabling/disabling, and empty table creation remain supported.
-Application edges can refer to `OmniActor` under ordinary referential-integrity
-rules; actor nodes do not grant permissions or prove human identity.
-
-Data exports follow their selected types and can include protected `OmniActor`
-rows. Ordinary load refuses those rows instead of recreating or silently dropping
-them. Export/load therefore does not provide a provenance-preserving restore;
-preserving provenance requires the accepted schema binding and actor content
-together with graph state.
-
 ## Diagnostic codes
-
 
 Migration rejections may include a stable `OG-...` code. Match automation on the
 code rather than the message text.
