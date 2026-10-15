@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-14
+updated: 2026-10-15
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -27,9 +27,11 @@ once, refuse invalid or unsupported selections without fallback, and print the
 resolved destination before mutations. Source directories and credentials do
 not select destinations.
 
-Use **workspace** for a declared configuration bundle and **service** for
-managed provisioning. Keep declarative validation, planning and application,
-the current v2 identity contract, and existing deployment/publication
+Use **service** for managed provisioning. Configuration remains an input bundle
+selected with `--config DIR`; it needs no separate named object or command group.
+Expose `validate`, `plan`, `apply` and `push` as top-level commands. Keep
+declarative validation, planning and application, the current v2 identity
+contract, and existing deployment/publication
 authority. This is a deliberate CLI/configuration migration, not a new storage,
 authorization or deployment protocol. All new syntax below is proposed; the
 [CLI reference](../user/cli/reference.md) owns currently supported behavior.
@@ -75,10 +77,10 @@ retaining operation-specific effects and recovery rules.
 | Concept | Meaning |
 | --- | --- |
 | Target | Operator-owned destination and authentication binding. Its nickname is not backend identity. |
-| Workspace | Desired bundle: `cluster.yaml` and its referenced schema, query, policy and provider files, or a captured managed source revision. |
+| Configuration bundle | Input files: `cluster.yaml` and its referenced schema, query, policy and provider files, or a captured managed source revision. It is not a separately registered resource. |
 | Service | Provisioned managed resource, with its authoritative service identity and incarnation. |
 | Deployment | Existing durable application/run identity and its observed outcome. |
-| Graph and branch/snapshot | Data scope within the selected target, independent of workspace source revision. |
+| Graph and branch/snapshot | Data scope within the selected target, independent of configuration source revision. |
 
 For backend operations, selection is exactly:
 
@@ -101,12 +103,12 @@ omnigraph target current
 omnigraph target inspect production --output json
 omnigraph target use staging
 omnigraph query list_people --target staging --graph knowledge
-omnigraph workspace validate ./company-brain
-omnigraph workspace plan ./company-brain --target staging
-omnigraph workspace apply ./company-brain --target staging
-omnigraph workspace push ./company-brain --target production
-omnigraph workspace plan --target production --revision REVISION
-omnigraph workspace apply --target production --plan PLAN_RUN_ID
+omnigraph validate --config ./company-brain
+omnigraph plan --config ./company-brain --target staging
+omnigraph apply --config ./company-brain --target staging
+omnigraph push --config ./company-brain --target production
+omnigraph plan --target production --revision REVISION
+omnigraph apply --target production --plan PLAN_RUN_ID
 omnigraph deployment show DEPLOYMENT_ID --target staging
 omnigraph service status --target production
 ```
@@ -132,9 +134,10 @@ Neither alone establishes that every command is available.
 | `direct` | `root`: one deployment storage root | Currently supported deployment, recovery and root/graph tooling. A root is not a graph URI. |
 | `server` | One server endpoint and its explicit authentication binding | Currently supported served data and deployment operations. Preserve HTTP(S) and Unix-socket support and platform refusals. |
 | `managed` | `account`: control API origin and control identity binding | Service creation and exact provisioning-operation recovery before a service exists. No graph access. |
-| `managed` | `service`: control API origin, service ID/incarnation and control identity binding; optional independently selected data endpoint and separate data credential reference | Qualified managed workspace/service operations; graph operations additionally require a complete data binding. |
+| `managed` | `service`: control API origin, service ID/incarnation and control identity binding; optional independently selected data endpoint and separate data credential reference | Qualified managed configuration/service operations; graph operations additionally require a complete data binding. |
 
-An account target must not require a service ID, data endpoint or workspace.
+An account target must not require a service ID, data endpoint or configuration
+directory.
 Service creation returns the service identity and operation/replay identifiers
 before attempting to save a local target. A local save failure cannot hide an
 accepted creation or cause another create. Registering the resulting service
@@ -147,7 +150,7 @@ unavailable data endpoint cannot block service status, deletion or recovery.
 
 A graph operation requires `--graph` or the selected target's `default_graph`
 when the target does not itself identify one graph. A direct graph target rejects an
-additional graph selector. Registry, workspace, deployment and service
+additional graph selector. Registry, configuration, deployment and service
 operations do not consume a graph default and reject an irrelevant explicit
 graph. No sole-graph probe supplies a missing graph. Data branch/snapshot
 selection remains explicit or uses that operation's existing default; targets
@@ -224,9 +227,9 @@ credential mechanism/reference, configuration path and selection provenance.
 It labels configured identity as configured, not remotely verified.
 
 Inspection is offline and redacted: no token reads/exports, issuer calls,
-authentication refresh, credential plugins, backend opens or workspace reads.
-Untrusted workspaces cannot install authentication behavior. Portable secret
-export, if ever added, is a separate explicit operation.
+authentication refresh, credential plugins, backend opens or reads of bundle
+files. Untrusted configuration bundles cannot install authentication behavior.
+Portable secret export, if ever added, is a separate explicit operation.
 
 ### Aliases, output and discovery
 
@@ -314,34 +317,37 @@ the existing acquisition lock. Offline inspection never performs acquisition.
 Authenticated served actors remain server-derived; direct actor selection and
 engine policy checks retain their existing scope.
 
-### Workspace input and deployment
+### Configuration input and deployment
 
-The destination never supplies desired configuration. A source argument names
-a workspace, not a backend. Keep `cluster.yaml` and all storage/wire names in
-this proposal; renaming CLI nouns does not rename deployed artifacts or routes.
+The destination never supplies desired configuration. `--config DIR` selects
+the directory containing `cluster.yaml` and its referenced input files. Keep
+`cluster.yaml` and all storage/wire names in this proposal; renaming CLI nouns
+does not rename deployed artifacts or routes.
 The [current control-plane guide](../dev/control-plane.md) and
 [server deployment RFC](2026-09-29-server-runtime-and-online-deployment.md)
 own durable authority and activation.
 
 | Stage | Direct root or server | Managed service |
 | --- | --- | --- |
-| Validate | Local workspace validation, without target credentials. | Same local authoring validation; does not validate a remote revision. |
+| Validate | Local bundle validation, without target credentials. | Same local authoring validation; does not validate a remote revision. |
 | Push | No new upload step. | Explicit capture/upload of referenced files, retaining existing bounds and replay contract. |
-| Plan | Workspace preview against selected destination. | Saved plan for explicit pushed revision or bound source head, including existing lease/effects. |
+| Plan | Bundle preview against selected destination. | Saved plan for explicit pushed revision or bound source head, including existing lease/effects. |
 | Apply | Capture/revalidate source and submit through current owner. | Execute the exact saved plan; never silently replan, push or commit source. |
 | Inspect/wait | Observe the original deployment ID and digest. | Observe the original run/provisioning-operation identity under its protocol. |
 
-Direct/server plan and new apply require an explicit source directory; no
-implicit `.` destination or source inference. A workspace's declared storage
-root must agree with the independently selected destination under existing
-canonical-root checks; neither side silently overrides the other. Managed
-plan uses its pushed source contract and rejects a local directory as execution
-input. Its output identifies the exact selected revision. A graph branch is
-never a configuration branch or revision.
+Local `validate`, managed `push`, and direct/server `plan` and new `apply` require
+an explicit `--config DIR`; there is no implicit `.` source or destination.
+Managed `plan` selects its pushed source through `--revision` or the bound head;
+managed `apply` selects the exact saved `--plan`. Both reject `--config` because
+local files are not their execution input. Managed plan output identifies the
+exact selected revision. A bundle's declared storage root must agree with the
+independently selected destination under existing canonical-root checks; neither
+side silently overrides the other. A graph branch is never a configuration
+branch or revision.
 
 New direct apply still requires stopped serving and the existing writer/admission
 conditions. Server-owned apply retains live activation. Root-only reconciliation
-of an existing deployment remains possible without workspace files, using its
+of an existing deployment remains possible without source files, using its
 exact identity and existing quiescence requirements. Routing never adds a
 ledger writer, a per-graph apply loop, a last-applied cache or field-ownership
 database. Removed import, refresh and approve commands stay removed.
@@ -384,7 +390,7 @@ The migration inventory must map every current command and target source:
 | `--managed` and folder-based mode selection | Managed target kind/scope. |
 | `--direct` | Retired after command-aware migration; never translate it to storage because ordinary addressing may select HTTP. |
 | `OMNIGRAPH_PROFILE`, implicit folder context | Retired as routing sources; explicit import may propose target entries but never selects one automatically. |
-| `cluster validate/plan/apply/push` | `workspace` operations with source and destination separated. |
+| `cluster validate/plan/apply/push` | Top-level `validate`, `plan`, `apply`, `push`; `--config DIR` selects local input, `--target NAME` selects the backend. Managed plan/apply use revision/saved-plan inputs instead of `--config`. |
 | Deployment status/observe/reconciliation, lock and ledger maintenance | Explicit `deployment` operations through the selected backend; retain distinct observational and effectful verbs. |
 | Managed create/delete/undo-delete/status and provisioning-operation recovery | `service` operations, including account-scoped recovery. |
 | Folder `use`, `profile list/show`, credential commands and aliases | Target administration/inspection and target-bound authentication/aliases, with explicit migration for each spelling. |
@@ -485,7 +491,7 @@ Use hermetic operator homes and fixture credentials; do not log secrets.
 | Credential binding | Wrong API, endpoint, service/incarnation or principal never sends the credential to a substituted destination; v1/malformed cache refuses. Missing/expired valid v2 paths acquire only under existing bounds. | Managed data/auth tests, server `auth_policy` |
 | Inspection/completion | Offline, redacted, correct provenance; no token reads, issuer/backend calls, config writes or executable auth. Relative paths stay tied to the declaring file. | Operator/config and CLI invocation tests |
 | Output | Every mutation has the same resolved target diagnostic on stderr; JSON, query rows, NDJSON and Blob bytes remain parseable; exact receipts and unknown outcomes survive quiet mode. | `cli_data`, `cli_cluster`, existing outcome tests |
-| Source/deployment binding | Workspace-root mismatch refuses; managed plan uses pushed revision and apply exact plan; direct recovery needs no source; no v1 executor or apply loop. | `cli_cluster`, `cli_cluster_e2e`, cluster deployment tests |
+| Source/deployment binding | Bundle-root mismatch refuses; managed plan uses pushed revision and apply exact plan; direct recovery needs no source; no v1 executor or apply loop. | `cli_cluster`, `cli_cluster_e2e`, cluster deployment tests |
 | Observation | Concurrent successor cannot satisfy original wait; lost submission reply/timeout observes original ID without resubmission, with bounded polls. | `system_remote`, `cli_cluster`, server deployment tests |
 | Aliases and migration | Bound aliases cannot retarget; name collisions and credential owners; complete old-command inventory, conflict/refusal behavior, finite adapter removal and isolated old/new binary homes. | `operator.rs`, `planes.rs`, `cli_queries`, `cli_schema_config` |
 
@@ -559,3 +565,9 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
   removed v1 grants, retired commands, restart-only assumptions and unrelated
   public-Rust repairs. Removed the duplicate developer framework. The original
   draft remains in Git history; this revision remains a proposal.
+- **2026-10-15:** Removed the proposed `workspace` command group and resource
+  vocabulary from the body. Top-level `validate`, `plan`, `apply` and `push`
+  operate on configuration input; `--config DIR` replaces the earlier positional
+  directory examples. This supersedes the 2026-10-14 workspace naming decision.
+  Target selection, managed revision/saved-plan semantics and service lifecycle
+  separation are unchanged.
