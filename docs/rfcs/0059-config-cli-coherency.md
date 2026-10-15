@@ -27,22 +27,27 @@ once, refuse invalid or unsupported selections without fallback, and print the
 resolved destination before mutations. Source directories and credentials do
 not select destinations.
 
-Use **service** for managed provisioning. Configuration remains an input bundle
-selected with `--config DIR`; it needs no separate named object or command group.
-Expose `validate`, `plan`, `apply` and `push` as top-level commands. Keep
-declarative validation, planning and application, the current v2 identity
-contract, and existing deployment/publication
-authority. This is a deliberate CLI/configuration migration, not a new storage,
-authorization or deployment protocol. All new syntax below is proposed; the
-[CLI reference](../user/cli/reference.md) owns currently supported behavior.
+Keep the existing command families: `cluster validate/plan/apply/status` and
+managed `cluster create/push/delete/operation` remain under `cluster`. Add
+`target` only for administering connection selections. Configuration remains
+input files selected with `--config DIR`; provisioning and deployment remain
+operations on the selected cluster. No `workspace`, `service` or `deployment`
+command group is introduced.
+
+Keep declarative planning/application, the current v2 identity contract and
+existing deployment/publication authority. This proposal changes destination
+selection, not the storage, authorization or deployment protocol. All new syntax
+below is proposed; the [CLI reference](../user/cli/reference.md) owns currently
+supported behavior.
 
 ## Motivation and inspected baseline
 
 The current CLI distributes destination selection among `--server`, `--store`,
 `--cluster`, `--profile`, `--managed`, `--direct`, operator defaults, environment
 profiles and managed folder context. Their applicability differs by command.
-The noun `cluster` also covers a declared bundle, direct deployment storage
-and a provisioned managed service.
+The existing `cluster` family already groups configuration, deployment and
+managed lifecycle operations. Keep that organization and make backend selection
+consistent across those operations.
 
 Source was reviewed at `cea152566` on 2026-10-14. The existing explicit managed
 control selection and ambiguity checks already prevent several earlier wrong
@@ -66,7 +71,7 @@ source inspection and proposed evidence gates, not runtime qualification.
 
 Expected work includes interactive switching between development and production,
 scripts sharing operator homes with interactive shells, local authoring against
-a remote service, bootstrap before a service exists, and recovery after a lost
+a remote cluster, bootstrap before a cluster exists, and recovery after a lost
 submission response. Those cases require a common selection contract while
 retaining operation-specific effects and recovery rules.
 
@@ -78,7 +83,7 @@ retaining operation-specific effects and recovery rules.
 | --- | --- |
 | Target | Operator-owned destination and authentication binding. Its nickname is not backend identity. |
 | Configuration bundle | Input files: `cluster.yaml` and its referenced schema, query, policy and provider files, or a captured managed source revision. It is not a separately registered resource. |
-| Service | Provisioned managed resource, with its authoritative service identity and incarnation. |
+| Cluster | The existing unit of configuration, deployment and managed lifecycle operations. Target kind determines which operations are supported. |
 | Deployment | Existing durable application/run identity and its observed outcome. |
 | Graph and branch/snapshot | Data scope within the selected target, independent of configuration source revision. |
 
@@ -103,17 +108,18 @@ omnigraph target current
 omnigraph target inspect production --output json
 omnigraph target use staging
 omnigraph query list_people --target staging --graph knowledge
-omnigraph validate --config ./company-brain
-omnigraph plan --config ./company-brain --target staging
-omnigraph apply --config ./company-brain --target staging
-omnigraph push --config ./company-brain --target production
-omnigraph plan --target production --revision REVISION
-omnigraph apply --target production --plan PLAN_RUN_ID
-omnigraph deployment show DEPLOYMENT_ID --target staging
-omnigraph service status --target production
+omnigraph cluster validate --config ./company-brain
+omnigraph cluster plan --config ./company-brain --target staging
+omnigraph cluster apply --config ./company-brain --target staging
+omnigraph cluster push --config ./company-brain --target production \
+  --expected-revision PREVIOUS_REVISION --message "Update configuration"
+omnigraph cluster plan --target production --rev REVISION
+omnigraph cluster apply --target production --plan PLAN_RUN_ID
+omnigraph cluster status --deployment-id DEPLOYMENT_ID --target staging
+omnigraph cluster status --target production
 ```
 
-Here `staging` is a server target; `production` is a managed service target.
+Here `staging` is a server target; `production` is a managed cluster target.
 Data commands retain their existing query, parameter, branch, snapshot and
 conditional-write semantics. Target selection never infers a stored query from
 a local filename or a graph from credentials or discovery results.
@@ -133,26 +139,24 @@ Neither alone establishes that every command is available.
 | `direct` | `graph`: one storage URI | Currently supported direct graph operations, including initialization and maintenance. |
 | `direct` | `root`: one deployment storage root | Currently supported deployment, recovery and root/graph tooling. A root is not a graph URI. |
 | `server` | One server endpoint and its explicit authentication binding | Currently supported served data and deployment operations. Preserve HTTP(S) and Unix-socket support and platform refusals. |
-| `managed` | `account`: control API origin and control identity binding | Service creation and exact provisioning-operation recovery before a service exists. No graph access. |
-| `managed` | `service`: control API origin, service ID/incarnation and control identity binding; optional independently selected data endpoint and separate data credential reference | Qualified managed configuration/service operations; graph operations additionally require a complete data binding. |
+| `managed` | `account`: control API origin and control identity binding | Cluster creation and exact provisioning-operation recovery before a cluster exists. No graph access. |
+| `managed` | `cluster`: control API origin, cluster ID/incarnation and control identity binding; optional independently selected data endpoint and separate data credential reference | Qualified managed configuration/lifecycle operations; graph operations additionally require a complete data binding. |
 
-An account target must not require a service ID, data endpoint or configuration
-directory.
-Service creation returns the service identity and operation/replay identifiers
+An account target must not require a cluster ID, data endpoint or configuration
+directory. Cluster creation returns the cluster identity and operation/replay identifiers
 before attempting to save a local target. A local save failure cannot hide an
-accepted creation or cause another create. Registering the resulting service
+accepted creation or cause another create. Registering the resulting cluster
 target does not automatically make it current.
 
-A service target can be registered immediately after accepted creation, before
-its data endpoint is ready. Control operations use its service binding; graph
+A managed cluster target can be registered immediately after accepted creation,
+before its data endpoint is ready. Control operations use its cluster binding; graph
 operations refuse until an explicit endpoint/data binding is installed. An
-unavailable data endpoint cannot block service status, deletion or recovery.
+unavailable data endpoint cannot block cluster status, deletion or recovery.
 
 A graph operation requires `--graph` or the selected target's `default_graph`
 when the target does not itself identify one graph. A direct graph target rejects an
-additional graph selector. Registry, configuration, deployment and service
-operations do not consume a graph default and reject an irrelevant explicit
-graph. No sole-graph probe supplies a missing graph. Data branch/snapshot
+additional graph selector. Registry and cluster control operations do not
+consume a graph default and reject an irrelevant explicit graph. No sole-graph probe supplies a missing graph. Data branch/snapshot
 selection remains explicit or uses that operation's existing default; targets
 do not add hidden branch defaults.
 
@@ -193,10 +197,10 @@ targets:
     control_credential: work-account
   production:
     kind: managed
-    scope: service
+    scope: cluster
     api: https://control.example
-    service_id: SERVICE_ID
-    service_incarnation: INCARNATION
+    cluster_id: CLUSTER_ID
+    cluster_incarnation: INCARNATION
     endpoint: https://production.graphs.example
     control_credential: work-account
     data_credential: production-identity
@@ -250,8 +254,8 @@ and conflict rule, not a second rendering implementation.
 Before every backend mutation, print the resolved target kind, destination,
 graph/branch where applicable and selection source to stderr. This includes
 ordinary mutations, branch statements, loads, Blob writes, deployments and
-service operations. `--quiet` may suppress progress but not this destination
-line or unknown-outcome recovery information. Results remain on stdout.
+managed lifecycle operations. `--quiet` may suppress progress but not this
+destination line or unknown-outcome recovery information. Results remain on stdout.
 Classify effects per operation, including durable unpublished proposals and
 equivalent GQ statements. Preserve read-shaped operations' existing recovery
 effects and make them explicit; a read-like verb is not proof of no writes.
@@ -302,7 +306,7 @@ root/incarnation; current applied policy authorizes operations. Candidate
 policy cannot authorize its own deployment.
 
 Resolve endpoints independently of credentials. Before sending a managed data
-credential, require agreement with the selected canonical API origin, service
+credential, require agreement with the selected canonical API origin, cluster
 ID/incarnation and data endpoint as well as the existing v2 metadata checks.
 A cache entry cannot supply or replace the destination. Endpoint rotation is an
 explicit target update plus matching credential acquisition; permission refusal
@@ -321,13 +325,13 @@ engine policy checks retain their existing scope.
 
 The destination never supplies desired configuration. `--config DIR` selects
 the directory containing `cluster.yaml` and its referenced input files. Keep
-`cluster.yaml` and all storage/wire names in this proposal; renaming CLI nouns
-does not rename deployed artifacts or routes.
+`cluster.yaml` and all storage/wire names unchanged; connection naming does
+not rename deployed artifacts or routes.
 The [current control-plane guide](../dev/control-plane.md) and
 [server deployment RFC](2026-09-29-server-runtime-and-online-deployment.md)
 own durable authority and activation.
 
-| Stage | Direct root or server | Managed service |
+| Stage | Direct root or server | Managed cluster |
 | --- | --- | --- |
 | Validate | Local bundle validation, without target credentials. | Same local authoring validation; does not validate a remote revision. |
 | Push | No new upload step. | Explicit capture/upload of referenced files, retaining existing bounds and replay contract. |
@@ -335,18 +339,25 @@ own durable authority and activation.
 | Apply | Capture/revalidate source and submit through current owner. | Execute the exact saved plan; never silently replan, push or commit source. |
 | Inspect/wait | Observe the original deployment ID and digest. | Observe the original run/provisioning-operation identity under its protocol. |
 
-Local `validate`, managed `push`, and direct/server `plan` and new `apply` require
-an explicit `--config DIR`; there is no implicit `.` source or destination.
-Managed `plan` selects its pushed source through `--revision` or the bound head;
-managed `apply` selects the exact saved `--plan`. Both reject `--config` because
-local files are not their execution input. Managed plan output identifies the
-exact selected revision. A bundle's declared storage root must agree with the
-independently selected destination under existing canonical-root checks; neither
-side silently overrides the other. A graph branch is never a configuration
-branch or revision.
+Keep `--config DIR` for local inputs to `cluster validate`, managed
+`cluster push`, and direct/server `cluster plan` and source-based `cluster apply`. Its
+existing `.` default selects source files only and cannot supply a destination.
+Managed `cluster plan` retains `--rev` or the bound source head; managed
+`cluster apply` retains the exact saved `--plan`. These two paths reject
+`--config` because they no longer need folder context and do not execute local
+files. Managed plan output identifies the exact selected revision. A bundle's
+declared storage root must agree with the independently selected destination
+under existing canonical-root checks; neither side silently overrides the
+other. A graph branch is never a configuration branch or revision.
 
-New direct apply still requires stopped serving and the existing writer/admission
-conditions. Server-owned apply retains live activation. Root-only reconciliation
+The target determines command availability. For example, `cluster create` needs
+an account-scoped managed target, `cluster push/delete` need a managed cluster
+target, and `cluster force-unlock` needs supported direct root access. An
+unsupported combination refuses rather than changing backend or turning one
+operation into another. `cluster validate` stays local and needs no target.
+
+Applying new configuration through direct storage still requires stopped serving
+and the existing writer/admission conditions. Server-owned apply retains live activation. Root-only reconciliation
 of an existing deployment remains possible without source files, using its
 exact identity and existing quiescence requirements. Routing never adds a
 ledger writer, a per-graph apply loop, a last-applied cache or field-ownership
@@ -387,18 +398,18 @@ The migration inventory must map every current command and target source:
 | --- | --- |
 | Server, store/root entries, profiles and flat target defaults | Complete named targets; presentation defaults stay separate. |
 | `--server`, `--store`, `--cluster`, `--profile`, positional backend addresses | `--target NAME`; registration accepts explicit endpoints/URIs. No permanent second targeting syntax. |
-| `--managed` and folder-based mode selection | Managed target kind/scope. |
+| `--managed` and folder-based mode selection | Managed target kind/scope, with the existing `cluster` verbs. |
 | `--direct` | Retired after command-aware migration; never translate it to storage because ordinary addressing may select HTTP. |
 | `OMNIGRAPH_PROFILE`, implicit folder context | Retired as routing sources; explicit import may propose target entries but never selects one automatically. |
-| `cluster validate/plan/apply/push` | Top-level `validate`, `plan`, `apply`, `push`; `--config DIR` selects local input, `--target NAME` selects the backend. Managed plan/apply use revision/saved-plan inputs instead of `--config`. |
-| Deployment status/observe/reconciliation, lock and ledger maintenance | Explicit `deployment` operations through the selected backend; retain distinct observational and effectful verbs. |
-| Managed create/delete/undo-delete/status and provisioning-operation recovery | `service` operations, including account-scoped recovery. |
+| `cluster validate/plan/apply/push` | Keep their names. `--config DIR` selects local input; `--target NAME` selects the backend. Managed plan/apply retain `--rev`/`--plan` and no longer read folder context. |
+| Deployment status/observe/reconciliation, lock and ledger maintenance | Keep `cluster status/observe/apply/force-unlock/upgrade-ledger` and their exact-ID/recovery contracts; resolve the destination through `--target`. |
+| Managed create/delete/undo-delete/status and provisioning-operation recovery | Keep `cluster create/delete/undo-delete/status/operation`, including account-scoped creation/recovery. Managed history/cancel/token also remain under `cluster`. |
 | Folder `use`, `profile list/show`, credential commands and aliases | Target administration/inspection and target-bound authentication/aliases, with explicit migration for each spelling. |
 
 Do not infer equivalence from equal nicknames. Existing cluster-name resolution
 differs between maintenance and deployment commands. Flatten each profile's
 complete address and graph binding; do not inherit fields from unused profiles
-or defaults. Importing a folder binding requires independently verified service
+or defaults. Importing a folder binding requires independently verified cluster
 endpoint/identity information, not a cached token's choice of destination.
 Colliding server/cluster/profile names require an explicit mapping. Two old
 names sharing an endpoint retain their chosen credential owners; URL-prefix
@@ -428,7 +439,7 @@ Older binaries ignore unknown operator keys today; a new format marker alone
 cannot make them refuse safely. Use isolated operator homes and matched
 binary/config/script upgrades, with a nonsecret backup and an explicit rollback
 procedure. Never run old binaries on migrated configuration and assume equivalent
-selection. Routing rollback changes no graph format, service identity or ledger;
+selection. Routing rollback changes no graph format, cluster identity or ledger;
 independent storage/server downgrade restrictions still apply.
 
 ## Scope and alternatives
@@ -448,7 +459,7 @@ resolve existing supported targets.
 | Alternative | Decision |
 | --- | --- |
 | Keep overlapping flags and document precedence | Rejected: every new command must still explain multiple competing selection models. |
-| Add managed profiles only | Rejected: leaves controls, folder routing and provisioning nouns inconsistent. |
+| Add managed profiles only | Rejected: leaves controls and folder routing with different selection rules. |
 | Require an explicit target on every invocation | Supported for automation; allow explicit persistent selection for interactive work, with mutation diagnostics. |
 | Copy kubeconfig file merging and independent connection overrides | Rejected: expands provenance/write-back rules and permits destination/authentication field splicing. |
 | Copy Kubernetes field ownership or per-object apply | Rejected: creates incompatible configuration/publication authority. Existing deployment owners remain responsible for partial progress and recovery. |
@@ -486,12 +497,12 @@ Use hermetic operator homes and fixture credentials; do not log secrets.
 | Selection | Explicit target overrides current; empty/unknown/malformed/unsupported selection never falls back. Missing selection errors before backend access. | `operator.rs`, `scope.rs`, `planes.rs`, `cli_schema_config` |
 | Directory independence | Valid, malformed and parent-only managed context cannot affect any new target-selected command or local tool. | `cli_cluster`, `cli_data`, managed data tests |
 | Frozen invocation | Change current target/config during acquisition, submission and waiting; all traffic and diagnostics retain original target identity. | Managed data tests, `cli_cluster`, `system_remote` |
-| Scope matrix | Graph/root/server/managed-account/managed-service; missing/explicit/default graph; unsupported operations; server Unix sockets and unsupported platforms. | `planes.rs`, `cli_schema_config`, `cli_data`, `cli_cluster` |
-| Bootstrap | Create without a service; control-only service target before endpoint readiness; lost reply and local target-save failure preserve original replay/operation identifiers without duplicate creation. | Managed lifecycle tests, `cli_cluster` |
-| Credential binding | Wrong API, endpoint, service/incarnation or principal never sends the credential to a substituted destination; v1/malformed cache refuses. Missing/expired valid v2 paths acquire only under existing bounds. | Managed data/auth tests, server `auth_policy` |
+| Scope matrix | Graph/root/server/managed-account/managed-cluster; missing/explicit/default graph; unsupported operations; server Unix sockets and unsupported platforms. | `planes.rs`, `cli_schema_config`, `cli_data`, `cli_cluster` |
+| Bootstrap | Create without an existing cluster; control-only managed cluster target before endpoint readiness; lost reply and local target-save failure preserve original replay/operation identifiers without duplicate creation. | Managed lifecycle tests, `cli_cluster` |
+| Credential binding | Wrong API, endpoint, cluster/incarnation or principal never sends the credential to a substituted destination; v1/malformed cache refuses. Missing/expired valid v2 paths acquire only under existing bounds. | Managed data/auth tests, server `auth_policy` |
 | Inspection/completion | Offline, redacted, correct provenance; no token reads, issuer/backend calls, config writes or executable auth. Relative paths stay tied to the declaring file. | Operator/config and CLI invocation tests |
 | Output | Every mutation has the same resolved target diagnostic on stderr; JSON, query rows, NDJSON and Blob bytes remain parseable; exact receipts and unknown outcomes survive quiet mode. | `cli_data`, `cli_cluster`, existing outcome tests |
-| Source/deployment binding | Bundle-root mismatch refuses; managed plan uses pushed revision and apply exact plan; direct recovery needs no source; no v1 executor or apply loop. | `cli_cluster`, `cli_cluster_e2e`, cluster deployment tests |
+| Source/deployment binding | `--config` and its default select only source files; managed plan/apply reject it; bundle-root mismatch refuses; managed plan uses pushed revision and apply exact plan; direct recovery needs no source; no v1 executor or apply loop. | `cli_cluster`, `cli_cluster_e2e`, cluster deployment tests |
 | Observation | Concurrent successor cannot satisfy original wait; lost submission reply/timeout observes original ID without resubmission, with bounded polls. | `system_remote`, `cli_cluster`, server deployment tests |
 | Aliases and migration | Bound aliases cannot retarget; name collisions and credential owners; complete old-command inventory, conflict/refusal behavior, finite adapter removal and isolated old/new binary homes. | `operator.rs`, `planes.rs`, `cli_queries`, `cli_schema_config` |
 
@@ -571,3 +582,9 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
   directory examples. This supersedes the 2026-10-14 workspace naming decision.
   Target selection, managed revision/saved-plan semantics and service lifecycle
   separation are unchanged.
+- **2026-10-15 — Retain existing command families:** Supersedes the earlier
+  workspace/service/deployment grouping and top-level configuration verbs.
+  Keep configuration, lifecycle and recovery commands under `cluster`, including
+  `--rev`, exact operation identifiers and the local-source `--config` default.
+  Add `target` administration and unify destination selection with `--target`.
+  No new resource command groups are needed to establish that contract.
