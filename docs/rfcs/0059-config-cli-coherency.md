@@ -89,16 +89,9 @@ targets:
     default_graph: knowledge
 ```
 
-```sh
-omnigraph cluster validate --config ./app
-omnigraph cluster plan --config ./app
-omnigraph cluster apply --config ./app
-omnigraph cluster apply --config ./app --target production
-omnigraph query list_people --target production --graph knowledge
-```
-
-Here plan/apply use `staging` unless overridden. The directory supplies desired
-configuration; the named target supplies the backend. Neither replaces the other.
+With this configuration, plan/apply use `staging` unless overridden. The directory
+supplies desired configuration; the named target supplies the backend. Neither
+replaces the other.
 `--config` retains its `.` source default where applicable. An omitted `--target`
 is valid whenever operator config supplies `defaults.target`.
 
@@ -113,6 +106,92 @@ homes. Local modes ignore the default and reject an irrelevant explicit target.
 Keep `cluster` for configuration, deployment and managed lifecycle operations.
 A configuration bundle is simply the input files, not another registered resource.
 No `workspace`, `service` or `deployment` command group is introduced.
+
+### Before and after
+
+The following comparisons show current commands and proposed post-migration
+syntax. Assume `defaults.target: staging`, with `staging` and `production` as
+server targets, `cloud` as a managed cluster target, and `local` naming the same
+graph addressed by `./graph.omni` in the direct-access example. All target entries
+must be configured first; their names do not infer an endpoint or storage path.
+
+**Query a server**
+
+```sh
+# Before
+omnigraph query list_people --server production --graph knowledge
+
+# After
+omnigraph query list_people --target production --graph knowledge
+```
+
+**Plan and apply to the default cluster**
+
+```sh
+# Before
+omnigraph cluster plan --config ./app --server staging
+omnigraph cluster apply --config ./app --server staging
+
+# After — defaults.target selects staging
+omnigraph cluster plan --config ./app
+omnigraph cluster apply --config ./app
+```
+
+**Apply to a different cluster for this invocation**
+
+```sh
+# Before
+omnigraph cluster apply --config ./prod --server production
+
+# After
+omnigraph cluster apply --config ./prod --target production
+```
+
+`--config` selects the files; `--target` selects the destination. The bundle's
+declared root must match that destination. This invocation leaves the default
+unchanged.
+
+**Plan and apply a managed revision**
+
+```sh
+# Before — ./app supplies the managed folder binding
+omnigraph cluster plan --managed --config ./app --rev REVISION
+omnigraph cluster apply --managed --config ./app --plan PREVIEW_ID
+
+# After
+omnigraph cluster plan --target cloud --rev REVISION
+omnigraph cluster apply --target cloud --plan PREVIEW_ID
+```
+
+`REVISION` is the full pushed commit ID and `PREVIEW_ID` comes from planning.
+These commands use pushed source; local edits still require `cluster push`.
+
+**Check a managed deployment**
+
+```sh
+# Before
+omnigraph cluster status DEPLOYMENT_ID --managed --config ./app --wait
+
+# After
+omnigraph cluster status DEPLOYMENT_ID --target cloud --wait
+```
+
+**Query a local graph using a query file**
+
+```sh
+# Before
+omnigraph query list_people --query queries.gq --store ./graph.omni
+
+# After
+omnigraph query list_people --query queries.gq --target local
+```
+
+**Validate local configuration — unchanged**
+
+```sh
+# Before and after — no destination needed
+omnigraph cluster validate --config ./app
+```
 
 ### Complete target bindings
 
