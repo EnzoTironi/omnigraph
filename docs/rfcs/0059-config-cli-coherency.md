@@ -47,14 +47,15 @@ owns currently supported behavior.
 
 The current CLI distributes destination selection among `--server`, `--store`,
 `--cluster`, `--profile`, `--managed`, `--direct`, backend URI arguments, operator
-defaults, environment profiles and managed folder context. Their applicability
-differs by command. Some supported data commands use folder context implicitly,
+defaults, environment profiles, managed folder context and bundle `storage:`
+(or its source-directory fallback). Their applicability differs by command.
+Some supported data commands use folder context implicitly,
 while managed controls require explicit mode selection. Profiles and root
 nicknames also have different applicability across data and cluster controls.
 The existing ambiguity checks prevent several wrong-destination cases, but do
 not provide one selection contract.
 
-Source was reviewed at `76b8976aaa9267e2bcd9b9259ef17a9950f07fa7` on 2026-10-16:
+Source was reviewed at `864495a863bf92a7f4084dce6b0d47743b112b2a` on 2026-10-16:
 75 explicit command leaves, plus argument-dependent modes and aliases. This
 includes organization administration from [#1004](https://github.com/ModernRelay/omnigraph/pull/1004)
 and local skill commands from [#995](https://github.com/ModernRelay/omnigraph/pull/995).
@@ -96,15 +97,23 @@ targets:
 With this configuration, plan/apply use `staging` unless overridden. The directory
 supplies desired configuration; the named target supplies the backend. Neither
 replaces the other. `--config` retains its `.` source default where applicable.
-An omitted `--target` is valid whenever operator config supplies `defaults.target`.
+An omitted `--target` uses `defaults.target`, except for the recovery effects
+below that require explicit destination selection.
 
 An empty, unknown, malformed or unsupported explicit target errors; it never
-falls through to the default. Validate a default reference only when it is selected:
+falls through to the default. Validate a default reference only when selected:
 an unused dangling default cannot block an explicit target, bound alias or local
-command. Malformed operator configuration still refuses. Environment profiles,
-folder context, cached credentials and discovery results cannot select or repair
-a destination. Automation can pass `--target` and use isolated operator
-homes. Local modes ignore the default and reject an irrelevant explicit target.
+command. YAML, duplicate-name, format-version, unknown-key and mixed legacy/target
+format errors refuse whenever the operator file is read. Variant completeness
+and endpoint semantics are checked for the selected entry; unrelated incomplete
+entries do not block it. Environment profiles, folder context, cached credentials
+and discovery results cannot select or repair a destination. During compatibility,
+default selection refuses a nonempty `OMNIGRAPH_PROFILE` or folder routing evidence
+that formerly applied to that command; it never silently substitutes the new
+default. Explicit targets remain independent of retired routing evidence. Lifecycle
+recovery evidence has the separate mandatory preservation rule below, even with
+an explicit target. Automation can use isolated operator homes. Local modes ignore
+the default and reject an irrelevant explicit target.
 
 Keep `cluster` for configuration, deployment and managed lifecycle operations.
 A configuration bundle is simply the input files, not another registered resource.
@@ -219,10 +228,11 @@ A nickname is not a storage, cluster or credential identity.
 | Kind/scope | Required destination binding |
 | --- | --- |
 | Direct graph | One storage URI and any nonsecret provider account/endpoint settings needed to identify that storage. |
-| Direct root | One deployment storage root with the same provider requirements; this is not a graph URI or source directory. |
+| Direct root | One deployment storage root with the same provider requirements. Source and storage are distinct roles but may occupy the same directory. |
+| Direct catalogue | The current binary's built-in `og_catalog`; no URI, provider, credential or graph-default fields. |
 | Server | One HTTP(S) endpoint or supported Unix socket, with an explicit authentication binding. |
-| Managed account | Control API origin, organization ID and control credential binding. Organization may be omitted only for first-login discovery described below. No cluster, data endpoint or source directory required. |
-| Managed cluster | Control API origin, organization ID, cluster ID/incarnation and control credential binding. An independently configured data endpoint and separate data credential binding are required only for data access. |
+| Managed account | Control API origin, organization ID and declared control authentication mechanism. Organization may be omitted only for first-login discovery described below. No cluster, data endpoint or source directory required. |
+| Managed cluster | Control API origin, organization ID, cluster ID/incarnation and declared control authentication mechanism. A configured data endpoint is required for data requests; data credentials keep their existing identity-derived namespace. |
 
 Additional schema sketches:
 
@@ -241,7 +251,7 @@ targets:
     scope: account
     api: https://control.example
     organization_id: ORGANIZATION_ID
-    control_credential: work-account
+    control_auth: human-device
   managed-production:
     kind: managed
     scope: cluster
@@ -249,18 +259,29 @@ targets:
     organization_id: ORGANIZATION_ID
     cluster_id: CLUSTER_ID
     cluster_incarnation: INCARNATION
-    control_credential: work-account
+    control_auth: human-device
     endpoint: https://production.graphs.example
-    data_credential: production-identity
     default_graph: knowledge
 ```
 
-These sketches are not an accepted serialized format. Credential fields are
-nonsecret references in existing namespaces, not bearer values or permission
-claims. Managed control custody is bound to API and organization; data custody
-also binds cluster identity and validates incarnation. Server credentials keep
-their existing owner. A missing credential may be acquired through its declared
-mechanism, but cannot cause another target, organization or mechanism to be used.
+These sketches are not an accepted serialized format. Managed entries declare
+`human-device` or `automation-env`, not a new credential nickname namespace.
+Control lookup uses canonical API/organization; data lookup additionally uses
+cluster identity and validates incarnation/principal. Human-device selection and
+acquisition never consult automation environment credentials; automation uses the existing
+origin-bound environment pair and verifies organization without falling back to
+device custody. Valid data credentials retain their independent lifetime. Missing
+credentials cannot cause another target, organization or mechanism to be used.
+
+Server authentication explicitly names its existing token owner or selects
+anonymous access. Bind each named owner to an allowed endpoint scope and check
+that scope before reading or sending its token. Preserve URL base-path boundaries
+and canonical Unix-socket identity; a socket's synthetic HTTP origin is insufficient.
+A second target cannot reuse that reference at a different scope. Resource requests
+with a missing required token refuse; login retains the named credential owner.
+Named targets never fall through to `OMNIGRAPH_BEARER_TOKEN`; migration
+preserves the keyed owner and records its original endpoint scope. No new secret
+store is introduced.
 
 Register targets by editing operator config; entries may exist before login.
 For first login, an account entry may omit `organization_id` while declaring its
@@ -273,7 +294,12 @@ not under a nickname or an API-only wildcard. Return the verified organization I
 for the operator to add to config; do not modify the entry or default automatically.
 A configured organization remains an equality constraint. Resource operations and
 logout reject incomplete entries before acquisition or network access; an incomplete
-entry cannot use automation credentials to infer its organization.
+entry cannot use automation credentials to infer its organization. Fresh login
+retains the existing shared API/organization session replacement behavior; report
+the verified principal and test replacement under the same and a different
+principal. Already-running commands keep their captured identity and refuse a
+replacement that would change it. Automation entries reject login/logout rather
+than altering human-device custody.
 
 Create returns cluster and provisioning-operation identities. The operator adds
 the returned cluster binding to config without changing the default implicitly.
@@ -282,7 +308,14 @@ pull and recovery must still work. Data commands refuse until that binding is
 complete. `login --target NAME` and `logout --target NAME` retain the existing
 server credential lifecycle or managed control credential bound to API/organization;
 direct targets reject these commands. `cluster token` manages the selected cluster's
-data credential/cache. Preserve logout's existing control-session and shared-reference
+data credential/cache. Its existing endpoint metadata supplies the value for manual
+target completion. Token acquisition can run before the endpoint is configured,
+but sends no data request and never edits config. Once configured, compare origins
+using the existing `canonical_origin` rules: mismatching issuance refuses cache
+replacement, preserves the prior cache and reports safe endpoint metadata. This
+deliberately amends RFC 0053's issuer-selected data routing: rotation requires an
+explicit rebind and matching credentials, with the resulting availability cost.
+Preserve logout's existing control-session and shared-reference
 effects; managed data credentials retain independent expiry and explicit clearing.
 `cluster token --clear` only forgets the selected local data cache, requires no
 login/refresh, and does not revoke a token or delete the backend.
@@ -297,6 +330,12 @@ The same captured storage binding must reach catalog/admission and Lance dataset
 access; changing ambient endpoint variables cannot redirect either path. Refuse
 an incomplete cloud destination rather than advertise a stable target while
 still obtaining its address from the environment.
+Classify every provider option read by either storage path as destination,
+authentication or transport configuration before implementation acceptance. An
+omitted destination option must have a fixed provider default or refuse; it cannot
+inherit an environment or AWS-profile endpoint. Cover S3 endpoint/region/addressing
+style and Azure account/endpoint/emulator selection, including aliases, on both
+paths. Credential refresh cannot change those captured destination settings.
 
 Literal `init URI` is the only exception to registered destination settings. Parse
 its supported storage URI/path directly, never as a target nickname or server
@@ -329,6 +368,7 @@ checks remain additional requirements; this table grants no permissions.
 | `graphs list` | Server or qualified managed data path; registry scope. |
 | `alias` | Existing server read binding with its own target, graph, query and parameter/output defaults. Managed aliases need separate qualification. |
 | `init` | Direct graph target or explicit bootstrap storage URI; may address a nonexistent store. |
+| Built-in catalogue read query/explain or `schema show` | Direct catalogue, or server with `--graph og_catalog`; no mutation, branch or snapshot. Managed catalogue access remains unqualified. |
 | `upgrade`; `schema apply/upgrade-system-columns` | Direct graph, subject to existing standalone ownership restrictions. |
 | `optimize`; `rebuild-full-text-indexes`; `repair`; `cleanup`; `schema plan`; live-schema `lint` | Direct graph, or direct root plus selected graph. Make root `schema plan` independent of which old selector supplied the root. |
 | `queries list/validate`; `policy validate/test/explain` | Direct root, retaining existing optional explicit graph filtering and applied-state semantics. Served catalog support remains separate work. |
@@ -336,12 +376,12 @@ checks remain additional requirements; this table grants no permissions.
 | `cluster plan/apply` | Direct root or server with source input; managed cluster with the revision/preview forms below. |
 | `cluster status` | Direct root, server or managed cluster, with existing backend-specific exact-ID forms. |
 | `cluster observe` | Direct root with local source input to select declared graphs and compare observed state. |
-| `cluster force-unlock/upgrade-ledger`; source-free `cluster apply` recovery | Direct root; retain exact identities and existing quiescence/admission requirements. |
+| `cluster force-unlock/upgrade-ledger`; writer-attested source-free `cluster apply` | Direct root with explicit `--target`; retain exact identities and existing quiescence/admission requirements. |
 | `cluster create/list` | Managed account; organization is fixed before authentication. |
 | `cluster members list`; `cluster pull/push/delete/undo-delete/token/history/cancel` | Managed cluster control binding; data endpoint readiness is not required. |
 | `cluster operation` | Managed account or matching managed cluster; exact provisioning-operation identity. |
 | `organization members list/apply/offboard`; `organization invitations list/send/resend/revoke` | Managed account; preserve the `org` alias and existing operation inputs. |
-| `login/logout` | Server or managed account/cluster, using the selected credential owner; only account login permits missing organization. |
+| `login/logout` | Named-token server or human-device managed account/cluster; automation and anonymous entries refuse. Only account login permits missing organization. |
 | Existing `use`; `profile list/show` | Retired folder selection and bounded read-only legacy inspection respectively; migration is described below. No new selection/admin commands. |
 
 Graph-scoped server/managed operations require `--graph` or target `default_graph`.
@@ -351,6 +391,13 @@ graph. `graphs list`, whole-cluster and organization operations ignore graph
 defaults and reject explicit graphs. Root `queries`/`policy` tools retain explicit
 graph filters, ignore `default_graph`, and preserve their existing all-graph or
 ambiguity behavior.
+
+The catalogue row overrides ordinary graph applicability. A direct catalogue
+target identifies the existing store-free `og_catalog`, never a relative path;
+served access keeps its reserved graph name and existing read-only restrictions.
+Retain ordinary query source/name modes, catalogue versus graph scope, root graph
+filters, sole/multi-graph refusals and temporal-selector conflicts in the mode
+audit. Leaf count alone is not evidence of coverage.
 
 Organization commands use the account target's API/organization and control
 credential. Remove their `--managed`, `--api`, `--organization` and context-only
@@ -377,15 +424,29 @@ one, including local target completion, is outside this proposal.
 
 `--config DIR` means source files for `cluster validate`, `cluster observe`,
 managed `cluster push`, and fresh direct/server `cluster plan/apply`. Keep the
-existing `.` default only for those source modes. A bundle's declared root must
-agree with the selected destination under canonical-root checks; neither silently
-overrides the other. Keep `cluster.yaml`, storage formats and wire names unchanged.
+existing `.` default only for those source modes. Bundle `storage:` becomes an
+optional equality assertion, never a destination selector. If absent, use the
+selected root; do not derive storage from the source directory. Co-located source
+and state remain supported by a target pointing to that directory.
+
+For a direct local root, resolve stored target paths against the operator file
+and bundle-relative assertions against the source directory, then compare using
+the existing deployment/storage canonicalization, including symlinks. Preserve
+the deployment owner's existing-root requirement; `init` alone can create a graph
+at a nonexistent address. For a server, retain comparison with its advertised
+canonical root: do not resolve the server's paths or symlinks on the CLI host.
+Relative server-root assertions refuse. For direct cloud roots, compare normalized
+URI plus the selected account/endpoint binding;
+interpret the bundle's URI assertion within that same binding, never a second
+environment-derived one. Refuse mismatches or unprovable equality before submission.
+Keep `cluster.yaml`, storage formats and wire names unchanged.
 
 Remove `--config` wherever it only supplied routing context, including managed
 create/list/members/pull/plan/apply/status/history/cancel/token/delete/undo-delete/
 operation, all organization operations, and root-only status/force-unlock/recovery.
 Distinguish an explicit argument from an old parser-default `.`: only an explicit
-irrelevant flag is an input error; no implicit directory read remains in these modes.
+irrelevant flag is an input error. These modes read no implicit source or routing
+context; the legacy recovery-evidence checks below remain mandatory.
 
 | Operation | Input, mode and outcome |
 | --- | --- |
@@ -394,9 +455,10 @@ irrelevant flag is an input error; no implicit directory read remains in these m
 | Direct/server `cluster plan` | Preview local source against the selected root/server. |
 | Managed `cluster plan [--rev REVISION]` | Prepare an immutable preview of a full lowercase Git commit ID or captured source head. Return `PREVIEW_ID`; no change lease or implicit local upload. |
 | Direct-root `cluster apply` without an ID | Source apply; `--config` retains its `.` default. Capture/revalidate source through the existing owner; serving must be stopped. |
-| Direct-root `cluster apply --config DIR --deployment-id ID` | Explicit source submission or observation with that caller-chosen ID. Only a command-line `--config` selects this form; a parser default does not count. |
+| Direct-root or server `cluster apply --config DIR --deployment-id ID` | Explicit source submission or observation with a caller-supplied full ID satisfying the existing ledger/sequence/nonce rules. Only a command-line `--config` selects this form; a parser default does not count. |
 | Direct-root `cluster apply --deployment-id ID [--writers-stopped]` without explicit `--config` | Source-free lookup/reconciliation of the original invocation. Never read default `.` or resume schema execution. Terminal/not-recorded lookup needs no attestation; outstanding reconciliation requires `--writers-stopped`. |
-| Server `cluster apply [--deployment-id ID]` | Source apply/observation with the existing `--config` default and live activation. Reject `--writers-stopped`; exact source-free observation uses `cluster status`. |
+| Server `cluster apply` without an ID | Source apply with the existing `--config` default and live activation. Reject `--writers-stopped`. |
+| Server `cluster apply --deployment-id ID` without explicit `--config` | Refuse without reading source or submitting; direct the caller to existing `cluster status --deployment-id ID`. |
 | Managed `cluster apply --plan PREVIEW_ID` | Create a delivery for that exact preview; never silently replan or push. Preserve product and native deployment IDs. `--no-wait` acknowledges durable delivery reservation, not native acceptance. |
 | `cluster status --deployment-id ID [--wait]` | Existing server form; direct root supports the ID form without wait. |
 | Managed `cluster status [DEPLOYMENT_ID] [--wait]` | Current cluster projections without an ID, or exact delivery observation. Wait requires the ID; it cannot be replaced by self-hosted `--deployment-id`. |
@@ -405,14 +467,23 @@ irrelevant flag is an input error; no implicit directory read remains in these m
 
 Today `--cluster` selects direct reconciliation and `--writers-stopped` only
 attests safety after selection. After its retirement, an ID with no explicit source
-selects lookup/reconciliation; a safety attestation never changes intent. Reject
+can only select source-free lookup/reconciliation or refuse; changing target kind
+cannot turn it into source submission. A safety attestation never changes intent. Reject
 `--writers-stopped` with explicit `--config` or without a deployment ID. Omitting
-attestation cannot turn a missing receipt into a fresh deployment.
+attestation cannot turn a missing receipt into a fresh deployment. Direct
+writer-attested apply, force-unlock and upgrade-ledger require explicit `--target`
+before storage access, even if the eventual receipt is terminal. Unattested
+source-free lookup may use the default. Existing exact identities, actor checks
+and quiescence requirements remain additional conditions; no new confirmation
+flag is introduced.
 
 For direct and server source submissions with an existing deployment ID, matching
 immutable input only observes the original invocation; changed input refuses.
 Neither deliberate resubmission nor receipt eviction permits that ID to execute
 again. Source mode may capture files to verify equality; recovery mode never does.
+Caller preallocation remains supported; computing an ID does not reserve its
+sequence. Do not replace these existing rules with arbitrary idempotency strings
+or require that the server previously issued the ID.
 
 Managed apply rejects `--deployment-id` and `--writers-stopped`; server apply
 rejects the writer attestation; direct recovery rejects managed `--plan` and run
@@ -454,8 +525,10 @@ authorize its own deployment. Direct engine policy checks remain mandatory.
 Print the resolved target kind, address, graph/branch where applicable and selection
 source to stderr before backend mutations, including data, branch, Blob, load,
 deployment, lifecycle and organization effects. Include organization and cluster
-identity where needed to distinguish managed destinations. Do not expose bearer
-values or signed URLs. Retire `--quiet`: its only current effect is suppressing the target line,
+identity where needed to distinguish managed destinations and the operator-file
+path for configured selections. Use `redacted_storage_uri` for storage labels;
+never expose userinfo, bearer values, signed URLs or query-string credentials.
+Retire `--quiet`: its only current effect is suppressing the target line,
 which conflicts with this contract. During the announced compatibility interval it
 is a deprecated no-op with a warning; after removal it errors. Destination and
 unknown-outcome evidence always remain visible. Do not invent a new progress flag.
@@ -480,14 +553,42 @@ pending-request rules. Mutable target names, changed folders or config edits can
 erase that record or redirect its replay. This is recovery evidence, not another
 remote state authority; exact storage/lookup details are part of schema acceptance.
 
+Migration must inspect the invocation/source folder for legacy pending, last-operation
+and bound-context evidence before any lifecycle submission, even with an explicit
+target. Preserve/import verified evidence durably or refuse with recovery guidance;
+never ignore it and mint a new create key. Import pending records without changing
+their API, organization, principal, digest or key. Legacy last-operation/context
+records lack some of those fields: retain their known identities as observation
+evidence or a refusal guard, never fabricate a replayable request. Do not retire old
+custody until the new record is durable and conflicting legacy writers are excluded.
+An interrupted migration must recover or refuse, never appear as empty history.
+
+Serialize custody read/check/persist under one lock per operator home. This is
+local coordination, not cross-home deduplication: moving recovery to another home
+requires transferring verified custody or using the original operation ID/key
+within its owner's replay contract. Independent homes do not acquire a distributed
+lock or infer common intent from equal target names.
+
 Persist accepted cluster/incarnation/operation identity before retiring a pending
-create. Repeating that create observes the original operation once its ID is known;
-it never generates another key. A different explicit `--idempotency-key` can denote
-a deliberate new create only after earlier submission uncertainty is resolved.
-Preserve prior recovery evidence, including when local persistence fails after
-acceptance. Custody stays bounded but cannot silently evict a record in a way that
-turns recovery into another write. This replaces the old bound-folder safeguard
-without installing routing context or modifying the default.
+create. Match automatic recovery by API, organization, verified principal, operation
+and canonical request digest, never nickname or folder. An explicit key must also
+match its saved request. Multiple matches refuse and identify the existing operation
+IDs; do not choose one. A retained accepted match observes its original operation.
+A different explicit `--idempotency-key` denotes a deliberate new create only after
+prior submission uncertainty is resolved by exact-key recovery or authoritative
+operation observation; absence of a local record is not proof of non-acceptance.
+
+Bound record count and encoded bytes in the accepted schema. At capacity, refuse
+new lifecycle submissions requiring a new record; existing-record lookup and replay
+remain available. Do not evict uncertain records by age or LRU. Accepted
+payloads may retire only after verified terminal observation and durable installation
+of a home-wide guard against automatic key generation on a subsequent lookup miss.
+After retirement, an unrecognized no-key create refuses: use a known operation ID
+for recovery or an explicit key for a deliberate new create. The guard precedes
+deletion and survives config edits. This permits bounded custody without promising
+unlimited historical lookup or extending server replay retention. No discard/admin
+command is added. Preserve acceptance evidence on persistence failure and retain
+the old bound-folder protection until its equivalent record or guard is durable.
 
 Pin observation to the original target/incarnation, operation ID and source
 revision/digest where available. Managed success requires fresh native convergence
@@ -512,16 +613,33 @@ implementation changing a substrate boundary must repeat the relevant
 
 ## Compatibility and reversibility
 
-This changes contracts in [RFC 0007](0007-operator-config.md),
-[RFC 0011](0011-cli-addressing-and-config.md),
-[RFC 0052](0052-managed-control-plane-cli.md) and
-[RFC 0061](0061-managed-cluster-lifecycle.md). Acceptance must identify affected
-sections and add disposition notes. They remain authoritative until then; this
-draft does not supersede them or claim the new syntax is implemented.
+The following section-level dispositions are required at acceptance. These owners
+remain authoritative until then; this draft neither supersedes them nor claims
+the new syntax is implemented.
+
+| Accepted owner | Proposed disposition |
+| --- | --- |
+| [RFC 0007, D2/D3 and D5](0007-operator-config.md#design) | Replace routing schema/precedence; preserve keyed server credential ownership and prohibit cross-endpoint reference reuse. |
+| [RFC 0011, access path and resolution](0011-cli-addressing-and-config.md#access-path-is-derived-not-chosen) | Replace primitive/profile selectors with fixed declared kinds; preserve no scheme inference, distinct access authorities and refusal without fallback. |
+| [RFC 0052, operational behavior](0052-managed-control-plane-cli.md#user-and-operational-behavior) | Replace folder/mode routing; preserve authorization, operation identities and outcomes. |
+| [RFC 0053, managed CLI data access](0053-offline-data-token-verification.md#managed-cli-data-access) | Replace implicit folder routing and issuer-selected data endpoint with a configured endpoint assertion; preserve credential verification and bounded acquisition. |
+| [RFC 0061, design](0061-managed-cluster-lifecycle.md#design) | Move folder recovery custody with verified migration and bounded retention; preserve exact-key/body replay and operation observation. |
+| [Identity RFC, provider-native access](2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients) | Replace folder-based organization selection with target identity and explicit mechanisms; preserve principal custody, renewal checks and current-policy authority. |
+| [Server-runtime RFC, CLI and conversion](2026-09-29-server-runtime-and-online-deployment.md#cli-and-conversion) | Replace literal `--cluster` routing and configuration-discovery independence with explicit root targets and the isolated-home procedure below; preserve deployment/reconciliation authority and full-ID non-replay. |
+
+RFC 0011 rejected the former `--target` because one graph nickname could switch
+access path according to its URI scheme. This proposal intentionally revisits that
+decision: kind/scope are mandatory, cannot be overridden per command, and are
+validated and announced with the complete binding. A path, nickname or credential
+never infers another kind. The spelling is shared; storage and server authority
+are not interchangeable. Its no-auto-pick principle remains intact.
 
 | Existing surface | Migration |
 | --- | --- |
 | Server/store/root entries, profiles and flat routing defaults | Complete entries in `targets`; deliberate `defaults.target` selection. Keep presentation preferences separate. |
+| Bundle `storage:` or omitted-storage source-directory fallback | Optional root equality assertion. Register the actual old storage root, including the source directory for a co-located layout; omission thereafter uses the target root. |
+| Sole-graph auto-selection | Set `default_graph` explicitly when migrating that binding, or refuse with guidance to choose a graph; do not discover one at execution time. |
+| Local `--store og_catalog` | A direct catalogue target (`kind: direct`, `scope: catalogue`) with existing query/schema verbs; served access retains `--graph og_catalog`. |
 | `--server`, `--store`, `--cluster`, `--profile`, named `--uri` and positional backend addresses | `--target NAME`, except the existing positional `init URI` bootstrap form. Retain data/source URIs and operation IDs as inputs. |
 | `--managed`, `--direct`, `OMNIGRAPH_PROFILE` and implicit folder context | Target kind/scope; retire mode and ambient routing. `--direct` cannot mechanically become storage because it currently also permits HTTP. |
 | Authentication server name, `--api`, `--organization` on login/logout and managed cluster/organization controls | Target plus existing operation inputs; no independent API or organization override. Account login alone permits organization discovery for an incomplete entry. |
@@ -530,6 +648,8 @@ draft does not supersede them or claim the new syntax is implemented.
 | Context-only `--config` | Remove as enumerated above. Preserve actual source input and pull's separate `--out`. |
 | Read aliases | Explicit target-bound read aliases, preserving query/parameter/output behavior and credential ownership. |
 | `--quiet` | Deprecate as a no-op with a warning during the transition, then remove. Destination and unknown-outcome diagnostics cannot be suppressed. |
+| Folder pending/last lifecycle records and bound context | Verified custody migration or submission refusal, including incomplete accepted evidence; no fresh key on missing imported history. |
+| Server global bearer fallback | Migrate to an explicitly endpoint-bound named token owner or anonymous access; never attach the global token implicitly. |
 
 Migration is explicit: it may propose a default but cannot silently choose one
 from a folder, token, environment profile or colliding nickname. Import complete
@@ -538,6 +658,9 @@ Equal nicknames or URL prefixes are not proof of equivalence. A migrated default
 must be deliberately recorded as `defaults.target`; without one, only explicit
 destination selections (`--target`, a bound alias or literal `init URI`) work.
 No separate selection state is written.
+Before lifecycle cutover, account for the legacy folders used by that operator;
+the invocation-directory guard cannot discover recovery records in other folders.
+Keep unresolved work on its original custody or transfer its verified evidence.
 
 During a named compatibility interval, old explicit selectors may be bounded
 adapters only when they resolve an unambiguous complete binding. Mixing them with
@@ -550,6 +673,8 @@ invocations at the same time; an isolated legacy home may retain old definitions
 through the interval. A target-format file rejects legacy routing sections and
 legacy adapters rather than searching another file or guessing a binding. The
 unchanged `init URI` exception is not a legacy adapter.
+A qualified explicit root adapter counts as explicit selection for recovery during
+the interval; a default never does.
 A legacy `--cluster ROOT --deployment-id ID` invocation without writer attestation
 must preserve its source-free lookup/refusal or point to `cluster status`; an
 adapter must never turn it into fresh source apply. After removal, all retired
@@ -562,6 +687,31 @@ them refuse safely. Use isolated operator homes, matched binary/config/script
 upgrades, a nonsecret backup and explicit rollback instructions. Do not run old
 binaries on migrated config expecting equivalent routing. This migration changes
 no graph format or ledger; independent server/storage downgrade limits still apply.
+
+Recovery from an absent or broken ordinary operator file uses an isolated
+`OMNIGRAPH_HOME` with one complete direct-root entry and explicit `--target`.
+For example, put this proposed config in `/tmp/og-recovery/config.yaml`:
+
+```yaml
+target_config_version: 1
+targets:
+  recovery:
+    kind: direct
+    scope: root
+    uri: file:///srv/omnigraph
+```
+
+Then, with the original ID and required writer-quiescence evidence:
+
+```sh
+OMNIGRAPH_HOME=/tmp/og-recovery omnigraph cluster apply --target recovery \
+  --deployment-id ID --writers-stopped --as ACTOR
+```
+
+Cloud roots also need their pinned account/endpoint settings and existing
+authentication chain. This reads neither the broken ordinary home nor a source
+bundle. It deliberately replaces literal-root recovery with a minimal explicit
+config, without adding another address flag or weakening admission checks.
 
 ## Alternatives
 
@@ -578,6 +728,10 @@ existing bootstrap form. Using `--writers-stopped` as a mode selector conflates
 safety with intent; use existing explicit source and identity arguments instead.
 A new recovery flag or login command is unnecessary. Mixed old/new operator
 formats are also unnecessary: compatibility is an explicit per-home boundary.
+Privileged recovery requires the existing `--target` instead of adding confirmation
+semantics to defaults. Its isolated-home procedure avoids restoring an overlapping
+literal-root selector. The catalogue scope represents existing read-only behavior,
+not a new command family or storage kind.
 
 ## Evidence and tests
 
@@ -588,13 +742,13 @@ registry or tests that merely repeat the implementation.
 
 | Gate | Required cases | Existing owners |
 | --- | --- | --- |
-| Selection and scope | All 75 leaves and meaningful argument modes across direct graph/root, server, managed account/cluster; explicit/default/missing/invalid target; graph defaults versus root filters; wrong-mode flags refuse; organization account binding and local skill modes. | `operator.rs`, `scope.rs`, `planes.rs`, `cli_schema_config`, `cli_data` |
-| Binding stability | During an invocation, folder/config/default changes cannot redirect work. Named targets ignore ambient cloud destination changes across invocations; literal cloud init freezes one provider binding for all its accesses. Path/URI roots agree; Unix sockets preserve identity. | Operator/scope tests, managed data tests, `cli_cluster`, storage tests |
-| Authentication | Same API with different organizations; wrong endpoint/incarnation/principal; namespace isolation; malformed/v1 cache refusal; bounded acquisition; org-less fresh login despite zero/one/multiple cached organizations, verified org custody and incomplete-entry refusals; logout and local token clearing. | Managed auth/data tests, server `auth_policy` |
-| Source modes | Explicit versus default `--config`; local validation/lint; ID plus explicit source versus source-free recovery; missing attestation cannot select source; matching/mismatched/evicted IDs; root mismatch; preview revision/apply; pull without ambient routing. | `cli_cluster`, `cli_cluster_e2e`, `cli_schema_config` |
-| Bootstrap and uncertainty | Literal init without registration, conflicts/default independence and captured cloud settings; account create/list before a cluster; control-only cluster target; lost response before operation ID; pending/accepted create retries cannot create twice; persistence failure retains acceptance; exact request reuse/conflict; config edits cannot redirect recovery. | Managed lifecycle tests, `cli_cluster` |
+| Selection and scope | All 75 leaves and enumerated argument modes at the audited revision; direct graph/root/catalogue, server, managed account/cluster; explicit/default/missing/invalid target; file errors versus unrelated entry errors; graph defaults/root filters, catalogue and temporal refusals; unsupported modes; organization and local skill modes. Re-pin and reconcile the inventory at acceptance. | `operator.rs`, `scope.rs`, `planes.rs`, `cli_schema_config`, `cli_data`; `integration/parity_matrix.rs` for qualified direct/server parity only |
+| Binding stability | Folder/config/default changes cannot redirect in-flight work. Decoy S3 endpoint/profile and Azure account/endpoint settings cannot redirect named targets on either storage path; literal cloud init freezes one binding. Local path/file-URI equality, symlinks, remote advertised roots and Unix-socket identity. | Operator/scope tests, managed data tests, `cli_cluster`, `omnigraph-storage` and core Lance-access tests |
+| Authentication | Server reference shared across different endpoints refuses before token access/transmission; no global bearer fallback; explicit anonymous access. Human/automation mechanism isolation; API/org/incarnation/principal checks; strict cache formats and bounded acquisition. Token bootstrap with absent/matching/mismatched endpoint; mismatch preserves cache. Org-less login with zero/one/multiple cached organizations and same/different-principal replacement; in-flight identity cannot switch. Logout and token clearing retain their distinct local/session effects. | Managed auth/data tests, server `auth_policy`, operator tests |
+| Source modes | Same ID-only argv against root/server defaults never becomes source submission; explicit source is required with an ID. Matching/mismatched/evicted and valid preallocated IDs; missing attestation; default-selected recovery effects refuse. Bundle storage absent/matching/mismatched; co-located source/state; root/provider disagreement; preview/apply and pull. | `cli_cluster`, `cli_cluster_e2e`, `cli_schema_config`, cluster deployment tests |
+| Bootstrap and uncertainty | Literal init conflicts/default independence; account before cluster; control-only cluster; recovery with malformed ordinary home via isolated home. Lost response, persistence failure and exact request reuse/conflict. Legacy pending and accepted-only migration, crashes between copy/retirement, concurrent processes in one home and transfer across homes. Full capacity refuses; retired-history guard prevents no-key recreation. | Managed lifecycle tests, `cli_cluster` |
 | Outcomes and output | Original-ID waits with concurrent successors; delivery reservation versus native acceptance; fresh convergence versus archives; cancel boundary; effective output on success/error; parseable streams; deprecated `--quiet` cannot suppress destination/outcome diagnostics and refuses after removal. | `system_remote`, `cli_cluster`, `cli_data`, existing outcome tests |
-| Compatibility | Complete selector inventory, explicit adapter conflicts, aliases, name collisions, legacy-format adapters versus strict migrated homes; isolated old/new homes and finite adapter removal. Preserve source/parameter/temporal/pagination/safety flag contracts. | `operator.rs`, `planes.rs`, `cli_queries`, CLI integration suites |
+| Compatibility | Complete selector inventory, explicit adapters/aliases, name collisions, sole-graph migration and strict per-home formats. Default selection refuses applicable retired environment/folder evidence; explicit targets cannot bypass lifecycle preservation. Old-binary/migrated-home protection is documented isolation plus a detectable marker, not an impossible old-binary refusal. Finite adapter removal; preserved source/parameter/pagination/safety contracts. | `operator.rs`, `planes.rs`, `cli_queries`, CLI integration suites |
 
 This RFC update runs documentation, link and spelling checks only; it does not
 claim these proposed runtime gates pass. Implementation must update user docs,
@@ -682,6 +836,12 @@ modes and same-ID nonexecution are decisions in this proposal, not open defaults
   skill commands. Supersedes the earlier attestation-selected recovery mode with
   explicit source/ID mode selection and makes same-ID observation/nonexecution
   explicit. Allows first-login organization discovery and retains literal `init`
-  bootstrap; no new commands or flags. Retires the old quiet behavior, clarifies
-  per-home legacy compatibility, corrects command grouping/path examples, defers
+  bootstrap without additional commands or flags beyond `--target`. Retires the
+  old quiet behavior, clarifies per-home legacy compatibility, corrects command
+  grouping/path examples, defers
   completion and restores the standard RFC sections and linked deadline history.
+- **2026-10-16, review follow-up:** Require explicit source for any ID-bearing
+  submission and explicit targets for recovery effects. Define bundle-root
+  assertions, endpoint-bound authentication, legacy custody preservation and bounded
+  retirement. Add catalogue scope, isolated-home recovery and section-level RFC
+  dispositions; keep existing command families and operation flags.
