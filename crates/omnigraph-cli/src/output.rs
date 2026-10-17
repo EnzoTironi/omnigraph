@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::app::Completion;
+use omnigraph_api_types::CommitListOutput;
 
 pub(crate) fn graph_type_subject(type_key: &str) -> String {
     if let Some(type_name) = type_key.strip_prefix("node:") {
@@ -1139,10 +1140,13 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
 }
 
 pub(crate) fn write_commit_list_human(
-    commits: &[CommitOutput],
+    list: &CommitListOutput,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    for commit in commits {
+    if let Some(head_commit_id) = &list.head_commit_id {
+        writeln!(writer, "head_commit_id: {head_commit_id}")?;
+    }
+    for commit in &list.commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
         writeln!(
             writer,
@@ -1157,6 +1161,9 @@ pub(crate) fn write_commit_list_human(
                 .unwrap_or_default(),
             commit_kind_suffix(commit),
         )?;
+    }
+    if let Some(next_page_token) = &list.next_page_token {
+        writeln!(writer, "next_page_token: {next_page_token}")?;
     }
     Ok(())
 }

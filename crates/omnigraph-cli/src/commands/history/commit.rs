@@ -24,6 +24,8 @@ pub(crate) async fn run_commit(
             branch,
             unpublished,
             unattached,
+            limit,
+            page_token,
             json,
         } => {
             let client = match managed_client {
@@ -49,12 +51,17 @@ pub(crate) async fn run_commit(
                 CommitListSelection::Unpublished => {
                     client.list_unpublished_commits(branch.as_deref()).await?
                 }
+                CommitListSelection::Published if limit.is_some() || page_token.is_some() => {
+                    client
+                        .list_commits_page(branch.as_deref(), page_token.as_deref(), limit)
+                        .await?
+                }
                 CommitListSelection::Published => client.list_commits(branch.as_deref()).await?,
             };
             if json {
                 write_json(&payload, stdout)?;
             } else {
-                write_commit_list_human(&payload.commits, stdout)?;
+                write_commit_list_human(&payload, stdout)?;
             }
         }
         CommitCommand::Publish {
