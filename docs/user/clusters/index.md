@@ -160,7 +160,10 @@ convergence and activation by polling the original ID. `--no-wait` instead retur
 after durable acceptance; drain and preparation may precede that acknowledgment.
 `--timeout SECONDS` bounds caller waiting, including acceptance (default 300,
 maximum 3600). Expiry exits 5 with the original ID and last observation; it does
-not cancel execution or prove failure. Resume observation with:
+not cancel execution or prove failure. After reporting expiry, the CLI does not
+wait for an unfinished background DNS lookup before exiting. A failed recovery
+hint also preserves the server's original refusal, including an outstanding
+deployment ID. Resume observation with:
 
 ```bash
 omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
@@ -237,6 +240,13 @@ A lost connection does not mean failure. Observe the original ID:
 OMNIGRAPH_TOKEN_PRODUCTION='secret' omnigraph cluster status \
   --server production --deployment-id '<DEPLOYMENT_ID>' --json
 ```
+
+An output failure also returns nonzero without proving that deployment failed.
+Served apply must write and flush its deployment ID before submitting. Direct
+apply finishes its one deployment attempt even if its identity diagnostic cannot
+be written, then returns the output error with the original ID, root and lock
+information. Observe that identity before taking further action; failed output
+does not cause automatic resubmission.
 
 Status is read-only. `active` is false for an older result after a newer revision
 activates. Only the current runtime can prove activation; a durable completion

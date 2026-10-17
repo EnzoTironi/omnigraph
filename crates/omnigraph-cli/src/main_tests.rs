@@ -1,9 +1,9 @@
-//! In-source test suite for the CLI binary (moved verbatim from
-//! main.rs; `use super::*` resolves through the #[path] declaration).
+//! Shared CLI contract tests, compiled once in the application library.
 
 use super::{
     MissingCredential, RemoteCredential, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, normalize_bearer_token, resolve_remote_credential, sync_dir,
+    branch_statement_query_request, normalize_bearer_token, resolve_remote_credential_with_input,
+    sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -163,9 +163,7 @@ fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
            keyed:\n    url: https://keyed.example.com\n",
     )
     .unwrap();
-    let home_path = home.path().to_str().unwrap();
     let _env = ScopedEnv::set(&[
-        ("OMNIGRAPH_HOME", Some(home_path)),
         ("OMNIGRAPH_BEARER_TOKEN", Some("global-token")),
         ("OMNIGRAPH_TOKEN_KEYED", Some("keyed-token")),
         ("OMNIGRAPH_TOKEN_UNKEYED", None),
@@ -173,10 +171,13 @@ fn resolve_remote_credential_sends_no_unkeyed_token_issue_1022() {
 
     // The whole URL is the address here; served clients pass the server root
     // and a graph URL under it.
-    let credential = |url: &str| match resolve_remote_credential(url, url).unwrap() {
-        RemoteCredential::Keyed(token) => Ok(token),
-        RemoteCredential::Missing(missing) => Err(missing),
-    };
+    let input = crate::operator::InvocationConfig::at(Some(home.path().to_path_buf()), None);
+    let config = input.get(&mut Vec::new()).unwrap();
+    let credential =
+        |url: &str| match resolve_remote_credential_with_input(&input, config, url, url).unwrap() {
+            RemoteCredential::Keyed(token) => Ok(token),
+            RemoteCredential::Missing(missing) => Err(missing),
+        };
     let unbound = |server_root: &str| {
         Err(MissingCredential::Unbound {
             server_root: server_root.to_string(),
