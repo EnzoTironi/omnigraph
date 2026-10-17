@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-16
+updated: 2026-10-17
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -598,6 +598,70 @@ distinct. Preserve finite connection/request/body limits and per-operation wait
 budgets. Timeout stops local observation, not accepted work, and retains original
 IDs and recovery instructions. Nonzero exit does not establish absence of effects.
 
+### CLI implementation boundaries
+
+Implement the targeting contract through one preparation path inside the existing
+CLI crate. The module review at `4d7536d68b1db6da34bf9cff22a90d9fdd77bed4`
+on 2026-10-17 found repeated configuration interpretation in scope resolution,
+client construction and rendering. This is source evidence for the boundaries
+below, not a new command inventory or runtime qualification.
+
+```text
+parse -> prepare operation and binding -> acquire credentials -> execute -> render
+```
+
+1. **Prepare a typed operation.** Capture argument provenance and only the bounded
+   configuration, environment, path and applicable source/alias inputs needed by
+   that mode. Separate input loading from a pure preparation function over captured
+   values. Extend the existing exhaustive applicability owner; do not add a second command registry.
+   Distinguish source/name queries, offline/live lint, catalogue access and source
+   apply/recovery explicitly. Preserve Clap's command-line-versus-default distinction
+   for `--config`. Preparation rejects invalid combinations before credential
+   acquisition or backend effects; remote identity verification remains with its
+   existing owner. Local modes keep their current independence from target config.
+2. **Pass one binding down.** Replace the optional-string scope translation with
+   typed target variants carrying scope, selection provenance and destination
+   settings. Client constructors and handlers receive the prepared binding; they
+   cannot reload routing config, select another authentication mechanism or infer
+   a destination from the working directory. Keep the specified first-login and
+   literal-init exceptions. Required legacy recovery-evidence inspection and
+   custody validation remain explicit stages; they cannot select a new destination.
+   Inject narrow credential stores, clock inputs and writers where needed, rather
+   than a context object that gives every handler access to every service.
+3. **Give command families their own modules.** Co-locate each family's argument
+   definitions and handlers with explicit imports, following the existing managed
+   modules. Keep shared preparation, target resolution, transport and rendering
+   owners separate. A small `main.rs` owns process startup and final exit; `lib.rs`
+   makes internal preparation and handlers testable without subprocesses. Keep
+   these modules in the existing crate; no public SDK or command framework is
+   introduced. Preserve separate graph, managed-control and OAuth transport owners,
+   including destination checks, deadlines, redirect prohibitions and
+   operation-specific replay rules.
+4. **Capture presentation and return outcomes.** Resolve applicable alias/operator
+   output defaults once and carry the resulting preferences to successful output
+   and execution failures. Parse/config failures use only the output mode safely
+   established so far. Renderers receive preferences and writers, not config
+   loaders. Handlers return typed completion information; the outer boundary owns
+   flushing and exit codes. Preserve existing execution/effects evidence, deployment
+   outcomes and unknown-write classification. Streaming JSON and Arrow stay streaming;
+   this does not require buffering all results or a universal JSON result envelope.
+
+Keep Clap, Serde, `reqwest`, existing authentication libraries and `assert_cmd`.
+Use Clap's reusable argument groups and
+[`value_source`](https://docs.rs/clap/latest/clap/struct.ArgMatches.html#method.value_source)
+for explicit argument provenance. Reuse workspace
+[`thiserror`](https://docs.rs/thiserror/latest/thiserror/) for typed preparation and
+acquisition errors while preserving domain errors and public envelopes.
+[`serde_path_to_error`](https://docs.rs/serde_path_to_error/latest/serde_path_to_error/)
+is a small candidate for nested configuration diagnostics such as
+`targets.production.endpoint`; it does not replace strict schema validation or
+secret redaction. Optional development-only
+[`trycmd`](https://docs.rs/trycmd/latest/trycmd/) transcripts may check help and
+executable examples when they reduce fixture duplication; they are not required
+for the migration or a replacement for existing process/fault tests. No new
+framework, automatic configuration merger or generic write-retry middleware is
+needed.
+
 ## Invariants
 
 The [architectural invariants](../dev/invariants.md) remain unchanged. A target
@@ -761,6 +825,43 @@ conflate catalog visibility with permission to invoke a query. New managed wrapp
 support, live capability discovery, authorization preview, local/remote completion,
 new recovery flags and generalized output/wait behavior are outside this change.
 
+### CLI tests and GQT
+
+Keep one owner per observable contract. The
+[GQT runner](../../crates/omnigraph-gqt/README.md) already covers direct engine,
+DST and declared served execution; its HTTP adapter sends requests directly and
+its [served conformance suite](../../crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs)
+compares supported cases with in-process execution. It does not currently execute
+the product `omnigraph` binary for each GQT step. The
+[served smoke test](../../crates/omnigraph-cli/tests/integration/gqt_served_smoke.rs)
+starts a real deployment and invokes the separate `omnigraph-gqt` runner. These
+are complementary boundaries, not evidence that GQT covers product CLI routing.
+
+| Contract | Test owner |
+| --- | --- |
+| Argument provenance, mode selection, target applicability and configuration refusals | CLI unit tests over captured inputs and prepared operations, extending existing parser/operator/scope/applicability owners. Expected destinations and refusals must be independently specified, not derived from the classifier under test. |
+| Actual selected destination and credential, stdin/files, stdout/stderr, streaming, exit codes and submission/recovery behavior | Existing CLI subprocess and fault-proxy suites using hermetic `OMNIGRAPH_HOME` fixtures. Pure preparation tests do not replace these effects and process assertions. |
+| Query rows, counts, result types and logical errors | Existing `.gqt` cases; direct/DST coverage retains its existing support boundaries. Do not copy the semantic corpus into CLI tests. |
+| Supported GQ behavior through HTTP | Existing served GQT adapter/conformance suite, plus CLI parity tests for the product CLI's own encoding and decoding. Neither establishes support for unqualified managed wrappers. |
+
+For example, a wrong aggregate result belongs in GQT. Correct rows returned from
+the wrong destination belong in CLI tests with distinguishable intended and decoy
+graphs. A command's invalid-target refusal must prove no credential acquisition or
+backend request; a JSON-output test checks that destination diagnostics stay on
+stderr and does not reproduce aggregation semantics. If a defect spans both the
+engine and CLI, add assertions at both affected boundaries.
+
+During migration, change CLI fixture construction in the existing support owner to
+write target-format config into isolated operator homes, and pass explicit targets
+in process journeys. Keep dedicated tests for configured defaults and legacy
+adapters. Update actual product CLI setup calls used by served GQT smoke tests;
+keep `.gqt` cases and the separate runner's execution-environment selectors
+unchanged. Do not add a GQT CLI adapter or expand the GQT grammar for this RFC.
+Run the affected CLI suites and served smoke/conformance owners; run the relevant
+GQT cases whenever shared engine/query behavior changes, retaining the existing
+separate CI gates. Optional command transcripts test help and interface examples,
+not query semantics or durable recovery.
+
 ### Upstream design evidence
 
 Kubernetes documentation and implementation were reviewed on 2026-10-14:
@@ -791,9 +892,12 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
 
 1. Accept the schema and finite release interval; amend affected accepted RFC
    sections and capture baseline routing/authentication/outcome fixtures.
-2. Implement the shared resolver and mode guards in existing owners. Qualify all
-   current commands, login/init bootstrap and same-ID behavior before enabling the
-   new contract; unsupported combinations remain errors.
+2. Extract the affected command/preparation boundaries without changing behavior,
+   then implement typed operations, the shared resolver and immutable client inputs
+   in those owners. Qualify all current commands, login/init bootstrap and same-ID
+   behavior before enabling the new contract; unsupported combinations remain
+   errors. Keep broad file moves separate from targeting changes, and move output
+   handling incrementally while preserving streams and outcome contracts.
 3. Ship the introduction release with explicit legacy-format adapters and the
    deprecated quiet no-op. Migrate each operator home, scripts, aliases and docs
    together; keep isolated legacy homes where conversion is not yet complete.
@@ -845,3 +949,8 @@ modes and same-ID nonexecution are decisions in this proposal, not open defaults
   assertions, endpoint-bound authentication, legacy custody preservation and bounded
   retirement. Add catalogue scope, isolated-home recovery and section-level RFC
   dispositions; keep existing command families and operation flags.
+- **2026-10-17:** Specify one typed command-preparation path, immutable client
+  bindings, family-owned modules and captured presentation with outer exit handling.
+  Reuse existing libraries and test owners; keep optional diagnostic/transcript
+  helpers small. Clarify CLI/GQT test ownership without adding commands or a second
+  query-semantics corpus.
