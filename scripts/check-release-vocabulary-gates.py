@@ -75,7 +75,7 @@ def main() -> int:
         )
 
     publishers = {
-        "release-edge.yml": ("build_release", "publish_edge_release"),
+        "release-edge.yml": ("build_release", "publish_edge_release", "publish_edge_image"),
         "release.yml": ("build_release", "publish_release", "update_homebrew_tap"),
         "publish-image.yml": ("publish_image",),
         "publish-crates.yml": ("publish_crates",),
@@ -166,6 +166,23 @@ def main() -> int:
                 "release-edge.yml: an edge version must sort after the latest stable release",
                 failures,
             )
+            image_job = job_block(text, "publish_edge_image")
+            require(
+                '--source-digest "$SOURCE_SHA"' in image_job
+                and "BASE_IMAGE=public.ecr.aws/debian/debian:trixie-slim" in image_job,
+                "release-edge.yml: the edge image packages the attested archive of this commit on trixie",
+                failures,
+            )
+            require(
+                ":latest" not in text,
+                "release-edge.yml: an edge build must never move a `latest` image tag",
+                failures,
+            )
+            require(
+                'if [[ "$MOVED" == true && "$current_edge" == "$SOURCE_SHA" ]]; then' in image_job,
+                "release-edge.yml: the edge image tag follows the rolling release as it is now",
+                failures,
+            )
             require(
                 'git merge-base --is-ancestor "$current" "$SOURCE_SHA"' in text,
                 "release-edge.yml: the rolling edge tag must only move forward",
@@ -239,6 +256,14 @@ def main() -> int:
         "release-vocabulary-gate.yml: only a cancelled commit that main moved past is superseded",
         failures,
     )
+
+    # Every release artifact ships one server feature set.
+    for filename in ("build-release-archives.yml", "publish-image.yml"):
+        require(
+            "--features omnigraph-server/aws" in (WORKFLOW_ROOT / filename).read_text(),
+            f"{filename}: release builds enable the server's aws feature, as every release artifact does",
+            failures,
+        )
 
     # Tags before v0.14.0 predate the stamp; the cutoff is written in Python in
     # release.yml and in bash in publish-image.yml, so the two must agree.
