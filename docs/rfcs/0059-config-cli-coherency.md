@@ -7,13 +7,13 @@ implementation: not-started
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-17
+updated: 2026-10-18
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
 blocked_on:
   - Accept the exact versioned operator configuration and credential-reference schema.
-  - Name the introduction, last compatibility, and removal releases before shipping the transition.
+  - Name the one breaking release that ships the target contract and removes the retired selectors.
 ---
 
 # RFC 0059: Named targets and CLI coherency
@@ -22,21 +22,27 @@ blocked_on:
 
 Use the existing operator configuration to define named **targets** and a default
 in `defaults.target`. A target is the destination of a backend operation, including
-its access kind, scope, address and authentication binding. Named-target
-invocations select it the same way:
+its access kind, scope, address and authentication binding. Every invocation
+selects its destination the same way:
 
 ```text
-explicit --target NAME > defaults.target > missing-target error
+explicit --target NAME|ADDRESS > defaults.target > missing-target error
 ```
 
-`--config DIR` selects input files containing `cluster.yaml`; it does not select
-a destination. Keep existing command families, especially `cluster`, and existing
-operation flags. Add no target administration group, selection command or second
-current-target state. Editing operator config changes the default; `--target`
-overrides it for one invocation. Resolve once, refuse invalid selections without
-fallback, and print the resolved destination before backend mutations. Preserve
-existing `init URI` as the one literal-destination bootstrap exception; it does
-not require an operator config entry.
+`--target` takes a target name or an inline address: a storage path or URI, or a
+server endpoint, spelled on the command line and needing no operator config
+entry. Existing `init URI` is the same inline binding. `--config DIR` selects
+input files containing `cluster.yaml`; it does not select a destination. Keep
+existing command families, especially `cluster`, and existing operation flags.
+Add one `target` group that lists and edits complete entries in operator config;
+add no selection command or second current-target state. Editing operator config
+changes the default; `--target` overrides it for one invocation. Resolve once,
+refuse invalid selections without fallback, and print the resolved destination
+before backend mutations.
+
+The change is breaking. One release ships the target contract and removes every
+other destination selector, the legacy routing sections and their commands, with
+no compatibility adapters; an operator file is either the new format or refused.
 
 Keep declarative plan/apply and existing deployment, identity and publication
 authority. This is a targeting change, not a new resource model or deployment
@@ -68,7 +74,9 @@ not runtime qualification of the proposed resolver.
 The common workflow is authoring locally and applying to a chosen cluster.
 Bootstrap, authentication and recovery must also work without a source directory
 or a ready data endpoint. Cover those cases through complete bindings and existing
-operations, without adding commands for each combination.
+operations, without adding commands for each combination. One-off commands and
+scratch graphs must not need registration, so a complete binding can also be
+written inline.
 
 ## User and operational behavior
 
@@ -107,10 +115,10 @@ command. YAML, duplicate-name, format-version, unknown-key and mixed legacy/targ
 format errors refuse whenever the operator file is read. Variant completeness
 and endpoint semantics are checked for the selected entry; unrelated incomplete
 entries do not block it. Environment profiles, folder context, cached credentials
-and discovery results cannot select or repair a destination. During compatibility,
-default selection refuses a nonempty `OMNIGRAPH_PROFILE` or folder routing evidence
-that formerly applied to that command; it never silently substitutes the new
-default. Explicit targets remain independent of retired routing evidence. Lifecycle
+and discovery results cannot select or repair a destination. Default selection
+refuses a nonempty `OMNIGRAPH_PROFILE` or folder routing evidence that formerly
+applied to that command; it never silently substitutes the new default. Explicit
+targets, named or inline, remain independent of retired routing evidence. Lifecycle
 recovery evidence has the separate mandatory preservation rule below, even with
 an explicit target. Automation can use isolated operator homes. Local modes ignore
 the default and reject an irrelevant explicit target.
@@ -127,7 +135,8 @@ server targets and `cloud` as a managed cluster target. For the direct-access
 example, the working directory is `/data/project` and `local` has
 `uri: file:///data/project/graph.omni`, so it names the same graph as `./graph.omni`.
 Named entries must be configured first; names do not infer endpoints or paths.
-The literal `init URI` form below needs no registration.
+An inline address, including the literal `init URI` form below, needs no
+registration.
 
 **Query a server**
 
@@ -196,8 +205,28 @@ omnigraph cluster status DEPLOYMENT_ID --target cloud --wait
 # Before
 omnigraph query list_people --query queries.gq --store ./graph.omni
 
-# After
+# After — named, or inline
 omnigraph query list_people --query queries.gq --target local
+omnigraph query list_people --query queries.gq --target ./graph.omni
+```
+
+**Query a server without registering it**
+
+```sh
+# Before
+omnigraph query list_people --server https://staging.example --graph knowledge
+
+# After
+omnigraph query list_people --target https://staging.example --graph knowledge
+```
+
+**Register a target**
+
+```sh
+# Before — edit servers: and profiles: by hand
+# After — edit targets: by hand, or add one entry
+echo '{"kind":"server","endpoint":"https://staging.example","credential":"staging-auth"}' \
+  | omnigraph target add staging
 ```
 
 **Validate local configuration — unchanged**
@@ -214,8 +243,8 @@ omnigraph cluster validate --config ./app
 omnigraph init ./scratch.omni --schema schema.pg
 ```
 
-An explicit initialization URI conflicts with `--target` and ignores
-`defaults.target`. Without a URI, `init` uses ordinary named-target selection.
+An explicit initialization URI is an inline target: it conflicts with `--target`
+and ignores `defaults.target`. Without a URI, `init` uses ordinary selection.
 Neither form registers a target or changes the default.
 
 ## Design
@@ -337,15 +366,8 @@ inherit an environment or AWS-profile endpoint. Cover S3 endpoint/region/address
 style and Azure account/endpoint/emulator selection, including aliases, on both
 paths. Credential refresh cannot change those captured destination settings.
 
-Literal `init URI` is the only exception to registered destination settings. Parse
-its supported storage URI/path directly, never as a target nickname or server
-endpoint; relative paths resolve against the invocation directory. For literal
-cloud initialization, capture the existing provider account/endpoint configuration
-once into an invocation-local direct-graph binding. Print the resolved physical
-destination with selection source "positional URI" before effects and pass that
-same binding to catalog/admission and Lance access. Named targets cannot inherit
-these ambient destination settings. Keep existing initialization ownership,
-`--force` and external-admission restrictions.
+An inline target, below, is the only exception to registered destination
+settings.
 
 Strictly validate duplicate names, variant fields, endpoints, routing/authentication
 keys and format versions. Preserve server Unix-socket support and platform refusals;
@@ -353,6 +375,70 @@ its synthetic HTTP origin is not the destination. Do not merge operator files or
 splice fields from multiple targets. Unknown names in a selected default or alias
 refuse. Config edits do not rename credential custody, erase pending recovery
 records, log out sessions or change an invocation already in progress.
+
+### Inline targets
+
+`--target` also takes a literal address. Target names are one ASCII word of
+letters, digits, `-`, `_` and `.`, so a value containing `/` or `:` is never a
+name, and a bare word is always one. An unknown name that is also a relative
+path refuses with guidance to write `./NAME`. The reserved name `og_catalog`
+names the direct catalogue and cannot be registered. A literal address never
+consults `targets:`.
+
+An inline value is a complete binding written on the command line, not a
+nickname: nothing maps it to another destination, so the case RFC 0011 rejected,
+one nickname switching access path by its URI's scheme, does not arise. Each
+supported spelling names exactly one access authority:
+
+| Inline value | Binding |
+| --- | --- |
+| `http://…`, `https://…`, `unix:///…` | Server at that endpoint. |
+| A path, `file://…`, `s3://…`, `az://…` | Direct storage: a graph, or a root when the invocation selects a graph within it with `--graph` or the command applies only to a root. |
+
+The root-only commands are `queries`, `policy`, `cluster plan`, `cluster apply`,
+`cluster status`, `cluster observe` and root recovery; a graph-scoped operation
+given a root without
+`--graph` refuses. The command line alone decides the scope: nothing probes
+storage for a cluster's state to classify an address.
+
+An inline server sends a token only when its endpoint lies under a configured
+server target's endpoint scope, using the owner of the deepest such scope, which
+is the endpoint-bound rule above; otherwise its requests carry none. An inline
+value never names or creates a credential owner. Managed destinations have no
+inline form: their API, organization and cluster identity need a named target.
+
+Parse a relative path against the invocation directory. For an inline cloud
+URI, capture the provider account/endpoint configuration once into an
+invocation-local binding, print it with selection source `inline` before
+effects, and pass that same binding to catalog/admission and Lance access.
+Named targets never inherit these ambient destination settings. The positional
+`init URI` is the same inline direct-graph binding; keep its ownership, `--force`
+and external-admission restrictions.
+
+An inline target has no `default_graph`, so a multi-graph scope needs `--graph`.
+`defaults.target` and aliases take names only, so operator config holds only
+registered bindings.
+
+### Target administration
+
+`target list|show|add|remove` read and edit complete entries in operator
+config. `add` reads one entry as JSON on stdin and refuses an incomplete or
+conflicting one with its code; `remove` refuses the default target. Each edit
+changes only that entry's lines and keeps the rest of the file's text, holds an
+exclusive lock beside the file, checks that the edited file loads with exactly
+the expected targets and every other key unchanged, and replaces it by rename.
+A file it cannot edit that way refuses; edit it by hand. No command stores a
+secret, sets `defaults.target` or selects a target.
+
+`target import` converts a legacy-format file in one edit: each server, root and
+store entry and each complete profile becomes a complete target, keeping its
+credential owner name and the endpoint scope that owner was bound to. It may
+propose a default and records one only when the legacy file selected exactly
+one; it never infers one from a folder, token or environment profile.
+`credential get --target NAME` hands a server target's stored token to a pipe,
+never a terminal, for a same-account client that attaches to that server.
+Each command's `--json` output carries a protocol version that `version --json`
+reports.
 
 ### Command applicability
 
@@ -367,12 +453,13 @@ checks remain additional requirements; this table grants no permissions.
 | `branch create/list/delete/merge/diff/merge-base`; `snapshot`; `export`; `blob get/stat/put/clear`; `diff`; `commit publish/drop/changes`; `changes poll/baseline`; `schema show` | Direct graph or server. Managed wrappers remain unsupported until individually qualified. |
 | `graphs list` | Server or qualified managed data path; registry scope. |
 | `alias` | Existing server read binding with its own target, graph, query and parameter/output defaults. Managed aliases need separate qualification. |
-| `init` | Direct graph target or explicit bootstrap storage URI; may address a nonexistent store. |
+| `init` | Direct graph target, named or inline; `init URI` is the inline form. May address a nonexistent store. |
 | Built-in catalogue read query/explain or `schema show` | Direct catalogue, or server with `--graph og_catalog`; no mutation, branch or snapshot. Managed catalogue access remains unqualified. |
 | `upgrade`; `schema apply/upgrade-system-columns` | Direct graph, subject to existing standalone ownership restrictions. |
 | `optimize`; `rebuild-full-text-indexes`; `repair`; `cleanup`; `schema plan`; live-schema `lint` | Direct graph, or direct root plus selected graph. Make root `schema plan` independent of which old selector supplied the root. |
 | `queries list/validate`; `policy validate/test/explain` | Direct root, retaining existing optional explicit graph filtering and applied-state semantics. Served catalog support remains separate work. |
 | `cluster validate`; `lint --schema`; `embed`; `version`; `skill export/show` | No backend target. Embedding retains its separately configured provider/input behavior; skill export retains local file writes. |
+| `target list/show/add/remove/import`; `credential get` | Operator config and the credentials file only; no backend request. |
 | `cluster plan/apply` | Direct root or server with source input; managed cluster with the revision/preview forms below. |
 | `cluster status` | Direct root, server or managed cluster, with existing backend-specific exact-ID forms. |
 | `cluster observe` | Direct root with local source input to select declared graphs and compare observed state. |
@@ -382,7 +469,7 @@ checks remain additional requirements; this table grants no permissions.
 | `cluster operation` | Managed account or matching managed cluster; exact provisioning-operation identity. |
 | `organization members list/apply/offboard`; `organization invitations list/send/resend/revoke` | Managed account; preserve the `org` alias and existing operation inputs. |
 | `login/logout` | Named-token server or human-device managed account/cluster; automation and anonymous entries refuse. Only account login permits missing organization. |
-| Existing `use`; `profile list/show` | Retired folder selection and bounded read-only legacy inspection respectively; migration is described below. No new selection/admin commands. |
+| Existing `use`; `profile list/show` | Removed with the legacy formats; migration is described below. No selection command replaces them. |
 
 Graph-scoped server/managed operations require `--graph` or target `default_graph`.
 Direct root graph tools use the same rule; a direct graph target already identifies
@@ -500,8 +587,8 @@ import, refresh and approve commands stay removed.
 
 ### Resolution, credentials and outcomes
 
-Parse the operation, resolve its target or explicit initialization binding, and
-validate applicability before acquisition or backend effects. The login-only
+Parse the operation, resolve its named or inline target, and validate
+applicability before acquisition or backend effects. The login-only
 organization-discovery path freezes the API/mechanism first and verifies the
 provider-selected organization before saving its credential; it performs no
 resource operation. Carry that immutable binding and provenance through
@@ -525,13 +612,13 @@ authorize its own deployment. Direct engine policy checks remain mandatory.
 Print the resolved target kind, address, graph/branch where applicable and selection
 source to stderr before backend mutations, including data, branch, Blob, load,
 deployment, lifecycle and organization effects. Include organization and cluster
-identity where needed to distinguish managed destinations and the operator-file
-path for configured selections. Use `redacted_storage_uri` for storage labels;
+identity where needed to distinguish managed destinations, the operator-file
+path for configured selections and the selection source `inline` for an inline
+address. Use `redacted_storage_uri` for storage labels;
 never expose userinfo, bearer values, signed URLs or query-string credentials.
-Retire `--quiet`: its only current effect is suppressing the target line,
-which conflicts with this contract. During the announced compatibility interval it
-is a deprecated no-op with a warning; after removal it errors. Destination and
-unknown-outcome evidence always remain visible. Do not invent a new progress flag.
+Remove `--quiet`: its only current effect is suppressing the target line,
+which conflicts with this contract, so the breaking release refuses it.
+Destination and unknown-outcome evidence always remain visible. Do not invent a new progress flag.
 Existing read-shaped operations can have recovery effects: classify the actual
 operation, including equivalent GQ statements, rather than trusting its verb.
 
@@ -624,7 +711,7 @@ parse -> prepare operation and binding -> acquire credentials -> execute -> rend
    settings. Client constructors and handlers receive the prepared binding; they
    cannot reload routing config, select another authentication mechanism or infer
    a destination from the working directory. Keep the specified first-login and
-   literal-init exceptions. Required legacy recovery-evidence inspection and
+   inline-target exceptions. Required legacy recovery-evidence inspection and
    custody validation remain explicit stages; they cannot select a new destination.
    Inject narrow credential stores, clock inputs and writers where needed, rather
    than a context object that gives every handler access to every service.
@@ -700,51 +787,43 @@ are not interchangeable. Its no-auto-pick principle remains intact.
 
 | Existing surface | Migration |
 | --- | --- |
-| Server/store/root entries, profiles and flat routing defaults | Complete entries in `targets`; deliberate `defaults.target` selection. Keep presentation preferences separate. |
+| Server/store/root entries, profiles and flat routing defaults | Complete entries in `targets`, converted by `target import`; deliberate `defaults.target` selection. Keep presentation preferences separate. |
 | Bundle `storage:` or omitted-storage source-directory fallback | Optional root equality assertion. Register the actual old storage root, including the source directory for a co-located layout; omission thereafter uses the target root. |
 | Sole-graph auto-selection | Set `default_graph` explicitly when migrating that binding, or refuse with guidance to choose a graph; do not discover one at execution time. |
 | Local `--store og_catalog` | A direct catalogue target (`kind: direct`, `scope: catalogue`) with existing query/schema verbs; served access retains `--graph og_catalog`. |
-| `--server`, `--store`, `--cluster`, `--profile`, named `--uri` and positional backend addresses | `--target NAME`, except the existing positional `init URI` bootstrap form. Retain data/source URIs and operation IDs as inputs. |
+| `--server`, `--store`, `--cluster`, `--profile`, named `--uri` and positional backend addresses | `--target NAME`, or `--target ADDRESS` inline; positional `init URI` remains as the inline form. Retain data/source URIs and operation IDs as inputs. |
 | `--managed`, `--direct`, `OMNIGRAPH_PROFILE` and implicit folder context | Target kind/scope; retire mode and ambient routing. `--direct` cannot mechanically become storage because it currently also permits HTTP. |
 | Authentication server name, `--api`, `--organization` on login/logout and managed cluster/organization controls | Target plus existing operation inputs; no independent API or organization override. Account login alone permits organization discovery for an incomplete entry. |
 | Existing folder `use` | Retire it; migrate its verified binding to operator config explicitly. Do not introduce a replacement selection verb. |
-| `profile list/show` | Read-only legacy inspection during the bounded transition; never another way to select or administer new targets. |
+| `profile list/show` | Removed; `target list/show` reads targets. |
 | Context-only `--config` | Remove as enumerated above. Preserve actual source input and pull's separate `--out`. |
 | Read aliases | Explicit target-bound read aliases, preserving query/parameter/output behavior and credential ownership. |
-| `--quiet` | Deprecate as a no-op with a warning during the transition, then remove. Destination and unknown-outcome diagnostics cannot be suppressed. |
+| `--quiet` | Removed. Destination and unknown-outcome diagnostics cannot be suppressed. |
 | Folder pending/last lifecycle records and bound context | Verified custody migration or submission refusal, including incomplete accepted evidence; no fresh key on missing imported history. |
 | Server global bearer fallback | Migrate to an explicitly endpoint-bound named token owner or anonymous access; never attach the global token implicitly. |
 
-Migration is explicit: it may propose a default but cannot silently choose one
-from a folder, token, environment profile or colliding nickname. Import complete
-bindings, preserving graph scope, organization, identity and credential ownership.
+Migration is explicit: `target import` may propose a default but cannot silently
+choose one from a folder, token, environment profile or colliding nickname. Import
+complete bindings, preserving graph scope, organization, identity and credential
+ownership.
 Equal nicknames or URL prefixes are not proof of equivalence. A migrated default
 must be deliberately recorded as `defaults.target`; without one, only explicit
-destination selections (`--target`, a bound alias or literal `init URI`) work.
+destination selections (`--target`, named or inline, a bound alias or
+`init URI`) work.
 No separate selection state is written.
 Before lifecycle cutover, account for the legacy folders used by that operator;
 the invocation-directory guard cannot discover recovery records in other folders.
 Keep unresolved work on its original custody or transfer its verified evidence.
 
-During a named compatibility interval, old explicit selectors may be bounded
-adapters only when they resolve an unambiguous complete binding. Mixing them with
-`--target` refuses. Adapters use the same immutable resolver and emit deprecation
-and destination diagnostics. Explicit `--profile NAME` can adapt a complete legacy
-profile; ambient profiles, old flat routing defaults and folder context cannot
-select the destination. These legacy adapters and `profile list/show` work only
-with legacy-format operator configuration. Migrating a home requires migrating its
-invocations at the same time; an isolated legacy home may retain old definitions
-through the interval. A target-format file rejects legacy routing sections and
-legacy adapters rather than searching another file or guessing a binding. The
-unchanged `init URI` exception is not a legacy adapter.
-A qualified explicit root adapter counts as explicit selection for recovery during
-the interval; a default never does.
-A legacy `--cluster ROOT --deployment-id ID` invocation without writer attestation
-must preserve its source-free lookup/refusal or point to `cluster status`; an
-adapter must never turn it into fresh source apply. After removal, all retired
-destination spellings refuse. The exact versioned schema and
-introduction/last-compatibility/removal releases are acceptance gates, not
-permission for indefinite adapters.
+There is no compatibility interval and no legacy adapter. One breaking release
+ships the target contract and removes every retired destination spelling, flag,
+command and routing section; afterwards each refuses before any backend access,
+naming its target equivalent. A legacy-format operator file refuses whenever it
+is read, naming `target import`, and a target-format file rejects legacy routing
+sections. No file mixes the two formats, and no command reads a second file or
+guesses a binding. A legacy `--cluster ROOT --deployment-id ID` invocation refuses
+like every retired spelling; its replacement is an explicit root target under the
+source-free lookup rules above, never a fresh source apply.
 
 Older binaries ignore unknown operator keys; a format marker alone cannot make
 them refuse safely. Use isolated operator homes, matched binary/config/script
@@ -752,49 +831,42 @@ upgrades, a nonsecret backup and explicit rollback instructions. Do not run old
 binaries on migrated config expecting equivalent routing. This migration changes
 no graph format or ledger; independent server/storage downgrade limits still apply.
 
-Recovery from an absent or broken ordinary operator file uses an isolated
-`OMNIGRAPH_HOME` with one complete direct-root entry and explicit `--target`.
-For example, put this proposed config in `/tmp/og-recovery/config.yaml`:
-
-```yaml
-target_config_version: 1
-targets:
-  recovery:
-    kind: direct
-    scope: root
-    uri: file:///srv/omnigraph
-```
-
-Then, with the original ID and required writer-quiescence evidence:
+Recovery from an absent or broken ordinary operator file uses an isolated, empty
+`OMNIGRAPH_HOME` and an inline root, with the original ID and required
+writer-quiescence evidence:
 
 ```sh
-OMNIGRAPH_HOME=/tmp/og-recovery omnigraph cluster apply --target recovery \
+OMNIGRAPH_HOME=/tmp/og-recovery omnigraph cluster apply --target file:///srv/omnigraph \
   --deployment-id ID --writers-stopped --as ACTOR
 ```
 
-Cloud roots also need their pinned account/endpoint settings and existing
-authentication chain. This reads neither the broken ordinary home nor a source
-bundle. It deliberately replaces literal-root recovery with a minimal explicit
-config, without adding another address flag or weakening admission checks.
+An inline cloud root captures its account/endpoint settings once, as above, and
+uses the existing authentication chain. This reads neither the broken ordinary
+home nor a source bundle, without adding another address flag or weakening
+admission checks.
 
 ## Alternatives
 
 Keeping overlapping selectors or adding managed profiles alone leaves command
 families with different selection rules. Requiring `--target` every time is
 unnecessary when a deliberate config default exists; automation can still do so.
-Adding resource/admin groups would enlarge the surface without improving the
-common plan/apply workflow. The chosen change unifies selection and preserves
-operation-specific grammar.
+A `target` group limited to listing and editing operator config entries saves
+hand-editing YAML and lets same-account tools register a target, and it adds no
+selection state; resource or deployment groups would enlarge the surface without
+improving the common plan/apply workflow. The chosen change unifies selection and
+preserves operation-specific grammar.
 
-Requiring registration before `init` adds friction to scratch graphs without
-improving selection of the explicitly supplied creation address, so keep that
-existing bootstrap form. Using `--writers-stopped` as a mode selector conflates
+Requiring registration for every destination adds friction to scratch graphs and
+one-off commands without improving selection of an address the command line
+already names, so an inline address keeps them without restoring a flag per
+access kind. Using `--writers-stopped` as a mode selector conflates
 safety with intent; use existing explicit source and identity arguments instead.
 A new recovery flag or login command is unnecessary. Mixed old/new operator
-formats are also unnecessary: compatibility is an explicit per-home boundary.
+formats and compatibility adapters are rejected: one breaking release is simpler
+to reason about and test than an interval in which two resolvers coexist.
 Privileged recovery requires the existing `--target` instead of adding confirmation
-semantics to defaults. Its isolated-home procedure avoids restoring an overlapping
-literal-root selector. The catalogue scope represents existing read-only behavior,
+semantics to defaults. Its isolated-home procedure needs no separate literal-root
+selector: the inline root is `--target` itself. The catalogue scope represents existing read-only behavior,
 not a new command family or storage kind.
 
 ## Evidence and tests
@@ -807,12 +879,14 @@ registry or tests that merely repeat the implementation.
 | Gate | Required cases | Existing owners |
 | --- | --- | --- |
 | Selection and scope | All 75 leaves and enumerated argument modes at the audited revision; direct graph/root/catalogue, server, managed account/cluster; explicit/default/missing/invalid target; file errors versus unrelated entry errors; graph defaults/root filters, catalogue and temporal refusals; unsupported modes; organization and local skill modes. Re-pin and reconcile the inventory at acceptance. | `operator.rs`, `scope.rs`, `planes.rs`, `cli_schema_config`, `cli_data`; `integration/parity_matrix.rs` for qualified direct/server parity only |
-| Binding stability | Folder/config/default changes cannot redirect in-flight work. Decoy S3 endpoint/profile and Azure account/endpoint settings cannot redirect named targets on either storage path; literal cloud init freezes one binding. Local path/file-URI equality, symlinks, remote advertised roots and Unix-socket identity. | Operator/scope tests, managed data tests, `cli_cluster`, `omnigraph-storage` and core Lance-access tests |
+| Binding stability | Folder/config/default changes cannot redirect in-flight work. Decoy S3 endpoint/profile and Azure account/endpoint settings cannot redirect named targets on either storage path; an inline cloud address, `init URI` included, freezes one binding. Local path/file-URI equality, symlinks, remote advertised roots and Unix-socket identity. | Operator/scope tests, managed data tests, `cli_cluster`, `omnigraph-storage` and core Lance-access tests |
 | Authentication | Server reference shared across different endpoints refuses before token access/transmission; no global bearer fallback; explicit anonymous access. Human/automation mechanism isolation; API/org/incarnation/principal checks; strict cache formats and bounded acquisition. Token bootstrap with absent/matching/mismatched endpoint; mismatch preserves cache. Org-less login with zero/one/multiple cached organizations and same/different-principal replacement; in-flight identity cannot switch. Logout and token clearing retain their distinct local/session effects. | Managed auth/data tests, server `auth_policy`, operator tests |
 | Source modes | Same ID-only argv against root/server defaults never becomes source submission; explicit source is required with an ID. Matching/mismatched/evicted and valid preallocated IDs; missing attestation; default-selected recovery effects refuse. Bundle storage absent/matching/mismatched; co-located source/state; root/provider disagreement; preview/apply and pull. | `cli_cluster`, `cli_cluster_e2e`, `cli_schema_config`, cluster deployment tests |
-| Bootstrap and uncertainty | Literal init conflicts/default independence; account before cluster; control-only cluster; recovery with malformed ordinary home via isolated home. Lost response, persistence failure and exact request reuse/conflict. Legacy pending and accepted-only migration, crashes between copy/retirement, concurrent processes in one home and transfer across homes. Full capacity refuses; retired-history guard prevents no-key recreation. | Managed lifecycle tests, `cli_cluster` |
-| Outcomes and output | Original-ID waits with concurrent successors; delivery reservation versus native acceptance; fresh convergence versus archives; cancel boundary; effective output on success/error; parseable streams; deprecated `--quiet` cannot suppress destination/outcome diagnostics and refuses after removal. | `system_remote`, `cli_cluster`, `cli_data`, existing outcome tests |
-| Compatibility | Complete selector inventory, explicit adapters/aliases, name collisions, sole-graph migration and strict per-home formats. Default selection refuses applicable retired environment/folder evidence; explicit targets cannot bypass lifecycle preservation. Old-binary/migrated-home protection is documented isolation plus a detectable marker, not an impossible old-binary refusal. Finite adapter removal; preserved source/parameter/pagination/safety contracts. | `operator.rs`, `planes.rs`, `cli_queries`, CLI integration suites |
+| Bootstrap and uncertainty | Inline and `init URI` conflicts/default independence; account before cluster; control-only cluster; recovery with malformed ordinary home via isolated home. Lost response, persistence failure and exact request reuse/conflict. Legacy pending and accepted-only migration, crashes between copy/retirement, concurrent processes in one home and transfer across homes. Full capacity refuses; retired-history guard prevents no-key recreation. | Managed lifecycle tests, `cli_cluster` |
+| Outcomes and output | Original-ID waits with concurrent successors; delivery reservation versus native acceptance; fresh convergence versus archives; cancel boundary; effective output on success/error; parseable streams; `--quiet` refuses as removed and nothing suppresses destination/outcome diagnostics. | `system_remote`, `cli_cluster`, `cli_data`, existing outcome tests |
+| Compatibility | Complete selector inventory: every retired spelling refuses with its target equivalent before backend access. Legacy-format files refuse and `target import` converts them, keeping credential owners and endpoint scopes; name collisions, sole-graph migration and strict formats. Default selection refuses applicable retired environment/folder evidence; explicit targets cannot bypass lifecycle preservation. Old-binary/migrated-home protection is documented isolation plus a detectable marker, not an impossible old-binary refusal. Preserved source/parameter/pagination/safety contracts. | `operator.rs`, `planes.rs`, `cli_queries`, CLI integration suites |
+| Inline targets | Name versus address, reserved `og_catalog`, relative-path guidance; direct scope by `--graph` and by root-only command, refusing a graph operation on a root without one; inline server credentials only under a configured owner's endpoint scope; invocation-local cloud capture reaching both storage paths; managed refuses inline; `init URI` equals the inline form. | `scope.rs`, `targets.rs`, `cli_data`, `cli_cluster` |
+| Administration | Each edit keeps the rest of the file's text, refuses an incomplete, conflicting or uneditable entry and the default's removal, never stores a secret or sets the default, and serializes under the lock; `credential get` refuses a terminal. | `targets.rs`, `cli_data` |
 
 This RFC update runs documentation, link and spelling checks only; it does not
 claim these proposed runtime gates pass. Implementation must update user docs,
@@ -853,8 +927,8 @@ engine and CLI, add assertions at both affected boundaries.
 
 During migration, change CLI fixture construction in the existing support owner to
 write target-format config into isolated operator homes, and pass explicit targets
-in process journeys. Keep dedicated tests for configured defaults and legacy
-adapters. Update actual product CLI setup calls used by served GQT smoke tests;
+in process journeys. Keep dedicated tests for configured defaults, inline
+targets and retired-spelling refusals. Update actual product CLI setup calls used by served GQT smoke tests;
 keep `.gqt` cases and the separate runner's execution-environment selectors
 unchanged. Do not add a GQT CLI adapter or expand the GQT grammar for this RFC.
 Run the affected CLI suites and served smoke/conformance owners; run the relevant
@@ -890,7 +964,7 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
 
 ## Rollout
 
-1. Accept the schema and finite release interval; amend affected accepted RFC
+1. Accept the schema and the breaking release; amend affected accepted RFC
    sections and capture baseline routing/authentication/outcome fixtures.
 2. Extract the affected command/preparation boundaries without changing behavior,
    then implement typed operations, the shared resolver and immutable client inputs
@@ -898,12 +972,12 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
    behavior before enabling the new contract; unsupported combinations remain
    errors. Keep broad file moves separate from targeting changes, and move output
    handling incrementally while preserving streams and outcome contracts.
-3. Ship the introduction release with explicit legacy-format adapters and the
-   deprecated quiet no-op. Migrate each operator home, scripts, aliases and docs
-   together; keep isolated legacy homes where conversion is not yet complete.
-4. Remove adapters and `--quiet` in the named removal release. Mark implementation
-   complete only after the command matrix, refusal/recovery evidence, user docs,
-   help and release notes match the accepted contract.
+3. Ship one breaking release with the target contract, inline targets, the
+   `target` group and `target import`. It removes the retired selectors, routing
+   sections, `use`, `profile` and `--quiet`. Migrate operator homes, scripts,
+   aliases and docs with it.
+4. Mark implementation complete only after the command matrix, refusal/recovery
+   evidence, user docs, help and release notes match the accepted contract.
 
 ## Unresolved questions
 
@@ -911,8 +985,9 @@ Kubernetes documentation and implementation were reviewed on 2026-10-14:
   settings, credential references and bounded pending/accepted recovery custody?
   It must express the login-only incomplete account entry without weakening
   organization-bound credentials or permitting resource access before completion.
-- Which releases introduce the new contract, end compatibility and remove retired
-  flags? Define and test the supported old/new binary, config and script combinations.
+- Which release ships the breaking change? Define and test the old/new binary,
+  config and script combinations it supports; an older binary ignores unknown
+  operator keys.
 
 These decisions must be settled before acceptance; their review and release gates
 are recorded in `blocked_on`. Selection, bootstrap exceptions, source/recovery
@@ -954,3 +1029,15 @@ modes and same-ID nonexecution are decisions in this proposal, not open defaults
   Reuse existing libraries and test owners; keep optional diagnostic/transcript
   helpers small. Clarify CLI/GQT test ownership without adding commands or a second
   query-semantics corpus.
+- **2026-10-18:** Make the change breaking: one release removes every retired
+  selector, routing section and their commands, with no compatibility adapters
+  and no mixed-format operator file; `target import` converts a legacy file and
+  `--quiet` is removed rather than deprecated. Support inline targets: `--target`
+  takes a storage path or URI or a server endpoint as a complete binding, scoped
+  from the command line alone, with endpoint-scoped credentials and an
+  invocation-local cloud capture; `init URI` is its positional form and managed
+  destinations stay named. Add the `target` administration group and
+  `credential get`, which edit and read operator config and the credentials file
+  and never select a target or set the default. Pull request #1080 implements
+  the schema, validation, endpoint-bound credentials and administration commands
+  for direct and server targets.
