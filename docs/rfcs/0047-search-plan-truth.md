@@ -1146,3 +1146,13 @@ None.
   `rebuild-full-text-indexes --branch` elsewhere); a command that builds a
   branch's missing indexes alone (#840) is separate work. Steps 2 and 2a are
   recorded as merged.
+- 2026-10-17: step 4 implemented. Lowering roots the component holding the
+  bindings the leading order key ranks; a ranked binding no declaration
+  introduces gets a scan of its checked type, so declaring it changes no
+  plan. Correlated blocks have no order and keep the searched-binding rule.
+  The `rrf()` refusal moved from the planner to the type checker as `T59`,
+  which carries the refused expression, and the planner codes `P001` and
+  `P005` are withdrawn: a compiled query no longer reaches either, so the
+  planner keeps both checks as internal errors against a lowering defect.
+  An `rrf()` over one reached binding keeps its arm windows, so its nearest
+  arm still ranks the corpus before the traversal keeps the reached rows.
