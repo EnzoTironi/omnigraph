@@ -1502,6 +1502,10 @@ decide_seam! {
 }
 
 impl TableStore {
+    pub(crate) fn session(&self) -> Arc<lance::session::Session> {
+        self.session.clone()
+    }
+
     pub fn new(root_uri: &str, session: Arc<lance::session::Session>) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
@@ -1522,9 +1526,9 @@ impl TableStore {
     /// Authorize, normalize, deduplicate, and probe every URI before any
     /// external payload read, target ref creation, table commit, or
     /// graph-visible effect. Scalar-only preparation may already have produced
-    /// temporary in-memory or staged inputs. The graph session supplies the
-    /// process-wide shared registry, so one operation does not create cold
-    /// clients per row.
+    /// temporary in-memory or staged inputs. External sources retain their
+    /// independent provider registry; a selected graph destination never
+    /// overrides the source address or creates a cold client per row.
     pub(crate) async fn preflight_external_blob_uris(
         &self,
         uris: &[String],
@@ -1584,7 +1588,7 @@ impl TableStore {
         }
 
         crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
-        let registry = self.session.store_registry();
+        let registry = crate::lance_access::external_source_registry(&self.session);
         let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
             let registry = Arc::clone(&registry);
             async move {
@@ -1735,7 +1739,8 @@ impl TableStore {
         if entry.native_dataset_branch.is_none() {
             return self.open_at_entry(entry).await;
         }
-        let dataset = match open_dataset_entry(entry, &self.root_uri, None).await {
+        let fresh = crate::lance_access::statement_session(self.session.store_registry(), 0, 0);
+        let dataset = match open_dataset_entry(entry, &self.root_uri, Some(&fresh)).await {
             Ok(dataset) => dataset,
             Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
                 // Cleanup can reclaim a pinned version of a live fork (a
@@ -4052,7 +4057,8 @@ impl TableStore {
             ));
         }
 
-        let store_params = crate::storage::lance_store_params_for_uri(dataset_uri)?;
+        let store_params =
+            crate::storage::lance_store_params_for_session(dataset_uri, &self.session)?;
         let handler = crate::storage_layer::lance_clone::configured_commit_handler(
             dataset_uri,
             &Some(store_params.clone()),
@@ -4335,7 +4341,10 @@ impl TableStore {
     pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
         let params = WriteParams {
             mode: WriteMode::Create,
-            store_params: Some(crate::storage::lance_store_params_for_uri(dataset_uri)?),
+            store_params: Some(crate::storage::lance_store_params_for_session(
+                dataset_uri,
+                &self.session,
+            )?),
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,

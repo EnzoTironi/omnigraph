@@ -164,6 +164,13 @@ backup and read the candidate-written root with the predecessor before claiming
 a qualified rollback. This is independent of graph-stamp conversion; unchanged
 V2_2 files and format 16 do not establish reader compatibility on their own.
 
+The core `captured_provider` test runs isolated subprocesses because native
+provider environment snapshots are process-wide. It exercises S3 and Azure
+control-object and native Lance reads/conditional creates against fake HTTP
+endpoints, destination aliases and ambient-option drift, including cached Azure
+options and rotating credential providers. Storage's `binding` unit tests own
+option classification and fixed defaults; these are not live-cloud qualification.
+
 ## Server and CLI ownership
 
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
@@ -180,7 +187,9 @@ existing parity matrix. Query semantics remain in GQT, not duplicated in these
 CLI boundary tests.
 Schema-family application tests verify that failed result delivery preserves an
 applied schema and its actor with one publication, and that an undeliverable
-target line precedes writable open. Init output failure leaves a readable graph;
+target line precedes writable open. The same application owner injects write and
+flush failures into mutation-scope diagnostics; `cli_data` checks ordinary and GQ
+branch scopes while keeping JSON stdout parseable. Init output failure leaves a readable graph;
 lint report failures and subsequent invocations remain reusable. Extend the
 existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
 cluster ownership and offline source-read ordering.
@@ -201,10 +210,10 @@ filtering and wrong-plane refusal before configuration or HTTP access. The exist
 these CLI changes require no additional query-semantic GQT cases.
 
 Local command tests in `commands/local` own supplied login input, credential
-changes after report failure, captured profile configuration, and completed skill
+changes after report failure, captured target configuration, and completed skill
 or embedding files after output loss. `skill.rs` owns exact file delivery and its
 existing broken-pipe exception. Extend `cli_schema_config` for version and skill
-process behavior and `cli_data` for profile/embedding output. Its existing
+process behavior and `cli_data` for target/embedding output. Its existing
 discovery-swap fixture also replaces the credential file, requiring registry
 probing and the subsequent command to retain the original token. Application and
 managed-output tests own completion, partial-write and flush failures; managed
@@ -249,8 +258,10 @@ turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
-`--managed` selection, and wrong-mode refusals before context or external access.
-Direct apply must ignore both valid and malformed managed folder context.
+managed target selection, and unsupported target-kind refusals before credentials
+or external access. Default target selection refuses applicable retired folder
+routing; explicit direct targets never route through it. Legacy lifecycle custody
+remains guarded even with explicit selection.
 Managed deployment fixtures also exercise immutable preview/delivery bodies,
 original-ID recovery, current authorization refusals, bounded waiting through
 uncertain delivery/archival, and queued-only cancellation. They do not replace
