@@ -683,7 +683,9 @@ writes or token issuance. Move existing pending lifecycle recovery custody from 
 source folder to operator-owned storage. Persist API, organization, principal,
 request identity/digest and key before sending. Repeating the same existing command
 resumes its matching pending request; conflicting reuse refuses under the existing
-pending-request rules. Mutable target names, changed folders or config edits cannot
+pending-request rules. An unresolved pending request with a different key or
+request body refuses with `pending_lifecycle_conflict`; no new key is sent.
+Mutable target names, changed folders or config edits cannot
 erase that record or redirect its replay. This is recovery evidence, not another
 remote state authority; its implementation must preserve the accepted identity and
 bounded-retention rules below.
