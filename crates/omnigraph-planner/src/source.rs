@@ -266,26 +266,46 @@ pub trait PlanSource {
         GatePolicy::default()
     }
 
+    /// The directory each finished explain document is written into, one
+    /// `<operation>_<logical_hash>.explain.json` per planned operation;
+    /// `None` disables the write.
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// How far the full-text index of `property` covers the pinned table
-    /// `type_key` names. The default claims no coverage, the answer under
-    /// which every plan stays correct.
+    /// `type_key` names. The default claims an index of unproven coverage:
+    /// nothing is refused and every bm25 scan filters after scoring, the
+    /// placement under which every plan stays correct.
     fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
-        FullTextCoverage::Absent
+        FullTextCoverage::Partial
+    }
+
+    /// The fingerprint of the catalogue table `type_key` names at this source:
+    /// its rows and schema as the running binary derives them, so a plan records
+    /// what it read and a replay checks it. `None` for a source with no catalogue.
+    fn catalogue_fingerprint(&self, _type_key: &str) -> Option<String> {
+        None
     }
 }
 
 /// How far a property's full-text index covers the pinned dataset's
 /// fragments. Only full coverage makes a BM25 score independent of a filter
 /// applied before scoring: Lance scores the unindexed fragments flat, from
-/// statistics over the rows the filter admits.
+/// statistics over the rows the filter admits. A segment of any coverage,
+/// even the untrained declaration every write records, carries the index's
+/// analyzer to the rows it does not cover; an absent index refuses every
+/// full-text call on the property (`PlanError::FullTextIndexRequired`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FullTextCoverage {
-    /// Every fragment of the pinned version is in a full-text segment.
+    /// Every fragment of the pinned version is in a full-text segment, which
+    /// a table with no fragment has vacuously.
     Full,
     /// A full-text index exists; some fragment is not in it.
     Partial,
-    /// The property has no full-text index.
+    /// No segment on the property records a full-text index, and the table
+    /// has rows.
     Absent,
 }
 
@@ -315,6 +335,16 @@ impl FullTextCoverage {
                 });
         if full { Self::Full } else { Self::Partial }
     }
+
+    /// [`Self::of_facts`] for a table version holding `fragments` current
+    /// fragments: one with none has no row a full-text call could answer
+    /// differently, so it is covered whatever its indexes.
+    pub fn of_table(facts: &[IndexFact], column: &str, fragments: usize) -> Self {
+        if fragments == 0 {
+            return Self::Full;
+        }
+        Self::of_facts(facts, column)
+    }
 }
 
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
@@ -337,9 +367,50 @@ pub struct MemorySource {
     /// When set, a key's canonical id renders as `id:<value>`, a parameter
     /// resolved from these values.
     canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
+    explain_dump_dir: Option<std::path::PathBuf>,
+    catalogue_fingerprints: HashMap<String, String>,
 }
 
 impl MemorySource {
+    /// A catalogue node type: `rows` rows of the built-in type `name`
+    /// (`@Operator` and its kin) with the given fingerprint, as the engine
+    /// would serve it under the current identity spelling.
+    pub fn with_catalogue_type(mut self, name: &str, rows: u64, fingerprint: &str) -> Self {
+        let ty = omnigraph_compiler::catalogue_type(name)
+            .unwrap_or_else(|| panic!("`{name}` is not a catalogue type"));
+        let columns = omnigraph_compiler::SYSTEM_COLUMNS_V3;
+        let node = ty.node_type(columns);
+        let type_key = format!("node:{name}");
+        self.catalogue_fingerprints
+            .insert(type_key.clone(), fingerprint.to_string());
+        self.node_types.insert(
+            name.to_string(),
+            NodeTypeSpec {
+                table: TableRef::catalogue(type_key),
+                version: None,
+                columns,
+                schema: node.arrow_schema.clone(),
+                key: node.key.clone().unwrap_or_default(),
+                object_columns: node
+                    .node_object_fields()
+                    .map(|field| field.name().clone())
+                    .collect(),
+                object_fields: node
+                    .node_object_members()
+                    .map(|(member, field)| {
+                        arrow_schema::Field::new(
+                            member,
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                    })
+                    .collect(),
+                row_count: Some(rows),
+            },
+        );
+        self
+    }
+
     pub fn with_full_text_coverage(
         mut self,
         type_key: &str,
@@ -353,6 +424,11 @@ impl MemorySource {
 
     pub fn with_canonical_key_ids(mut self, params: omnigraph_compiler::ir::ParamMap) -> Self {
         self.canonical_keys = Some(params);
+        self
+    }
+
+    pub fn with_explain_dump_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.explain_dump_dir = Some(dir);
         self
     }
 
@@ -530,6 +606,14 @@ impl PlanSource for MemorySource {
         self.full_text
             .get(&(type_key.to_string(), property.to_string()))
             .copied()
-            .unwrap_or(FullTextCoverage::Absent)
+            .unwrap_or(FullTextCoverage::Partial)
+    }
+
+    fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {
+        self.explain_dump_dir.clone()
+    }
+
+    fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
+        self.catalogue_fingerprints.get(type_key).cloned()
     }
 }

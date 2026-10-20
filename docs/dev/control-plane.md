@@ -39,6 +39,22 @@ The protocol and cache compatibility boundaries are specified in
 [the identity and applied-policy RFC](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients); user behavior and limits
 are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
 
+Ordinary managed deployment uses immutable `/plans` previews and scoped
+`/deployments` delivery, separate from cloud lifecycle operations. The adapter
+freezes a resolved source head before preview and sends a preview ID exactly
+once for delivery. Polling observes the original product/native IDs and never
+resubmits a write. Native execution, runtime activation and result archival
+remain distinct facts; a saved result alone cannot prove an active runtime.
+Cancellation targets only the initiating caller's unattempted queued delivery.
+
+Read-only cluster member discovery uses the same selected organization and
+authenticated adapter. It requires cluster `status` permission and validates the
+response's cluster identity and bounded member records before rendering. The
+directory reports explicit enrollment and cluster-specific control grants;
+provider profile metadata is optional and applied Cedar remains the authority
+for graph operations. The `cli_cluster` transport fixture owns the command's
+scope, response validation and refusal tests.
+
 ## Durable layout
 
 | Path | Role |
@@ -177,14 +193,82 @@ conversion, admission construction or read-only server settings validation
 explicitly release the exact lock. Recovery
 of an accepted invocation retains admission even when its current preparation
 refuses. Other explicit release requires qualified terminal graph and control
-I/O; generic server drain does not establish that proof. Operator
-transfer therefore requires stopped prior processes and accepted-I/O quiescence,
+I/O; generic server drain does not establish that proof. Clean serving release
+adds an explicit storage scope covering native and Lance writes, described below.
+Other operator transfer requires stopped prior processes and accepted-I/O quiescence,
 then exact-ID unlock with all admissions and other unlocks excluded until it
 finishes. The backend has no conditional-delete guarantee; this is not a
 distributed fencing lock. Older/raw/embedded writers outside the participating
 doors remain operator-excluded across outstanding work and recovery. No tags or
 additional retention store protect deployment evidence, and the executor never
 runs cleanup.
+
+Fresh S3 initialization has one narrower exception to exact-ID unlock:
+`bootstrap_serving` executes only the initial cluster-scoped policy deployment
+under a private retained bootstrap lock. It opens no graphs and returns a strict
+16 KiB maximum receipt bound to the exact root, input, native ledger/result,
+state CAS and original lock version. Native authority, graph or recovery
+residue refuses initialization; unrelated opaque metadata grants no authority.
+`claim_bootstrap_serving` validates those bindings and conditionally replaces
+that same lock version with a new process-owned serving lock before capturing
+the empty serving snapshot. It never deletes the lock or adopts an earlier
+claim after an uncertain acknowledgement. Errors, cancellation and lost
+responses retain exclusion. Already-issued bootstrap state updates use spent
+CAS predecessors; immutable payload retries cannot alter achieved input. This
+is only fresh zero-graph bootstrap, not native-I/O settlement or expiry-based
+takeover. Later serving owners use clean release rather than replaying the
+bootstrap receipt. The S3 lock key remains continuously present across normal
+release and acquisition, so an older bootstrap create cannot recreate its owner.
+
+Clean native shutdown closes logical admission, drains its existing operation
+owners, then closes and drains an explicit `StorageIoScope` shared by control
+adapters and graph Lance sessions. The wrappers count actual mutating requests
+and multipart lifetimes. Physical settlement depends on the operation and the
+key it names. The wrapper recognizes Lance 13's fresh `data/*.lance` files,
+their `data/<file-key>/*.blob` sidecars, `_transactions/*.txn`,
+`_deletions/*.arrow|*.bin`, flat files in `_indices/<uuid>/`, detached
+`_versions/d*.manifest`, and numbered manifests created only if absent.
+Late fresh files remain unreachable and a conditional create cannot replace
+an existing publication. Such requests settle at the physical scope after
+an error or cancellation, including multipart uploads. This does not prove
+that a graph publication failed: the catalogue still owns the outcome of an
+unacknowledged numbered-manifest publication, and its uncertainty reaches the
+logical operation owner independently of the storage scope.
+
+Refs, version hints, cluster control objects, unknown paths, if-match
+replacements and recursive deletes remain conservative. A cancelled or
+ambiguous request sticks even if a higher layer consumes the error, and the
+scope logs its key and error. Rename also accounts for removal of its source.
+Single-attempt conditional conflicts and a delete answered "not found" are
+settled refusals.
+
+An unacknowledged manifest write may land after Lance reads it back as absent
+and attempts to delete its transaction file. One sticky flag therefore
+refuses transaction-file deletion throughout that scope, including rename
+source deletion and recursive removal. This intentionally retains other
+datasets' transaction files too, bounding the accounting state. Normal data
+serving can continue, while transaction cleanup can be deferred until a
+replacement scope. The collector must still establish its normal
+reachability, authority and age predicates before reclaiming retained files;
+replacing the scope is not permission to delete them. Definite conditional
+conflicts do not set the hold. A successful multipart abort does not clear a
+hold from an earlier unacknowledged completion.
+
+Scoped clients disable both transport and Lance AIMD retries, and local Lance
+uses its object-store file provider so direct file writes cannot bypass the
+scope. Embedded defaults and Azure serving clients are unchanged; the
+automatic scoped shutdown path applies only to local and S3 roots.
+
+Only unique admission, successful startup and unpoisoned settlement permit final
+release. Original adapters remain permanently closed; a private single-attempt
+client performs only exact-owner lock release under the same shutdown deadline.
+S3 release CAS writes a unique version-2 released marker at the existing key;
+ordinary acquisition CAS replaces it with a fresh held owner. Lost release
+acknowledgement is an error, while its delayed CAS cannot affect a successor.
+Local release uses awaited exact-owner deletion; automatic Azure release remains
+unqualified and its prior retained-lock shutdown behavior is unchanged. Older
+tools refuse the new released record. This supplies neither
+distributed fencing, generic runtime reuse nor crash recovery.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
@@ -213,8 +297,10 @@ disconnect; no polling worker or second storage-writing CLI is involved.
 POST returns 202 after the outstanding ledger CAS confirms acceptance. The CLI
 then polls exact-ID GET; its wait deadline does not cancel the owned operation.
 Exact GET returns the receipt, `active`, and `in_progress` derived from the
-current process owner. A complete receipt can precede activation. A missing
-receipt during preparation is not proof of refusal, and an outstanding receipt
+current process owner. That owner retains the deployment gate through pending
+result delivery; its observation clears when the gate releases. A complete
+receipt can precede activation. A missing receipt during preparation is not proof
+of refusal, and an outstanding receipt
 without a live owner requires recovery.
 
 Exact receipt reads also permit the authenticated initiating actor recorded in
@@ -340,9 +426,17 @@ before releasing ownership. A read
 error or panic does not trigger write uncertainty. A write panic or explicitly
 indeterminate owned completion closes admission for every graph and signals the
 same bounded process shutdown, retaining
-unresolved reservations until exit. Proven engine pre-effect refusals remain
-nonfatal. Read/write body and response lanes have independent capacity; bodyless
-reads consume only read observers. Once HTTP connections and the remaining known
+unresolved reservations until exit. The engine's completion evidence decides:
+a failure it proves left the graph unchanged, before any effect or after
+detached effects no manifest names (`BeforeEffect`, `Unpublished`), is
+not itself a reason for logical containment, whatever status it maps to,
+including a 500. Mutation, load, Blob write and merge mark opaque errors (storage, I/O, DataFusion, internal) at their pre-publication
+steps, alongside the table store's staged-write and detached-commit sites.
+A typed refusal keeps its shape. Other opaque schema and maintenance
+preparation errors without completion evidence still fail closed as uncertain. Proven publication followed by
+`RecoveryRequired`, and uncertain publication itself, are never downgraded.
+Read/write body and response lanes have independent capacity; bodyless reads
+consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 

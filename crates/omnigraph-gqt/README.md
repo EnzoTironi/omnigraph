@@ -120,8 +120,9 @@ expected to succeed, binds the receipt's commit id to `$name`
 `--- query snapshot: $name` header reads at that commit instead of a branch,
 and a commit statement whose whole quoted operand is the name,
 `commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
-bound id; this is the one place `${` may appear in a statement body, and the
-engine receives an ordinary literal. A mutation declaration
+bound id, as is a `branch create <branch> from commit "${name}"` whose
+commit is the whole quoted operand; these are the places `${` may appear in a statement
+body, and the engine receives an ordinary literal. A mutation declaration
 `as unattached branch on "${name}"` (RFC "Unattached graph branches") is
 substituted the same way, and a `--- params` body may spell a bound name,
 `{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
@@ -155,6 +156,61 @@ ends a body keeps the final line break the file shows. Each DST seed runs twice
 in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
+
+## CSV fixtures and the load statement
+
+A `--- mutate` step may hold one `load csv` statement
+([CSV loading](../../docs/user/mutations/index.md#csv-loading)); its
+`branch:` argument is the statement's target, as for a mutation declaration,
+and its `--- expect` takes the control-write forms (`ok`, `error: <needle>`).
+`--- bind commit $name` after it binds the load's commit. The source is a
+URI the engine reads under the case's external Blob policy, or the bare name
+of a `--- csv <name>` section: that section's body is the file's text, the
+runner writes every such section into a fresh directory before the store
+opens, rewrites the statement's source to the file's `file://` URI, and
+installs one `embedded_only` base over that directory on the case's handles,
+across a `--- restart` too, so the statement is authorized by the rule any
+source meets. A bare name without its section refuses the case. A served
+environment refuses fixture sections and bare source names at admission,
+before starting a worker or making any server request. A `load csv` step
+there names an absolute
+URI the server may read, and the `omnigraph-engine` environment is the one
+that runs section-backed loads. The step is reported as a `load` kind.
+
+```text
+--- csv person.csv
+id|firstName
+2|bob
+
+--- mutate branch: work
+load csv "person.csv" into node:Person mode append delimiter "|" header
+
+--- expect ok
+```
+
+A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
+pins the load's planner document and executed report, read from the load's
+receipt ([explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+Each line is one fact; a fact the section does not mention is unchecked, as
+for a query plan. The forms: `load route: <plan|pipeline>` (the document's
+`engine` or `executor` route); `load scan: partitions <n> fallback
+single_scan`; `load validate value <table> [a, b]`; `load validate unique
+<table> <key|unique> [a, b]: access <delta|probe|scan>`; `load validate
+edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
+cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
+<edge> <from|to>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
+merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
+are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
+an endpoint's referenced type is bare. A served environment refuses the
+section at admission, since the wire answer carries no plan.
+
+```text
+--- expect plan
+load route: plan
+load validate edge_ri edge:Knows from Person: access scan
+load write: overwrite fragments
+load executed: partitions 1 rows 2400
+```
 
 ## Generated fixtures and loads
 
@@ -450,6 +506,7 @@ scan Doc: not columns [embedding]
 scan Doc as $d: filter reads [d.state]
 scan Doc as $e: no filter
 hash join $e
+anti join $p: key_set
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
@@ -543,7 +600,12 @@ has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
-hash join over that binding. The `hash join` and `expand` lines take a
+hash join over that binding. An `anti join $var: <correlated|key_set>` line
+claims the strategy of every physical `AntiJoin` correlated on `$var` (a `not`,
+`exists`, `count` or aggregate block): `correlated` starts its inner tree from
+the outer rows, `key_set` runs it once from the block's own bounded binding
+(pass `anti_join_strategy`); it fails when no such block is in the physical
+plan or one took the other strategy. The `hash join` and `expand` lines take a
 trailing `ran <side>` (`hash join $e ran id_lookup`, `mode indexed_scan ran
 csr`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined
@@ -565,6 +627,55 @@ sequential choice. `access index_probe <physical-column>` requires a probe
 with that physical column in a leaf of `index_query`; it does not compare
 rendered search text, residuals or index names. `pass scan_access` records
 completed finalization; `pass key_to_id` records a safe key narrowing.
+
+A `load csv` step may carry an `--- expect plan` section directly after its
+`--- expect ok`.
+Its lines are checked against the planner document in the executed load's
+receipt ([Explaining a load statement](../../docs/user/queries/explain.md#explaining-a-load-statement)).
+Each line is one fact claim, and a fact no line mentions is unchecked:
+
+```text
+load route: plan|pipeline
+load scan: partitions <n> fallback single_scan
+load validate unique <table> key|unique [<cols>]: access delta|probe|scan
+load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
+load validate cardinality <edge-table> from <node-type>
+load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load write: overwrite fragments
+load write: append strict_insert
+load write: merge upsert
+load executed: partitions <n> rows <m>
+```
+
+`load route` claims the document's route, `plan` for `engine` and `pipeline`
+for `executor`.
+`load scan` claims the `CsvSource` node's partition count and its `single_scan`
+fallback.
+A `load validate` line claims one check of the `Validate` node with that
+identity, and its `access` suffix claims the check's access path.
+`load write` claims the `FragmentWrite` node's mode and adapter.
+`load executed` claims the partitions and rows the load executed.
+
+```text
+--- csv knows.csv
+from|to
+1|2
+2|3
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode overwrite delimiter "|" header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load scan: partitions 1 fallback single_scan
+load validate unique edge:Knows key [from, to]: access delta
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+load write: overwrite fragments
+load executed: partitions 1 rows 2
+```
 
 ## Reference comparison
 

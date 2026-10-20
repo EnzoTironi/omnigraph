@@ -16,7 +16,8 @@ use handlers::*;
 use settings::*;
 pub use settings::{
     ServerRuntimeState, classify_server_runtime_state, load_server_settings,
-    load_server_settings_with_data_token_trust, load_server_settings_with_identity_trust,
+    load_server_settings_with_bootstrap_handoff, load_server_settings_with_data_token_trust,
+    load_server_settings_with_identity_trust,
 };
 pub mod auth;
 pub mod data_tokens;
@@ -63,11 +64,11 @@ use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::{BranchStartRefusal, ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
@@ -123,6 +124,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_graphs_list,
         handlers::server_graphs_discovery,
         handlers::server_snapshot,
+        handlers::server_access,
         handlers::server_blob_get,
         handlers::server_blob_head,
         handlers::server_blob_put,
@@ -189,7 +191,6 @@ impl utoipa::Modify for SecurityAddon {
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
 const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
     omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
@@ -228,11 +229,11 @@ pub struct ServerConfig {
     pub cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
 }
 
-/// Applied server settings paired with already validated offline token trust.
+/// Applied server settings bound to a root and optional validated identity trust.
 ///
-/// Constructed only by [`load_server_settings_with_data_token_trust`]. The
-/// settings are exposed read-only so their graphs cannot be replaced after the
-/// canonical serving root has been checked against the trust document.
+/// Constructed by the identity-trust and bootstrap-handoff settings loaders. The
+/// settings are exposed read-only so their graphs cannot be replaced after
+/// ownership or identity trust has been bound to the canonical serving root.
 #[derive(Debug, Clone)]
 pub struct ManagedServerConfig {
     config: ServerConfig,
@@ -332,8 +333,15 @@ pub enum ServerConfigMode {
         /// Server-level Cedar policy for the management endpoints
         /// (`GET /graphs`). Wired into `GET /graphs` authorization.
         server_policy: Option<PolicySource>,
+        /// The policy bound to `graph.og_catalog`: it governs reads of the
+        /// engine catalogue scope, which every binary serves and no
+        /// deployment creates.
+        catalogue_policy: Option<PolicySource>,
     },
 }
+
+/// The route prefix of the engine catalogue scope, `/graphs/og_catalog`.
+pub(crate) const CATALOGUE_ROUTE_PREFIX: &str = "/graphs/og_catalog";
 
 /// Where a Cedar policy bundle comes from at startup. Cluster-local files are
 /// used during config application; inline digest-verified catalog content is
@@ -485,7 +493,9 @@ enum ApiErrorDetails {
     BlobPreconditionFailure(api::BlobPreconditionFailureOutput),
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
+    BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
+    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
 }
 
@@ -842,6 +852,22 @@ impl AppState {
         })
     }
 
+    /// Install the policy of the engine catalogue scope; `serve` passes the
+    /// `graph.og_catalog` binding's, a deployment activation replaces it.
+    pub fn set_catalogue_policy(&self, policy: Option<PolicyEngine>) {
+        self.routing
+            .registry
+            .initialize_catalogue_policy(policy.map(Arc::new));
+    }
+
+    pub(crate) fn catalogue_policy(&self) -> Option<Arc<PolicyEngine>> {
+        self.routing
+            .registry
+            .snapshot_ref()
+            .catalogue_policy
+            .clone()
+    }
+
     /// Attach the boot witness `/readyz` reports and the flag shutdown sets
     /// (RFC 0049). `serve` calls this; a test may build its own.
     #[must_use]
@@ -964,7 +990,7 @@ impl AppState {
             return true;
         }
         let snapshot = self.routing.registry.snapshot_ref();
-        if snapshot.server_policy.is_some() {
+        if snapshot.server_policy.is_some() || snapshot.catalogue_policy.is_some() {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
@@ -1371,6 +1397,23 @@ impl ApiError {
         }
     }
 
+    /// HTTP 409, or 410 Gone when the commit is no longer retained: `branch
+    /// create` cannot start a branch at the commit `from` named, and nothing
+    /// was created. The `branch_start_refusal` detail carries the reason.
+    fn branch_start_refusal(message: String, details: api::BranchStartRefusalOutput) -> Self {
+        let status = match details.reason {
+            api::BranchStartRefusalReason::NotRetained => StatusCode::GONE,
+            _ => StatusCode::CONFLICT,
+        };
+        Self {
+            completion_uncertain: false,
+            status,
+            code: (status == StatusCode::CONFLICT).then_some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
+            details: Some(Box::new(ApiErrorDetails::BranchStartRefusal(details))),
+        }
+    }
+
     /// A refused query: HTTP 400 with the one-line message, plus the
     /// compiler's structured diagnostic when the refusal carries one.
     fn from_compiler(err: &omnigraph_compiler::error::CompilerError) -> Self {
@@ -1500,6 +1543,16 @@ impl ApiError {
                 )));
                 response
             }
+            error @ OmniError::FullTextIndexRequired { .. } => {
+                let mut response = Self::conflict(error.to_string());
+                let OmniError::FullTextIndexRequired { index } = error else {
+                    unreachable!()
+                };
+                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
+                    api::FullTextIndexRequiredOutput { index },
+                )));
+                response
+            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -1511,6 +1564,60 @@ impl ApiError {
             }
             error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
             error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
+            error @ OmniError::BranchStartRefused { .. } => {
+                let message = error.to_string();
+                let OmniError::BranchStartRefused {
+                    graph_commit_id,
+                    reason,
+                } = error
+                else {
+                    unreachable!()
+                };
+                let (reason, type_name, branch) = match reason {
+                    BranchStartRefusal::NotRetained { table_key, .. } => {
+                        let Ok((_, type_name)) = api::entity_type_parts(&table_key) else {
+                            return Self::internal(
+                                "branch start refusal named invalid graph type metadata",
+                            );
+                        };
+                        (
+                            api::BranchStartRefusalReason::NotRetained,
+                            Some(type_name.to_string()),
+                            None,
+                        )
+                    }
+                    BranchStartRefusal::SchemaChanged => {
+                        (api::BranchStartRefusalReason::SchemaChanged, None, None)
+                    }
+                    BranchStartRefusal::EarlierStorageFormat => (
+                        api::BranchStartRefusalReason::EarlierStorageFormat,
+                        None,
+                        None,
+                    ),
+                    BranchStartRefusal::BranchDeleted { branch } => (
+                        api::BranchStartRefusalReason::BranchDeleted,
+                        None,
+                        Some(branch),
+                    ),
+                    BranchStartRefusal::UnpublishedCommit => {
+                        (api::BranchStartRefusalReason::UnpublishedCommit, None, None)
+                    }
+                    BranchStartRefusal::UnattachedSnapshot => (
+                        api::BranchStartRefusalReason::UnattachedSnapshot,
+                        None,
+                        None,
+                    ),
+                };
+                Self::branch_start_refusal(
+                    message,
+                    api::BranchStartRefusalOutput {
+                        reason,
+                        graph_commit_id,
+                        type_name,
+                        branch,
+                    },
+                )
+            }
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -1583,7 +1690,9 @@ impl ApiError {
             // Engine-layer policy enforcement (MR-722). Authentication
             // middleware has already distinguished a missing/invalid bearer
             // (401); policy denials and evaluation failures surface as 403.
-            // Most handlers also perform an HTTP-layer policy check.
+            // Most handlers also perform an HTTP-layer policy check. Clients
+            // read this 403 as proof the write never started, so `enforce`
+            // must precede every durable effect (docs/dev/writes.md).
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -1602,8 +1711,15 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        // The engine's evidence is the authority: a definite failure, before
+        // any effect or after detached effects no manifest names, keeps the
+        // process serving whatever status it maps to. Without evidence the
+        // status-class default above stands, which fails closed for a 500.
         match evidence {
-            Some(omnigraph::error::CompletionEvidence::BeforeEffect) => {
+            Some(
+                omnigraph::error::CompletionEvidence::BeforeEffect
+                | omnigraph::error::CompletionEvidence::Unpublished,
+            ) => {
                 response.completion_uncertain = false;
             }
             Some(omnigraph::error::CompletionEvidence::Uncertain) => {
@@ -1718,8 +1834,14 @@ impl ApiError {
                 ApiErrorDetails::ChangeDiffRefusal(value) => {
                     output.change_diff_refusal = Some(value)
                 }
+                ApiErrorDetails::BranchStartRefusal(value) => {
+                    output.branch_start_refusal = Some(value)
+                }
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
+                }
+                ApiErrorDetails::FullTextIndexRequired(value) => {
+                    output.full_text_index_required = Some(value)
                 }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
             }
@@ -1776,6 +1898,28 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
+        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
+            index: "Doc.title".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Conflict));
+        assert!(error.error.contains("has no segment"), "{}", error.error);
+        assert!(
+            error.error.contains("rebuild-full-text-indexes"),
+            "{}",
+            error.error
+        );
+        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
+        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]
@@ -1867,6 +2011,78 @@ mod api_error_tests {
         let gap = error.change_feed_gap.expect("structured feed gap");
         assert_eq!(gap.cursor.as_deref(), Some("opaque-cursor"));
         assert_eq!(gap.first_unreadable_commit_id, "01JTESTGAP");
+    }
+
+    #[tokio::test]
+    async fn branch_start_refusal_is_typed_409_or_410() {
+        for (reason, status, code, wire, type_name) in [
+            (
+                BranchStartRefusal::NotRetained {
+                    table_key: "node:Person".to_string(),
+                    published_dataset_version: 7,
+                },
+                StatusCode::GONE,
+                None,
+                api::BranchStartRefusalReason::NotRetained,
+                Some("Person".to_string()),
+            ),
+            (
+                BranchStartRefusal::SchemaChanged,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::SchemaChanged,
+                None,
+            ),
+            (
+                BranchStartRefusal::EarlierStorageFormat,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::EarlierStorageFormat,
+                None,
+            ),
+            (
+                BranchStartRefusal::BranchDeleted {
+                    branch: "gone".to_string(),
+                },
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::BranchDeleted,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnpublishedCommit,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::UnpublishedCommit,
+                None,
+            ),
+            (
+                BranchStartRefusal::UnattachedSnapshot,
+                StatusCode::CONFLICT,
+                Some(ErrorCode::Conflict),
+                api::BranchStartRefusalReason::UnattachedSnapshot,
+                None,
+            ),
+        ] {
+            let error = OmniError::branch_start_refused("01JTESTROOT", reason).before_effect();
+            let message = error.to_string();
+            let response = ApiError::from_omni(error).into_response();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.error, message);
+            let refusal = error.branch_start_refusal.expect("structured refusal");
+            assert_eq!(refusal.reason, wire);
+            assert_eq!(refusal.graph_commit_id, "01JTESTROOT");
+            assert_eq!(refusal.type_name, type_name);
+            assert_eq!(
+                refusal.branch.as_deref(),
+                (wire == api::BranchStartRefusalReason::BranchDeleted).then_some("gone")
+            );
+        }
     }
 
     #[tokio::test]
@@ -2305,6 +2521,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
+            io_scope: None,
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
@@ -2654,6 +2871,7 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        .route("/access", get(server_access))
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
         // handler and could begin payload work before stripping the body; the
         // dedicated handler makes the zero-payload-read contract structural.
@@ -2687,10 +2905,13 @@ pub fn build_app(state: AppState) -> Router {
             "/branches",
             get(server_branch_list).post(server_branch_create),
         )
-        .route("/branches/{branch}", delete(server_branch_delete))
-        .route("/branches/merge", post(server_branch_merge))
-        .route("/branches/diff", get(server_branch_diff))
-        .route("/branches/merge-base", get(server_merge_base))
+        // One route owns `/branches/{name}`: the branch actions `merge`,
+        // `diff` and `merge-base` share its shape, so it dispatches them by
+        // name and method, and DELETE of any name deletes that branch.
+        .route(
+            "/branches/{branch}",
+            axum::routing::delete(server_branch_delete).fallback(server_branch_action),
+        )
         .route("/commits", get(server_commit_list))
         .route(
             "/commits/{commit_id}",
@@ -2746,9 +2967,27 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
+    let catalogue = Router::new()
+        .route("/query", post(handlers::catalogue::catalogue_query))
+        .route("/schema", get(handlers::catalogue::catalogue_schema))
+        .route("/{*rest}", any(handlers::catalogue::catalogue_refused))
+        .route("/", any(handlers::catalogue::catalogue_refused))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            |State(state): State<AppState>, request: Request, next: Next| async move {
+                ingress::admit(&state, request, next).await
+            },
+        ))
+        .route_layer(middleware::from_fn(http_contract::require_contract))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
     // RFC-011 cluster-only: per-graph routes always nest under
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
+        .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
         .nest("/graphs/{graph_id}", per_graph_protected)
         .merge(management)
         .merge(deployments);
@@ -2779,8 +3018,8 @@ pub async fn serve_with_mcp_settings(config: ServerConfig, mcp: McpSettings) -> 
     serve_config(config, None, None, mcp).await
 }
 
-/// Serve settings whose offline data-token trust was validated against their
-/// applied snapshot's canonical root before any graph engine open.
+/// Serve root-bound settings whose enabled identity trust was validated against
+/// the applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
     serve_config(config.config, config.trust, config.oidc_trust, config.mcp).await
 }
@@ -2831,8 +3070,13 @@ async fn serve_config(
         ServerConfigMode::Multi {
             graphs,
             server_policy,
+            catalogue_policy,
             ..
-        } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
+        } => {
+            server_policy.is_some()
+                || catalogue_policy.is_some()
+                || graphs.iter().any(|g| g.policy.is_some())
+        }
     };
     let runtime_state = classify_server_runtime_state(
         !tokens.is_empty() || data_token_trust.is_some() || oidc_identity_trust.is_some(),
@@ -2861,6 +3105,7 @@ async fn serve_config(
             graphs,
             config_path,
             server_policy,
+            catalogue_policy,
         } => {
             info!(
                 bind = %bind,
@@ -2869,14 +3114,16 @@ async fn serve_config(
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            prepare_multi_graph_state(
+            let (state, prepared) = prepare_multi_graph_state(
                 graphs,
                 tokens,
                 server_policy.as_ref(),
                 config_path,
                 config.cluster_admission,
             )
-            .await?
+            .await?;
+            state.set_catalogue_policy(load_catalogue_policy(catalogue_policy.as_ref())?);
+            (state, prepared)
         }
     };
 
@@ -2953,11 +3200,30 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        warn!(
-            root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
-            lock_id = %owner.lock_id(),
-            "v2 cluster admission retained after shutdown; establish prior graph/control I/O quiescence before exact-ID force-unlock"
-        );
+        if owner.canonical_root().starts_with("az://") {
+            // Azure keeps its existing stopped-process boundary until its
+            // native clean-release path has independent qualification.
+            warn!("Azure cluster admission retained after logical shutdown");
+            return Ok(());
+        }
+        let scope = owner.io_scope().ok_or_else(|| {
+            eyre!("cluster storage lifetime is untracked; retaining its admission")
+        })?;
+        scope.close();
+        scope.wait_idle().await;
+        if scope.is_uncertain() {
+            return Err(eyre!(
+                "storage completion uncertain; retaining cluster admission"
+            ));
+        }
+        // Axum's connection completion notification can precede destruction
+        // of its Hyper service and AppState. Drain those actual owners too;
+        // the original process watchdog still bounds this wait.
+        owner.wait_for_exclusive_owner().await;
+        owner
+            .release_after_settlement()
+            .await
+            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
 }
@@ -2968,6 +3234,14 @@ fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngi
         PolicySource::File(path) => Ok(PolicyEngine::load_graph(path, graph_id)?),
         PolicySource::Inline(text) => Ok(PolicyEngine::load_graph_from_source(text, graph_id)?),
     }
+}
+
+/// The engine catalogue scope's policy, compiled against the resource
+/// `Graph::"og_catalog"` like any graph binding.
+pub(crate) fn load_catalogue_policy(source: Option<&PolicySource>) -> Result<Option<PolicyEngine>> {
+    source
+        .map(|source| load_graph_policy(source, omnigraph_compiler::CATALOGUE_SCOPE))
+        .transpose()
 }
 
 /// Parallel open of every graph in the startup config, with bounded
@@ -3140,7 +3414,10 @@ async fn prepare_multi_graph_state(
         );
         let uri = cfg.uri.clone();
         match prepare_single_graph(cfg, expected) {
-            Ok(graph) => {
+            Ok(mut graph) => {
+                graph.io_scope = admission
+                    .as_ref()
+                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -3279,6 +3556,7 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    io_scope: Option<omnigraph::storage::StorageIoScope>,
 }
 
 #[cfg(test)]
@@ -3357,6 +3635,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
+        io_scope: None,
     })
 }
 
@@ -3367,6 +3646,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
+        io_scope,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3376,7 +3656,11 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let db = Omnigraph::open(&uri).await.map_err(|err| {
+    let opened = match io_scope {
+        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
+        None => Omnigraph::open(&uri).await,
+    };
+    let db = opened.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
             eyre!(

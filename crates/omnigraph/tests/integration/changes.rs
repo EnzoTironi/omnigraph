@@ -4535,16 +4535,66 @@ async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
         OmniError::AmbiguousReadTarget { target } => assert_eq!(target, genesis),
         other => panic!("expected AmbiguousReadTarget, got {other:?}"),
     }
-    assert!(matches!(
-        db.diff_read_target_branch(&genesis).await.unwrap_err(),
-        OmniError::AmbiguousReadTarget { .. }
-    ));
 
-    match graph_diff_all(&db, between("main", "no-such-side"), None)
+    // A spelling no commit id has skips the commit lookup: an unknown name,
+    // and a malformed `hb1` address, are the same typed not-found.
+    for side in ["no-such-side", "hb1.not.a.commit"] {
+        match graph_diff_all(&db, between("main", side), None)
+            .await
+            .unwrap_err()
+        {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, side),
+            other => panic!("expected ReadTargetNotFound for {side}, got {other:?}"),
+        }
+    }
+
+    // A caller that may read only some branches is asked, side by side, for
+    // the branch each side reads (a branch itself, or a commit's authored
+    // branch) as soon as the side is classified. A refused side is the
+    // not-found of a side that names nothing, and the next side is never
+    // looked at, so an unknown `to` cannot reveal that `from` exists.
+    db.branch_create("feature").await.unwrap();
+    let on_feature = write_on(&db, "feature", "insert_person", &person("Fay", 30)).await;
+    for from in ["feature", on_feature.graph_commit_id.as_str()] {
+        let mut asked = Vec::new();
+        let refused = db
+            .diff_page_readable(
+                &diff_request(between(from, "no-such-side"), None),
+                &mut |branch: &str| {
+                    asked.push(branch.to_string());
+                    branch == "main"
+                },
+            )
+            .await
+            .unwrap_err();
+        match refused {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, from),
+            other => panic!("expected ReadTargetNotFound for {from}, got {other:?}"),
+        }
+        assert_eq!(asked, ["feature"], "a refused side ends the resolution");
+    }
+    let mut asked = Vec::new();
+    db.diff_page_readable(
+        &diff_request(between("main", &on_feature.graph_commit_id), None),
+        &mut |branch: &str| {
+            asked.push(branch.to_string());
+            true
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked, ["main", "feature"]);
+
+    // A commit whose branch was deleted is no longer readable: it is that
+    // side's not-found, never the branch its record names.
+    db.branch_create("gone").await.unwrap();
+    let on_gone = write_on(&db, "gone", "insert_person", &person("Gil", 31)).await;
+    db.branch_delete("gone").await.unwrap();
+    match graph_diff_all(&db, between(&on_gone.graph_commit_id, "main"), None)
         .await
         .unwrap_err()
     {
-        OmniError::ReadTargetNotFound { target } => assert_eq!(target, "no-such-side"),
+        OmniError::ReadTargetNotFound { target } => assert_eq!(target, on_gone.graph_commit_id),
         other => panic!("expected ReadTargetNotFound, got {other:?}"),
     }
 }
@@ -4591,6 +4641,46 @@ async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
         db.diff_page(&other_sides).await.unwrap_err(),
         OmniError::ChangeCursorRejected { .. }
     ));
+    // A token is checksummed, not signed: one re-signed to name a commit its
+    // sides do not reach is refused on the embedded door too, where every
+    // branch is readable. The `from` side is spelled as a commit, which never
+    // moves.
+    let forged = resign_change_token(&token, |payload| {
+        payload["from_commit_id"] = serde_json::json!(first.to_commit_id);
+    });
+    let mut forged_request = diff_request(between(&start, "main"), Some(2));
+    forged_request.page_token = Some(forged);
+    match db.diff_page(&forged_request).await.unwrap_err() {
+        OmniError::ChangeCursorRejected { reason } => assert_eq!(
+            reason,
+            "diff page token names a commit its sides do not reach"
+        ),
+        other => panic!("expected ChangeCursorRejected, got {other:?}"),
+    }
+    // `main` moved, so its `to` is checked on the commit's own branch: one the
+    // caller may not read is refused, after `can_read` is asked for it.
+    db.branch_create("side").await.unwrap();
+    let on_side = write_on(&db, "side", "insert_person", &person("Sid", 4)).await;
+    let forged = resign_change_token(&token, |payload| {
+        payload["to_commit_id"] = serde_json::json!(on_side.graph_commit_id);
+    });
+    forged_request.page_token = Some(forged);
+    let mut asked = Vec::new();
+    match db
+        .diff_page_readable(&forged_request, &mut |branch: &str| {
+            asked.push(branch.to_string());
+            branch != "side"
+        })
+        .await
+        .unwrap_err()
+    {
+        OmniError::ChangeCursorRejected { reason } => assert_eq!(
+            reason,
+            "diff page token names a commit its sides do not reach"
+        ),
+        other => panic!("expected ChangeCursorRejected, got {other:?}"),
+    }
+    assert_eq!(asked.last().map(String::as_str), Some("side"), "{asked:?}");
     let mut other_scope = diff_request(between(&start, "main"), Some(2));
     other_scope.page_token = Some(token.clone());
     other_scope.scope = ChangeFeedScope {

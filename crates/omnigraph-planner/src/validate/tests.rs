@@ -21,7 +21,7 @@ use crate::source::{MemorySource, NodeTypeSpec};
 const SCHEMA: &str = r#"
 node Doc {
     slug: String @key
-    title: String
+    title: String @index
     year: I64
     open: Bool
     rank: I32?
@@ -70,11 +70,7 @@ impl Fixture {
             source = source.with_node_type(
                 name,
                 NodeTypeSpec {
-                    table: TableRef {
-                        type_key: format!("node:{name}"),
-                        dataset_path: format!("node/{name}"),
-                        native_branch: None,
-                    },
+                    table: TableRef::dataset(format!("node:{name}"), format!("node/{name}"), None),
                     version: Some(1),
                     columns: catalog.system_columns,
                     schema: Arc::clone(&node_type.arrow_schema),
@@ -103,7 +99,7 @@ impl Fixture {
     }
 
     fn traced(&self) -> crate::gate::Traced {
-        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS).expect("the query plans")
+        crate::gate::plan_traced(&self.ir, &self.source, &BOUNDS, false).expect("the query plans")
     }
 
     fn plan(&self) -> PhysicalPlan {
@@ -332,6 +328,73 @@ fn a_dropped_conjunct_fails_predicate_retention() {
     }
     let (check, detail) = fixture.refused(plan);
     assert_eq!(check, "predicate retention", "{detail}");
+}
+
+/// The strategy of every block of `plan` set to `strategy`.
+fn relabel_blocks(plan: &mut PhysicalPlan, strategy: crate::AntiJoinStrategy) {
+    for id in node_ids(plan, |node| matches!(node, PhysicalNode::AntiJoin { .. })) {
+        if let Some(PhysicalNode::AntiJoin {
+            strategy: declared, ..
+        }) = plan.node_mut(id)
+        {
+            *declared = strategy;
+        }
+    }
+}
+
+#[test]
+fn a_strategy_its_inner_tree_lacks_fails_block_strategy() {
+    use crate::AntiJoinStrategy::{Correlated, KeySet};
+    use crate::source::PlanSource;
+    use omnigraph_compiler::types::Direction;
+    let mut fixture = Fixture::new(
+        "query q($s: String) { match { $d: Doc not { $d cites $e $e: Doc { slug: $s } } } return { $d.slug } }",
+        &[("s", Literal::String("x".to_string()))],
+    );
+    let strategies = |plan: &PhysicalPlan| -> Vec<crate::AntiJoinStrategy> {
+        plan.live()
+            .filter_map(|(_, node)| match node {
+                PhysicalNode::AntiJoin { strategy, .. } => Some(*strategy),
+                _ => None,
+            })
+            .collect()
+    };
+    // No row counts: the block is correlated, its inner tree over the outer rows.
+    let correlated = fixture.plan();
+    assert_eq!(strategies(&correlated), [Correlated]);
+    fixture
+        .accept(correlated.clone())
+        .expect("the correlated plan is accepted");
+    let mut relabelled = correlated;
+    relabel_blocks(&mut relabelled, KeySet);
+    let (check, detail) = fixture.refused(relabelled);
+    assert_eq!(check, "block strategy", "{detail}");
+
+    // With row counts and edge statistics the bound `$e` makes the key set cheaper.
+    let mut doc = fixture.source.node_type("Doc").unwrap();
+    doc.row_count = Some(100);
+    let statistics = crate::ExpandStatistics {
+        edge_count: 1_000,
+        src_node_count: 100,
+        dst_node_count: 100,
+        max_frontier_cap: 1024,
+        max_hops_cap: 6,
+    };
+    fixture.source = fixture
+        .source
+        .clone()
+        .with_node_type("Doc", doc)
+        .with_expand_statistics("Cites", Direction::Out, statistics)
+        .with_expand_statistics("Cites", Direction::In, statistics);
+    let key_set = fixture.plan();
+    assert_eq!(strategies(&key_set), [KeySet]);
+    fixture
+        .accept(key_set.clone())
+        .expect("the key-set plan is accepted");
+    let mut relabelled = key_set;
+    relabel_blocks(&mut relabelled, Correlated);
+    let (check, detail) = fixture.refused(relabelled);
+    assert_eq!(check, "block strategy", "{detail}");
 }
 
 fn value_type(
@@ -1332,5 +1395,56 @@ fn a_distinct_return_sorts_its_groups() {
             .accept(fixture.plan())
             .unwrap_or_else(|error| panic!("{query}: {error:?}"));
         assert_eq!(accepted.scope(), ValidationScope::InvariantsOnly, "{query}");
+    }
+}
+
+/// A full-text call reads its property's index segment, which carries the
+/// analyzer: planning refuses an absent one with the typed conflict (for a
+/// search filter and for a bm25 order alike), and acceptance refuses a plan
+/// that records no coverage, or an absent one, for a call it makes.
+#[test]
+fn a_full_text_call_needs_a_recorded_index_segment() {
+    use crate::source::FullTextCoverage;
+    let search = r#"query q($q: String) {
+    match { $d: Doc search($d.title, $q) }
+    return { $d.slug }
+}"#;
+    for query in [search, RANKED] {
+        let mut fixture = Fixture::new(query, &[("q", Literal::String("graph".into()))]);
+        fixture.source = std::mem::take(&mut fixture.source).with_full_text_coverage(
+            "node:Doc",
+            "title",
+            FullTextCoverage::Absent,
+        );
+        match crate::gate::plan_traced(&fixture.ir, &fixture.source, &BOUNDS, false).err() {
+            Some(crate::gate::Unrouted::FullTextIndexRequired { index }) => {
+                assert_eq!(index, "Doc.title", "{query}")
+            }
+            other => panic!("{query}: an absent index plans: {other:?}"),
+        }
+    }
+
+    let fixture = Fixture::new(search, &[("q", Literal::String("graph".into()))]);
+    let plan = fixture.plan();
+    let key = crate::physical::Assumptions::full_text_key("node:Doc", "title");
+    assert_eq!(
+        plan.assumptions().full_text.get(&key),
+        Some(&FullTextCoverage::Partial),
+        "planning records the coverage a search filter reads"
+    );
+    fixture
+        .accept(plan.clone())
+        .expect("a recorded segment is accepted");
+    for recorded in [None, Some(FullTextCoverage::Absent)] {
+        let mut edited = plan.clone();
+        let mut assumptions = edited.assumptions().clone();
+        match recorded {
+            None => assumptions.full_text.remove(&key),
+            Some(coverage) => assumptions.full_text.insert(key.clone(), coverage),
+        };
+        edited.set_assumptions(assumptions);
+        let (check, detail) = fixture.refused(edited);
+        assert_eq!(check, "prerequisite", "{recorded:?}: {detail}");
+        assert!(detail.contains("Doc.title"), "{detail}");
     }
 }

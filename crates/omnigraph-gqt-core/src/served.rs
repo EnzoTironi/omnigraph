@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::show_statement_name;
+use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,6 +52,9 @@ impl std::fmt::Debug for ServerTarget {
 /// naming each so the author sees what keeps the case in-process only.
 pub fn admit_served(case: &Case) -> Result<(), String> {
     let mut refused = Vec::new();
+    if !case.csv_sections.is_empty() {
+        refused.push("`--- csv` fixtures (engine execution only)".to_string());
+    }
     if !case.seams.is_empty() {
         let ordinals = case
             .seams
@@ -84,18 +87,29 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
                     refused.push(format!("step {ordinal} (expect same as v1)"));
                 }
             }
-            Step::Control(control) if !control.prefix.is_empty() => {
-                refused.push(format!(
-                    "step {ordinal} ({} with a settings prefix)",
-                    control.name
-                ));
+            Step::Control(control) => {
+                if !control.prefix.is_empty() {
+                    refused.push(format!(
+                        "step {ordinal} ({} with a settings prefix)",
+                        control.name
+                    ));
+                }
+                if let ControlWrite::Load { stmt, .. } = &control.write
+                    && !stmt.source.contains("://")
+                {
+                    refused.push(format!(
+                        "step {ordinal} (load csv source without an absolute URI)"
+                    ));
+                }
+                if let ControlWrite::Load { plan: Some(_), .. } = &control.write {
+                    refused.push(format!("step {ordinal} (expect plan on a load)"));
+                }
             }
             Step::Show(show) if !show.prefix.is_empty() => {
                 refused.push(format!("step {ordinal} (show with a settings prefix)"));
             }
             Step::Mutate(_)
             | Step::Load(_)
-            | Step::Control(_)
             | Step::List(_)
             | Step::Show(_)
             | Step::BranchRead(_) => {}
@@ -700,12 +714,21 @@ fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String
     Ok(match write {
         ControlWrite::Create {
             name,
-            from: Some(parent),
+            from: Some(BranchCreateFrom::Branch(parent)),
             ..
         } => format!(
             "branch create {} from {}",
             branch_name(name),
             branch_name(parent)
+        ),
+        ControlWrite::Create {
+            name,
+            from: Some(BranchCreateFrom::Commit(commit)),
+            ..
+        } => format!(
+            "branch create {} from commit {}",
+            branch_name(name),
+            string_literal(&resolve_operand(commit, bindings)?)
         ),
         ControlWrite::Create { name, .. } => format!("branch create {}", branch_name(name)),
         ControlWrite::Delete { name, .. } => format!("branch delete {}", branch_name(name)),
@@ -736,6 +759,15 @@ fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String
             "commit drop {}",
             string_literal(&resolve_operand(graph_commit_id, bindings)?)
         ),
+        ControlWrite::Load { stmt, .. } => {
+            if !stmt.source.contains("://") {
+                return Err(format!(
+                    "`load csv \"{}\"` names a `--- csv` section, which only the engine environment materializes; a served load names an absolute URI the server may read",
+                    stmt.source
+                ));
+            }
+            stmt.render()
+        }
     })
 }
 
@@ -753,7 +785,10 @@ async fn control(
         query: control_statement(&step.write, bindings).map_err(&fail)?,
         name: None,
         params: None,
-        branch: None,
+        branch: match &step.write {
+            ControlWrite::Load { branch, .. } => branch.clone(),
+            _ => None,
+        },
         settings: None,
     };
     let outcome = operation(
@@ -797,6 +832,19 @@ async fn control(
                         output.outcome
                     )));
                 }
+            }
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| commit)
+                .map_err(fail)
+        }
+        ControlWrite::Load { expect, .. } => {
+            if let (WriteExpect::Ok, Ok(output)) = (expect, &outcome)
+                && (output.outcome.is_some() || output.commit.is_none())
+            {
+                return Err(fail(format!(
+                    "`{name}` answered as a branch statement, not as a load: {:?}",
+                    output.outcome
+                )));
             }
             check_write_expect(host, name, expect, outcome)
                 .map(|()| commit)

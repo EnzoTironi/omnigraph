@@ -93,7 +93,7 @@ fn blob_write_parity() -> Parity {
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both(&self.local, &self.server.base_url, args)
+        run_both(&self.local, &self.server, args)
     }
 }
 
@@ -251,6 +251,45 @@ fn parity_schema_show() {
     let p = parity();
     let (l, r) = p.run(&["schema", "show", "--json"]);
     assert_parity("schema show", &l, &r);
+
+    let expected = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let (local, served) = p.run(&["schema", "show"]);
+    for (arm, output) in [("direct", local), ("served", served)] {
+        assert!(output.status.success(), "{arm}: {output:?}");
+        let source = stdout_string(&output);
+        assert_eq!(source.trim_end(), expected.trim_end(), "{arm}");
+        omnigraph_compiler::schema::parser::parse_schema(&source)
+            .unwrap_or_else(|err| panic!("{arm} schema output must re-parse: {err}"));
+    }
+
+    let home = p._temp.path().join("operator");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "servers:\n  local:\n    url: '{}'\nprofiles:\n  catalogue:\n    server: local\n    default_graph: og_catalog\n",
+            p.server.base_url
+        ),
+    )
+    .unwrap();
+    for addressing in [
+        vec!["--store", "og_catalog"],
+        vec!["--server", &p.server.base_url, "--graph", "og_catalog"],
+        vec!["--profile", "catalogue"],
+    ] {
+        let output = output_success(
+            cli()
+                .env("OMNIGRAPH_HOME", &home)
+                .env("OMNIGRAPH_TOKEN_LOCAL", "parity-tok")
+                .args(&addressing)
+                .args(["schema", "show"]),
+        );
+        let source = stdout_string(&output);
+        assert!(
+            source.contains(&omnigraph_compiler::catalogue_declarations()),
+            "{addressing:?}: {source}"
+        );
+    }
 }
 
 #[test]
@@ -281,6 +320,77 @@ fn parity_commit_list_branch() {
     let p = parity();
     let (l, r) = p.run(&["commit", "list", "--branch", "main", "--json"]);
     assert_parity("commit list --branch", &l, &r);
+}
+
+#[test]
+fn parity_branch_create_at_a_commit() {
+    // The twins share their history, so one commit id names the same commit
+    // on both arms: the embedded arm starts the branch in the engine, the
+    // remote arm through `from_commit` on `POST /branches`.
+    let p = parity();
+    let (listed, _) = p.run(&["commit", "list", "--branch", "main", "--json"]);
+    let head = parse_stdout_json(&listed)["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        &head,
+        "at-head",
+        "--json",
+    ]);
+    assert_parity("branch create at a commit", &l, &r);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["from"], "main", "{arm}");
+        assert_eq!(payload["from_commit_id"], head, "{arm}");
+    }
+    let (l, r) = p.run(&[
+        "branch",
+        "create",
+        "--from-commit",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "nowhere",
+        "--json",
+    ]);
+    assert_parity("branch create at an unknown commit", &l, &r);
+    assert!(!l.status.success(), "{l:?}");
+}
+
+#[test]
+fn parity_commit_list_pages() {
+    // The remote arm sends `?limit=&page_token=` while the embedded arm calls
+    // the engine's paged listing; the twins mint the same token.
+    let p = parity();
+    let (l, r) = p.run(&["commit", "list", "--limit", "1", "--json"]);
+    assert_parity("commit list --limit", &l, &r);
+    let first = parse_stdout_json(&l);
+    assert_eq!(first["commits"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(
+        first["head_commit_id"],
+        first["commits"][0]["graph_commit_id"]
+    );
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("the fixture has more than one commit")
+        .to_string();
+    let (l, r) = p.run(&["commit", "list", "--page-token", &token, "--json"]);
+    assert_parity("commit list --page-token", &l, &r);
+    let (whole, _) = p.run(&["commit", "list", "--json"]);
+    let mut paged = first["commits"].as_array().unwrap().clone();
+    paged.extend(
+        parse_stdout_json(&l)["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    assert_eq!(
+        serde_json::Value::Array(paged),
+        parse_stdout_json(&whole)["commits"]
+    );
 }
 
 #[test]
@@ -342,7 +452,7 @@ fn parity_mutate() {
                     .arg(PARITY_ACTOR);
             } else {
                 command
-                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .envs(p.server.credential(PARITY_TOKEN))
                     .arg("--server")
                     .arg(&p.server.base_url)
                     .arg("--graph")
@@ -403,7 +513,33 @@ fn parity_branch_merge() {
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
-    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    // A name is used as written on both arms: a padded spelling of a branch
+    // is refused, never read as the branch, before any effect.
+    for args in [
+        &["branch", "merge", " feature ", "--into", " main ", "--json"][..],
+        &["branch", "merge", "feature", "--into", "main ", "--json"][..],
+        &[
+            "mutate",
+            "--branch",
+            " main",
+            "-e",
+            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "--json",
+        ][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert_parity("padded branch name", &l, &r);
+        for output in [&l, &r] {
+            // `--json` reports the error on stdout.
+            assert!(
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("has leading or trailing whitespace"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_write_parity("branch merge own publication", &l, &r);
     for output in [&l, &r] {
         let payload = parse_stdout_json(output);
@@ -426,9 +562,9 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        " feature2 ",
+        "feature2",
         "--into",
-        " main ",
+        "main",
         "--delete-branch",
         "--json",
     ]);
@@ -490,9 +626,10 @@ fn parity_branch_merge() {
         let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
         for output in [&l, &r] {
             assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("branch merge source and target must not be empty"),
+                stderr.contains("has leading or trailing whitespace")
+                    || stderr.contains("contains a control character"),
                 "{output:?}"
             );
         }

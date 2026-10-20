@@ -29,13 +29,16 @@ with its first parent. Each response includes:
   [Blobs](../blobs.md)).
 
 Filter with repeatable `--kind node|edge`, `--type <name>`, and
-`--op insert|update|delete` options. `--limit` defaults to 1,000 and may be
-at most 8,192. Results are deterministic by entity kind, type identity, logical
-id, and operation.
+`--op insert|update|delete` options. A page holds at most 8,192 changes; the
+HTTP routes default to 1,000. Results are deterministic by entity kind, type
+identity, logical id, and operation.
 
 Large results are paginated. The CLI normally follows every
-`next_page_token`; passing `--page-token` fetches exactly one page. A page
-token continues that one commit result and is not a change-feed cursor.
+`next_page_token` and asks for 8,192 changes per page, because every page
+restarts its comparison and fewer, larger pages cost less; passing
+`--page-token` fetches exactly one page, of 1,000 changes unless `--limit`
+sets the size. A page token continues that one commit result and is not a
+change-feed cursor.
 
 A parentless commit returns `409` with reason `parentless_commit`. A diff
 that crosses a schema boundary returns `409` with reason
@@ -69,7 +72,13 @@ branches diverged, reversed. To review a branch, use the branch form below.
 
 The kind, type and operation filters, `--limit` and `--page-token` work as for
 `commit changes`. A page token keeps the commits the first page resolved, so
-later pages answer for them even after the branches move. A diff across a
+later pages answer for them even after the branches move. Each continuation is
+checked against the request's sides, on the server and in the embedded CLI
+alike. A side spelled as a commit id reaches only that commit. A branch side
+reaches its head now, any of its earlier heads within its last 1,024 commits,
+and any commit the caller may read as a side of its own. A token naming any
+other commit is refused with `400`; start the diff again without it. A diff
+across a
 schema change returns `409` with reason `schema_boundary`, and a side whose
 history was reclaimed returns `410` with `change_feed_gap`.
 
@@ -190,11 +199,18 @@ Baseline kind and type filters select the snapshot contents. An operation
 filter applies only to the resumed feed. Baselines require the `export`
 policy action; commit changes, diffs and feed polling require `read`. A diff
 needs `read` on the branch each side resolves to; a side the actor cannot read
-answers `404` exactly as a side that names nothing. `branch diff` and
-`branch merge-base` need `read` on both branches, every page included, and
-answer `403` otherwise.
+answers `404` exactly as a side that names nothing, whatever the other side
+names. A commit whose branch was deleted answers the same `404`.
+`branch diff` and `branch merge-base` need `read` on both branches, every
+page included, and answer `403` otherwise. On a later page, a commit the
+token names that its side no longer resolves to needs `read` on the branch
+that wrote it, unless it was an earlier head of the side's branch, such as a
+fork's first head that `main` wrote. An unknown or unreadable one answers the
+same `400`.
 
 The CLI's durable `--out` installation is available on POSIX platforms. The
 file contains only snapshot entity records, not the terminal handshake. The CLI
 syncs and atomically replaces it before printing
-`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout.
+`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout. Concurrent
+captures to the same path stay serialized until the cursor output is flushed.
+A cursor-output failure returns an error; the installed snapshot remains in place.

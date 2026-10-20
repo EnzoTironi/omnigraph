@@ -16,9 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
-    FileBody, Literal, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
-    show_statement_name,
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
+    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
+    UnattachedBase, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -54,9 +54,11 @@ use omnigraph::storage::StorageAdapter;
 pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
 pub use served::{ServerTarget, admit_served, execute_steps_served};
 
+mod load_plan;
 mod plan;
 mod report;
 mod shape;
+use load_plan::{LoadPlanExpect, load_plan_mismatch, parse_load_plan_body};
 use plan::{PlanExpect, parse_plan_body, plan_mismatch, validate_plan_columns};
 
 use shape::{
@@ -76,6 +78,13 @@ pub struct Case {
     traversal: Option<&'static str>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
+    /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
+    /// reads, by name, until the runner materializes them beside the store.
+    pub csv_sections: BTreeMap<String, String>,
+    /// The external Blob policy the runner installs on every handle of the
+    /// case, set by [`Case::materialize_csv_fixtures`]: one embedded-only
+    /// `file://` base over the materialized sections.
+    pub external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
 }
 
 #[derive(Debug)]
@@ -280,7 +289,7 @@ pub struct ControlStep {
 pub enum ControlWrite {
     Create {
         name: String,
-        from: Option<String>,
+        from: Option<BranchCreateFrom>,
         expect: WriteExpect,
     },
     Delete {
@@ -304,13 +313,28 @@ pub enum ControlWrite {
         graph_commit_id: String,
         expect: WriteExpect,
     },
+    /// `load csv "<source>" into <type> …` onto the step's `branch:`
+    /// (`main` when unspelled). A source naming a `--- csv` section is
+    /// rewritten to its materialized `file://` URI before the run.
+    Load {
+        stmt: LoadStmt,
+        branch: Option<String>,
+        expect: WriteExpect,
+        /// `--- expect plan` after the step's `--- expect ok`: facts of the
+        /// accepted plan and the executed report the receipt carries.
+        plan: Option<LoadPlanExpect>,
+    },
 }
 
-/// The parsed statement behind a control step: a branch write or a commit
-/// write, both completed by the same `--- expect` forms.
+/// The parsed statement behind a control step: a branch write, a commit
+/// write or a load statement, all completed by the same `--- expect` forms.
 enum ControlSource {
     Branch(BranchWrite),
     Commit(CommitWrite),
+    Load {
+        stmt: LoadStmt,
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -811,8 +835,14 @@ fn bind_commit(step: &mut Step, name: &str) -> Result<(), String> {
             | ControlWrite::Publish {
                 expect: WriteExpect::Error { .. },
                 ..
+            }
+            | ControlWrite::Load {
+                expect: WriteExpect::Error { .. },
+                ..
             } => return Err(FAILING.into()),
-            ControlWrite::Merge { .. } | ControlWrite::Publish { .. } => &mut step.bind,
+            ControlWrite::Merge { .. }
+            | ControlWrite::Publish { .. }
+            | ControlWrite::Load { .. } => &mut step.bind,
             ControlWrite::Create { .. }
             | ControlWrite::Delete { .. }
             | ControlWrite::Drop { .. } => {
@@ -1681,8 +1711,15 @@ fn complete_control_step(
     let name = match &write {
         ControlSource::Branch(write) => write.statement_name(),
         ControlSource::Commit(write) => write.statement_name(),
+        ControlSource::Load { stmt, .. } => stmt.statement_name(),
     };
     let write = match write {
+        ControlSource::Load { stmt, branch } => ControlWrite::Load {
+            stmt,
+            branch,
+            expect: complete_write_expect(name, mode, section)?,
+            plan: None,
+        },
         ControlSource::Branch(BranchWrite::Create { name: branch, from }) => ControlWrite::Create {
             name: branch,
             from,
@@ -1914,9 +1951,11 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
     let mut awaiting_same_as_v1: Option<Step> = None;
+    let mut awaiting_load_plan = false;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
+    let mut csv_sections: BTreeMap<String, String> = BTreeMap::new();
     let mut awaiting_seam_step = false;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
     let mut bound_names: HashSet<String> = HashSet::new();
@@ -1971,6 +2010,9 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         if !expect_word.starts_with("shape") {
             settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
         }
+        if expect_word != "plan" {
+            awaiting_load_plan = false;
+        }
         if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
             push_step(&mut items, &mut open_loop, step);
         }
@@ -2021,6 +2063,36 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     "line {}: `--- {kind}` is out of position; schema then seed lead the file, once each",
                     section.header_line + 1
                 ));
+            }
+            "csv" => {
+                if pending.is_some() {
+                    return Err("the previous step is missing its `--- expect`".into());
+                }
+                let name = rest.trim();
+                if name.is_empty()
+                    || name.contains(['/', '\\'])
+                    || name.contains("..")
+                    || name.chars().any(char::is_whitespace)
+                {
+                    return Err(format!(
+                        "line {}: `--- csv <name>` names one file, a bare name without separators",
+                        section.header_line + 1
+                    ));
+                }
+                let mut text = section
+                    .body
+                    .iter()
+                    .map(|(_, l)| *l)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                text.push('\n');
+                if csv_sections.insert(name.to_string(), text).is_some() {
+                    return Err(format!(
+                        "line {}: `--- csv {name}` is given twice",
+                        section.header_line + 1
+                    ));
+                }
+                continue;
             }
             "load" => {
                 if pending.is_some() {
@@ -2166,11 +2238,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                     source: source.clone(),
                                 }
                             }
-                            BranchStmt::Write(write) => Pending::Control {
-                                ordinal,
-                                prefix: file.settings,
-                                write: ControlSource::Branch(write),
-                            },
+                            BranchStmt::Write(write) => {
+                                if let BranchWrite::Create {
+                                    from: Some(BranchCreateFrom::Commit(commit)),
+                                    ..
+                                } = &write
+                                    && let Some(name) = bound_operand(commit)
+                                {
+                                    if !bound_names.contains(name) {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                    if source.matches("${").count() == 1 {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                }
+                                Pending::Control {
+                                    ordinal,
+                                    prefix: file.settings,
+                                    write: ControlSource::Branch(write),
+                                }
+                            }
                         });
                         continue;
                     }
@@ -2203,7 +2293,22 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         });
                         continue;
                     }
-                    FileBody::Explain(_) => {
+                    FileBody::Load(stmt) => {
+                        if kind == "query" {
+                            return Err(
+                                "a load statement under `--- query` is refused; use `--- mutate`"
+                                    .into(),
+                            );
+                        }
+                        ordinal += 1;
+                        pending = Some(Pending::Control {
+                            ordinal,
+                            prefix: file.settings,
+                            write: ControlSource::Load { stmt, branch },
+                        });
+                        continue;
+                    }
+                    FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
                         return Err(format!(
                             "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
                         ));
@@ -2467,10 +2572,34 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 }
                 if rest.trim() == "plan" {
                     let Some(mut step) = awaiting_plan.take() else {
-                        return Err(format!(
-                            "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`",
-                            section.header_line + 1
-                        ));
+                        if !awaiting_load_plan {
+                            return Err(format!(
+                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape` or a `load csv` step's `--- expect ok`",
+                                section.header_line + 1
+                            ));
+                        }
+                        awaiting_load_plan = false;
+                        let lines = parse_load_plan_body(&section.body)
+                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                        let last = match open_loop.as_mut() {
+                            Some((_, _, steps)) => steps.last_mut(),
+                            None => match items.last_mut() {
+                                Some(Item::Step(step)) => Some(step),
+                                _ => None,
+                            },
+                        };
+                        let Some(Step::Control(ControlStep {
+                            write: ControlWrite::Load { plan, .. },
+                            ..
+                        })) = last
+                        else {
+                            return Err(format!(
+                                "line {}: internal: the step awaiting a load plan is not a `load csv` step",
+                                section.header_line + 1
+                            ));
+                        };
+                        *plan = Some(LoadPlanExpect { lines });
+                        continue;
                     };
                     let lines = parse_plan_body(&section.body)
                         .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
@@ -2570,6 +2699,16 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                 };
+                awaiting_load_plan = matches!(
+                    &completed,
+                    Step::Control(ControlStep {
+                        write: ControlWrite::Load {
+                            expect: WriteExpect::Ok,
+                            ..
+                        },
+                        ..
+                    })
+                );
                 if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                     substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                     awaiting_shape = Some(completed);
@@ -2687,8 +2826,83 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         traversal: header.traversal,
         items,
         needs_indices,
+        csv_sections,
+        external_blob_policy: None,
     };
     Ok(case)
+}
+
+impl Case {
+    /// Write every `--- csv <name>` section into `dir`, point each `load csv`
+    /// step whose source names a section at the written file's `file://` URI,
+    /// and record the one embedded-only base over `dir` the runner installs
+    /// on the case's handles. A source that names no section is an absolute
+    /// URI and is left as written; a bare name without a section is refused.
+    pub fn materialize_csv_fixtures(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let steps = self.items.iter().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_ref(step).iter(),
+            Item::Loop { steps, .. } => steps.iter(),
+        });
+        for step in steps {
+            if let Step::Control(ControlStep {
+                write: ControlWrite::Load { stmt, .. },
+                ..
+            }) = step
+                && !stmt.source.contains("://")
+                && !self.csv_sections.contains_key(&stmt.source)
+            {
+                return Err(format!(
+                    "step {}: `load csv \"{}\"` names no `--- csv {}` section and is not a URI",
+                    step.ordinal(),
+                    stmt.source,
+                    stmt.source
+                ));
+            }
+        }
+        if self.csv_sections.is_empty() {
+            return Ok(());
+        }
+        let dir = dir
+            .canonicalize()
+            .map_err(|error| format!("csv fixture directory: {error}"))?;
+        for (name, text) in &self.csv_sections {
+            std::fs::write(dir.join(name), text)
+                .map_err(|error| format!("csv fixture `{name}`: {error}"))?;
+        }
+        let dir_text = dir
+            .to_str()
+            .ok_or_else(|| "csv fixture directory is not UTF-8".to_string())?
+            .trim_end_matches('/')
+            .to_string();
+        let base_url = format!("file://{dir_text}/");
+        let steps = self.items.iter_mut().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_mut(step).iter_mut(),
+            Item::Loop { steps, .. } => steps.iter_mut(),
+        });
+        for step in steps {
+            let Step::Control(ControlStep {
+                write: ControlWrite::Load { stmt, .. },
+                ..
+            }) = step
+            else {
+                continue;
+            };
+            if stmt.source.contains("://") {
+                continue;
+            }
+            stmt.source = format!("{base_url}{}", stmt.source);
+        }
+        let base = omnigraph::ExternalBlobBase::new(
+            &base_url,
+            omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .map_err(|error| format!("csv fixture base: {error}"))?;
+        self.external_blob_policy = Some(
+            omnigraph::ExternalBlobPolicy::allow(vec![base])
+                .map_err(|error| format!("csv fixture policy: {error}"))?,
+        );
+        Ok(())
+    }
 }
 
 fn normalize_number(n: &serde_json::Number) -> String {
@@ -3054,14 +3268,16 @@ fn check_restored_plan(bound: &BoundPlan, restored: &BoundPlan) -> Result<(), St
                 PhysicalNode::AntiJoin {
                     predicate,
                     aggregate,
+                    strategy,
                     ..
                 },
                 Some(PhysicalNode::AntiJoin {
                     predicate: back,
                     aggregate: back_spec,
+                    strategy: back_strategy,
                     ..
                 }),
-            ) => predicate == back && aggregate == back_spec,
+            ) => predicate == back && aggregate == back_spec && strategy == back_strategy,
             (
                 PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
@@ -3695,11 +3911,17 @@ async fn run_control_step(
             from,
             expect,
         } => {
-            let parent = from.as_deref().unwrap_or(MAIN_BRANCH);
+            let start = match from {
+                Some(BranchCreateFrom::Commit(commit)) => ReadTarget::snapshot(SnapshotId::new(
+                    resolve_operand(commit, bindings).map_err(&fail)?,
+                )),
+                Some(BranchCreateFrom::Branch(parent)) => ReadTarget::branch(parent.as_str()),
+                None => ReadTarget::branch(MAIN_BRANCH),
+            };
             let outcome = operation(
                 host,
                 step.ordinal,
-                db.branch_create_from_as(ReadTarget::branch(parent), branch, None),
+                db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;
@@ -3749,6 +3971,58 @@ async fn run_control_step(
             check_write_expect(host, name, expect, outcome)
                 .map(|()| None)
                 .map_err(fail)
+        }
+        ControlWrite::Load {
+            stmt,
+            branch,
+            expect,
+            plan,
+        } => {
+            let target = branch.as_deref().unwrap_or(MAIN_BRANCH);
+            let request = omnigraph::loader::CsvLoadRequest::from_statement(stmt);
+            let outcome = operation(
+                host,
+                step.ordinal,
+                db.load_csv_as_with_receipt(target, &request, None),
+            )
+            .await
+            .map_err(&fail)?
+            .inspect_err(|error| host.observe_fault(error));
+            host.observe(|| {
+                format!(
+                    "actual control: {:?}",
+                    outcome.as_ref().map(|receipt| &receipt.result)
+                )
+            });
+            let commit = outcome
+                .as_ref()
+                .ok()
+                .map(|receipt| receipt.commit.graph_commit_id.clone());
+            let executed = outcome.as_ref().ok().map(|receipt| {
+                (
+                    receipt.plan.as_ref().map(|explain| explain.to_value()),
+                    receipt.executed,
+                )
+            });
+            check_write_expect(host, name, expect, outcome).map_err(&fail)?;
+            if let Some(expect) = plan {
+                let Some((Some(accepted), executed)) = executed else {
+                    return Err(fail(
+                        "`--- expect plan` on a load whose receipt carries no plan".to_string(),
+                    ));
+                };
+                host.observe(|| {
+                    let facts: Vec<String> = load_plan::plan_facts(&accepted, &executed)
+                        .iter()
+                        .map(load_plan::LoadFact::spell)
+                        .collect();
+                    format!("actual load plan: {facts:?}")
+                });
+                if let Some(message) = load_plan_mismatch(&expect.lines, &accepted, &executed) {
+                    return Err(fail(message));
+                }
+            }
+            Ok(commit)
         }
         ControlWrite::Merge {
             source,
@@ -4101,6 +4375,10 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         host.operation_started(*ordinal)?;
                         let reopened = host.reopen(uri, storage.clone()).await;
                         host.operation_finished(*ordinal)?;
+                        let reopened = reopened.and_then(|db| match &case.external_blob_policy {
+                            Some(policy) => db.with_external_blob_policy(policy.clone()),
+                            None => Ok(db),
+                        });
                         session = match reopened {
                             Ok(db) => detached.attach(Arc::new(db)),
                             Err(error) => {
@@ -4415,6 +4693,7 @@ impl Step {
                 ControlWrite::Merge { .. } => StepKind::BranchMerge,
                 ControlWrite::Publish { .. } => StepKind::CommitPublish,
                 ControlWrite::Drop { .. } => StepKind::CommitDrop,
+                ControlWrite::Load { .. } => StepKind::Load,
             },
             Self::List(_) => StepKind::BranchList,
             Self::Settings(_) => StepKind::Settings,

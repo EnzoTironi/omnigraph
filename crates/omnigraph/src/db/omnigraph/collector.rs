@@ -58,6 +58,12 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_FILE_DELETE = ("cleanup.sweep_pre_file_delete", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After the files only a table's dead stagings reference are deleted and
+    /// before the first of their manifests is.
+    pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
+}
+
 /// Requests the run made, for the two ceilings in `maintenance.rs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
@@ -319,6 +325,7 @@ pub(crate) async fn sweep_table(
     let dead = plan.dead_stagings();
     if !dead.is_empty() {
         stats.bytes_removed += delete_paths(&store, &base, &plan.dead_paths).await?;
+        fail(&CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE)?;
     }
     for version in dead {
         let manifest = naming.manifest_path(&base, version);
@@ -341,7 +348,10 @@ fn location_base(dataset: &lance::Dataset) -> object_store::path::Path {
 
 /// Delete the location-relative `paths` (never an inherited `base:` file),
 /// an `_indices/<uuid>` entry as a directory; returns the bytes freed,
-/// with a file an earlier pass already removed counting nothing.
+/// with a file an earlier pass already removed counting nothing. A pass
+/// that stops between these files and their manifest plans the manifest
+/// again, so an absent index directory is already deleted, not an error
+/// (the local store reports one as `NotFound`; object stores list it empty).
 async fn delete_paths(
     store: &lance::io::ObjectStore,
     base: &object_store::path::Path,
@@ -357,10 +367,10 @@ async fn delete_paths(
             .chain(object_store::path::Path::from(path.as_str()).parts())
             .collect();
         if path.starts_with("_indices/") {
-            store
-                .remove_dir_all(full)
-                .await
-                .map_err(OmniError::storage)?;
+            match store.remove_dir_all(full).await {
+                Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+                Err(error) => return Err(OmniError::storage(error)),
+            }
             continue;
         }
         bytes += delete_object(store, &full, None).await?;
@@ -421,6 +431,42 @@ impl CollectorPathSnapshot {
             }
         }
         Ok(missing.into_iter().collect())
+    }
+
+    /// The location of a captured object that no longer exists, or `None`
+    /// when every one does. Probes at most `concurrency` objects at once and
+    /// stops at the first missing one, so a complete inventory costs one
+    /// request per object and an incomplete one usually far fewer.
+    pub(crate) async fn first_missing_location(
+        &self,
+        concurrency: usize,
+    ) -> Result<Option<String>> {
+        use futures::StreamExt;
+        if let Some((location, _)) = self.missing_at_capture.first() {
+            return Ok(Some(location.clone()));
+        }
+        let mut probes = futures::stream::iter(self.objects.iter().cloned())
+            .map(|object| async move {
+                let present = object
+                    .store
+                    .exists(&object.path)
+                    .await
+                    .map_err(OmniError::storage)?;
+                Ok::<_, OmniError>((!present).then_some(object.location))
+            })
+            .buffer_unordered(concurrency.max(1));
+        while let Some(probed) = probes.next().await {
+            if let Some(location) = probed? {
+                return Ok(Some(location));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Move `other`'s captured objects into this inventory.
+    pub(crate) fn absorb(&mut self, other: CollectorPathSnapshot) {
+        self.objects.extend(other.objects);
+        self.missing_at_capture.extend(other.missing_at_capture);
     }
 
     fn insert(
@@ -513,7 +559,7 @@ async fn capture_index_paths(
     Ok(())
 }
 
-async fn capture_dataset_paths(
+pub(crate) async fn capture_dataset_paths(
     snapshot: &mut CollectorPathSnapshot,
     dataset: &lance::Dataset,
     location: &str,
@@ -2632,6 +2678,71 @@ mod overlay_retention_tests {
             .iter()
             .find(|plan| plan.location == table_uri)
             .unwrap();
+        if !cfg!(debug_assertions) {
+            // Native overlays are experimental in release builds. Qualify refusal
+            // and retention without enabling the process-wide upstream opt-in.
+            assert!(!lance_table::feature_flags::can_read_dataset(
+                lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            ));
+            assert_ne!(
+                overlay.manifest().reader_feature_flags
+                    & lance_table::feature_flags::FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                0
+            );
+            // forbidden-api-allow: test-only cold read verifies native release refusal
+            let error = lance::dataset::builder::DatasetBuilder::from_uri(&table_uri)
+                .with_session(Arc::new(lance::session::Session::default()))
+                .with_version(version)
+                .load()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, lance::Error::NotSupported { .. }),
+                "{error:?}"
+            );
+            assert!(
+                plan.errors
+                    .iter()
+                    .any(|error| error.contains("Not supported")),
+                "{:?}",
+                plan.errors
+            );
+            assert!(report.tables.iter().all(|plan| {
+                plan.sweep_paths.is_empty()
+                    && plan.dead_paths.is_empty()
+                    && plan.orphan_paths.is_empty()
+            }));
+            let mut expected = CollectorPathSnapshot::default();
+            capture_dataset_paths(&mut expected, &source, &table_uri)
+                .await
+                .unwrap();
+            capture_dataset_paths(&mut expected, &overlay, &table_uri)
+                .await
+                .unwrap();
+            assert!(
+                expected
+                    .objects
+                    .iter()
+                    .any(|object| object.path == overlay_path)
+            );
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            let rows = db.cleanup(options).await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.type_key == entry.type_key)
+                .unwrap();
+            assert!(
+                row.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("trace did not finish")),
+                "{row:?}"
+            );
+            assert_eq!(row.bytes_removed, 0);
+            assert_eq!(row.old_versions_removed, 0);
+            assert_eq!(row.manifests_removed, 0);
+            assert!(expected.missing_paths().await.unwrap().is_empty());
+            return;
+        }
         assert!(plan.errors.is_empty(), "{:?}", plan.errors);
         assert!(if foreign {
             plan.foreign_versions.contains(&version)
