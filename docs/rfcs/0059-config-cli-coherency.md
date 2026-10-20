@@ -616,8 +616,12 @@ immutable input only observes the original invocation; changed input refuses.
 Neither deliberate resubmission nor receipt eviction permits that ID to execute
 again. Source mode may capture files to verify equality; recovery mode never does.
 Caller preallocation remains supported; computing an ID does not reserve its
-sequence. Do not replace these existing rules with arbitrary idempotency strings
-or require that the server previously issued the ID.
+sequence. For a direct root, `cluster status --target ROOT --json` exposes
+`ledger_id` and `next_sequence`; a caller can form
+`<ledger_id>:<next_sequence>:<fresh ULID>` and submit it with explicit `--config`.
+A concurrent submission can make that sequence stale, which refuses.
+Do not replace these existing rules with arbitrary idempotency strings or require
+that the server previously issued the ID.
 
 Managed apply rejects `--deployment-id` and `--writers-stopped`; server apply
 rejects the writer attestation; direct recovery rejects managed `--plan` and run
