@@ -34,6 +34,7 @@ use crate::blob_cli::{
     remote_blob_error, whole_external_uri,
 };
 use crate::cli::CliLoadMode;
+use crate::command_outcome::{EngineWrite as _, EngineWriteError};
 #[cfg(test)]
 use crate::graph_http::ApiContractError;
 use crate::graph_http::GraphHttpClient;
@@ -1166,8 +1167,11 @@ impl GraphClient {
                 actor,
                 binding,
             } => {
-                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                refuse_noncanonical_branches([Some(branch), from])?;
                 let data = std::fs::read_to_string(data)?;
+                let session = Self::open_write_session(uri, binding, settings, stderr).await?;
+                // A missing branch is forked first, which publishes on its
+                // own; the engine marks a later refusal as following it.
                 let receipt = session
                     .load_graph_batch_as_with_receipt(
                         branch,
@@ -1176,7 +1180,8 @@ impl GraphClient {
                         mode.into(),
                         actor.as_deref(),
                     )
-                    .await?;
+                    .await
+                    .engine_write()?;
                 Ok(load_output_from_receipt(
                     uri,
                     branch,
@@ -1249,6 +1254,7 @@ impl GraphClient {
                 let (selected_name, query_params) =
                     select_named_query(parse_query(query_source)?, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
+                refuse_noncanonical_branches([branch])?;
                 let session = Self::open_write_session(uri, binding, settings, stderr).await?;
                 let actor = actor.as_deref();
                 let receipt = session
@@ -1269,7 +1275,7 @@ impl GraphClient {
                                 expected,
                                 actual,
                             } => precondition_failed_cli(message, expected, actual).into(),
-                            other => color_eyre::eyre::Report::from(other),
+                            other => color_eyre::eyre::Report::from(EngineWriteError(other)),
                         }
                     })?;
                 Ok(ChangeOutput {
@@ -1408,7 +1414,8 @@ impl GraphClient {
                                 actor.as_deref(),
                                 as_commit,
                             )
-                            .await?;
+                            .await
+                            .engine_write()?;
                         let commit = result.commit.as_ref().map(commit_output);
                         (
                             target.clone(),
@@ -1500,14 +1507,16 @@ impl GraphClient {
                 Self::apply_prefix(&mut session, query_source)?;
                 let target = session
                     .get_commit(write.graph_commit_id())
-                    .await?
+                    .await
+                    .engine_write()?
                     .graph_branch
                     .unwrap_or_else(|| "main".to_string());
                 let (commit, outcome) = match write {
                     CommitWrite::Publish { graph_commit_id } => {
                         let published = session
                             .publish_commit_as(&graph_commit_id, actor.as_deref())
-                            .await?;
+                            .await
+                            .engine_write()?;
                         (
                             Some(commit_output(&published)),
                             BranchOutcomeOutput::Published,
@@ -1516,7 +1525,8 @@ impl GraphClient {
                     CommitWrite::Drop { graph_commit_id } => {
                         session
                             .drop_commit_as(&graph_commit_id, actor.as_deref())
-                            .await?;
+                            .await
+                            .engine_write()?;
                         (None, BranchOutcomeOutput::Dropped { graph_commit_id })
                     }
                 };
@@ -1589,7 +1599,8 @@ impl GraphClient {
                 Self::apply_prefix(&mut session, query_source)?;
                 let receipt = session
                     .load_csv_as_with_receipt(branch.unwrap_or("main"), &request, actor.as_deref())
-                    .await?;
+                    .await
+                    .engine_write()?;
                 let executed = receipt.executed_plan().map(load_executed_output);
                 Ok(ChangeOutput {
                     branch: receipt.result.branch,
@@ -1638,7 +1649,8 @@ impl GraphClient {
                 commit_output(
                     &session
                         .publish_commit_as(commit_id, actor.as_deref())
-                        .await?,
+                        .await
+                        .engine_write()?,
                 )
             }
             GraphClient::Catalogue => return Err(catalogue_scope_refusal("commit publish")),
@@ -1677,7 +1689,7 @@ impl GraphClient {
                 session
                     .drop_commit_as(commit_id, actor.as_deref())
                     .await
-                    .map_err(Into::into)
+                    .engine_write()
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("commit drop")),
         }
@@ -2016,7 +2028,10 @@ impl GraphClient {
             } => {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let actor = actor.as_deref();
-                let created = db.branch_create_from_as(start, name, actor).await?;
+                let created = db
+                    .branch_create_from_as(start, name, actor)
+                    .await
+                    .engine_write()?;
                 Ok(BranchCreateOutput {
                     uri: uri.clone(),
                     from: created.from,
@@ -2057,7 +2072,7 @@ impl GraphClient {
             } => {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let actor = actor.as_deref();
-                db.branch_delete_as(name, actor).await?;
+                db.branch_delete_as(name, actor).await.engine_write()?;
                 Ok(BranchDeleteOutput {
                     uri: uri.clone(),
                     name: name.to_string(),
@@ -2082,9 +2097,7 @@ impl GraphClient {
         // Dispatch, receipt validation and optional deletion all use the names
         // as given, so refuse one the engine and the server would refuse before
         // any storage or HTTP work: none can then fail after publication.
-        for name in [source, into] {
-            omnigraph_policy::ensure_canonical_branch_name(name)?;
-        }
+        refuse_noncanonical_branches([Some(source), Some(into)])?;
         let output = match self {
             GraphClient::Remote {
                 http,
@@ -2136,7 +2149,8 @@ impl GraphClient {
                 let actor = actor.as_deref();
                 let result = session
                     .branch_merge_as_with_options(source, into, actor, as_commit)
-                    .await?;
+                    .await
+                    .engine_write()?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
@@ -2302,7 +2316,8 @@ impl GraphClient {
                 let db = Self::open_write(uri, binding, stderr).await?;
                 let result = db
                     .apply_schema_as_with_catalog_check(schema_source, actor.as_deref(), validate)
-                    .await?;
+                    .await
+                    .engine_write()?;
                 Ok(schema_apply_output(uri, result))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("apply schema")),
@@ -2569,7 +2584,7 @@ impl GraphClient {
                         }
                         .into()
                     }
-                    other => color_eyre::eyre::Report::from(other),
+                    other => color_eyre::eyre::Report::from(EngineWriteError(other)),
                 })?;
                 Ok(omnigraph_api_types::blob_write_output(
                     query.into(),
@@ -2783,6 +2798,19 @@ fn parse_change_feed_start(start: &str) -> Result<omnigraph::changes::ChangeFeed
             })
             .ok_or_else(|| eyre!("start must be now | beginning | after:<commit_id>")),
     }
+}
+
+/// Refuse a branch name the engine refuses, with the engine's own error,
+/// before any storage open or request: the refusal then proves that nothing
+/// ran.
+fn refuse_noncanonical_branches<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<()> {
+    for name in names.into_iter().flatten() {
+        omnigraph_policy::ensure_canonical_branch_name(name)
+            .map_err(|error| omnigraph::error::OmniError::manifest(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3234,33 +3262,36 @@ mod tests {
             };
             let server = IntentApiFixture::graph(replies);
             let http = GraphHttpClient::new(&server.origin).unwrap();
-            let (error, evidence) = crate::command_outcome::observe(async {
-                if earlier_request {
-                    remote_json::<Value>(
+            let (error, evidence) = crate::command_outcome::observe(
+                crate::command_outcome::CommandKind::Write,
+                async {
+                    if earlier_request {
+                        remote_json::<Value>(
+                            &http,
+                            Method::POST,
+                            format!("{}/graphs/knowledge/branches", server.origin),
+                            Some(json!({"name":"review"})),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    remote_json_with_graph_commit_precondition::<Value>(
                         &http,
-                        Method::POST,
-                        format!("{}/graphs/knowledge/branches", server.origin),
-                        Some(json!({"name":"review"})),
+                        if read_refusal {
+                            Method::GET
+                        } else {
+                            Method::POST
+                        },
+                        format!("{}/graphs/knowledge/mutate", server.origin),
+                        Some(json!({"query":"mutation m() {}"})),
                         None,
+                        conditional.then_some("head-a"),
                     )
                     .await
-                    .unwrap();
-                }
-                remote_json_with_graph_commit_precondition::<Value>(
-                    &http,
-                    if read_refusal {
-                        Method::GET
-                    } else {
-                        Method::POST
-                    },
-                    format!("{}/graphs/knowledge/mutate", server.origin),
-                    Some(json!({"query":"mutation m() {}"})),
-                    None,
-                    conditional.then_some("head-a"),
-                )
-                .await
-                .unwrap_err()
-            })
+                    .unwrap_err()
+                },
+            )
             .await;
             assert_eq!(
                 server.workflow_requests().len(),
@@ -3274,7 +3305,7 @@ mod tests {
             attempt(true, false, Refusal::Busy),
             attempt(false, false, Refusal::Busy)
         );
-        assert_eq!(compound.exit, 1);
+        assert_eq!(compound.exit, 2);
         assert_eq!(single.exit, 75);
         assert_eq!(
             serde_json::to_value(compound).unwrap()["disposition"],
@@ -3300,7 +3331,7 @@ mod tests {
             (false, Refusal::Denied),
         ] {
             let compound = attempt(true, read_refusal, kind).await;
-            assert_eq!(compound.exit, 1);
+            assert_eq!(compound.exit, 2);
             assert_eq!(
                 serde_json::to_value(compound).unwrap()["disposition"]["effects"],
                 "unknown"
