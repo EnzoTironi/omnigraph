@@ -415,6 +415,14 @@ for another server increment nor permission to replay a write. No old-client
 fallback or negotiation framework is supported. New wire changes update shared
 DTOs, the contract decision, OpenAPI and transport qualification together.
 
+The finalized unreleased 0.14 contract uses `actor_id`, the commit-list
+`listing` selector and standardized generated SDK names. Refresh prerelease
+CLI, server and integrations together and regenerate SDKs: older prerelease
+builds also use 0.14, so the header does not detect their different shapes.
+The CLI access-report protocol is 2. MCP keeps its protocol negotiation and
+requires refreshed tool schemas; its endpoint does not use the HTTP header.
+The [migration note](../../changelog.d/http-contract-014.breaking.md) owns the steps.
+
 Server URLs identify the service root, preserving any proxy prefix. Migrate
 graph-qualified URLs to that root plus `--graph`, `default_graph` or alias `graph`;
 the CLI does not infer a root by stripping path segments.
