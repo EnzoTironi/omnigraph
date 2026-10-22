@@ -28,7 +28,8 @@ directly. With OIDC, the resource identifier in the trust file is the URL users
 enter in their MCP client, for example `https://graphs.example.com/mcp`, and the
 client signs in through OAuth. With an identifier naming the service root,
 clients that accept a path prefix can also sign in from other routes; see
-[Sign-in and discovery](#sign-in-and-discovery).
+[Sign-in and discovery](#sign-in-and-discovery). A client that can only start a
+command uses [`omnigraph mcp`](#connect-a-stdio-agent).
 
 The endpoint is stateless Streamable HTTP built on the official Rust MCP SDK:
 each request is a `POST` that carries its own bearer credential and gets a JSON
@@ -75,6 +76,60 @@ behind a load balancer without OIDC, needs that name listed.
 With OIDC, a browser `Origin` must be the resource identifier's origin. Without
 OIDC there is no origin to allow, so a request carrying any `Origin` is refused
 with 403. Native clients send no `Origin`.
+
+## Connect a stdio agent
+
+An agent that starts its MCP servers as child processes, such as Claude Code or
+Codex in a terminal, connects to an existing server through the CLI:
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "staging"]}
+```
+
+`omnigraph mcp --target NAME [--graph G] [--write]` relays each JSON-RPC message
+on stdin to the server target's `/mcp`, one `POST` each, and writes each answer
+as one line on stdout; diagnostics go to stderr. Tools, their logic and their
+refusals stay the server's.
+
+- **Credential.** Requests carry the token of the target's `auth`, acquired as
+  every served command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
+  it never appears in the agent's configuration or output. A target whose
+  `auth` is `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
+  every request, so another actor's token is refused with `412 actor_mismatch`.
+- **One graph.** `--graph`, else the target's `default_graph`; without either the
+  command refuses before any request. A tool call that omits `graph` gets it, a
+  call or resource URI naming another graph is refused with a JSON-RPC error, and
+  `graphs` and `omnigraph://graphs` list only this graph. Run one bridge per
+  graph.
+- **Two consents for writes.** The server lists write tools only with
+  `--mcp-allow-writes`. Without `--write`, the bridge lists and admits only the
+  tools the server annotates `readOnlyHint: true`, and refuses a call to any
+  other before sending it. The applied policy still decides every call.
+- **Existing servers only.** A direct graph, root or catalogue target, and a
+  managed target, refuse with `target_kind_unsupported` before any I/O. The
+  bridge opens no storage and never starts or discovers a server.
+
+The bridge relays up to 16 requests at once, the server's own limit, and
+answers them as they complete. It applies `notifications/cancelled` itself: the
+cancelled request's exchange is dropped and it gets no answer, unless its answer
+was already written. A cancelled write may still have landed: read the target
+before running it again. It never sends a request again:
+
+| Failure | JSON-RPC error `data` |
+|---|---|
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
+| Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
+| The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
+
+These errors carry code `-32000`; refusals by the graph binding or write consent
+carry `-32602`, with a `bad_request` body. After a 401 the bridge reads the
+credential from its source again once, for later requests: a token rewritten
+in a `file` source, or returned anew by an `exec` helper, reaches them without
+a restart. An `env` source is fixed when the bridge starts, and a token
+replaced with `omnigraph credentials set` belongs to a new credential
+generation, so both take a restart; the error says how to replace the token. A
+server that stays unreachable fails each request; the bridge keeps running
+until stdin closes.
 
 ## Settings
 

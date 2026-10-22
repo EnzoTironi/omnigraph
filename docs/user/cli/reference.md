@@ -25,8 +25,7 @@ server requires `--graph` or its own `default_graph` for graph operations. No
 request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
 endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience; it cannot
-be combined with `--target`.
+`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
 `--as ACTOR` attributes supported direct operations. A served target derives its
 actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
@@ -74,6 +73,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
 | `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct or served |
+| `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its target's token, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization members/invitations` | Administer organization membership and invitations | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |

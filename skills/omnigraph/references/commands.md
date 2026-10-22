@@ -12,6 +12,7 @@
 - Maintenance (optimize, full-text rebuild, cleanup)
 - Stored queries
 - Operator config & credentials
+- MCP for agents (mcp)
 - Addressing a graph
 - Output formats and positions · health check
 - Organization administration (members and invitations)
@@ -58,6 +59,7 @@ prints the exact flags of the installed binary.
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
+| `mcp` | — | Relay an agent's stdio MCP to an existing server target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -407,6 +409,23 @@ same operator file; a conflicting later edit refuses. Principal replacement
 requires an existing profile or managed target, verifies the
 **new** principal ID, and invalidates derived credentials. It conflicts with
 onboarding `--create-profile`, `--api` and `--organization`.
+
+## MCP for Agents
+
+```json
+{"command": "omnigraph", "args": ["mcp", "--target", "staging", "--graph", "knowledge"]}
+```
+
+`omnigraph mcp` speaks MCP on stdio for an agent that starts its tools as a
+child process, relaying every message to an existing server target's `/mcp`
+with the token of the target's `auth`, which the agent never sees. It is bound to one
+graph (`--graph` or `default_graph`): calls that omit `graph` get it, and calls
+or resource URIs naming another graph are refused. Without `--write` only tools
+the server annotates read-only are listed and admitted; the server lists write
+tools only with `--mcp-allow-writes`. `--as` asserts the actor on every
+request. Direct and managed targets refuse with `target_kind_unsupported`; the
+bridge never starts a server. A lost answer is never resent: an
+`outcome_unknown` error means read the target and reconcile before replaying.
 
 ## Addressing a Graph
 
