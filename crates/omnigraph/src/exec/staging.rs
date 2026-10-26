@@ -498,6 +498,15 @@ impl MutationStaging {
             overwrite_writers,
         } = self;
 
+        if pending
+            .keys()
+            .any(|key| delete_predicates.contains_key(key))
+        {
+            return Err(OmniError::manifest_internal(
+                "a table cannot carry both pending rows and deletes",
+            ));
+        }
+
         let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
         let mut __dst_pt: Vec<_> = pending.into_iter().collect();

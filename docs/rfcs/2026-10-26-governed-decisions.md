@@ -12,7 +12,7 @@ discussion: https://github.com/EnzoTironi/omnigraph/issues/1
 supersedes: []
 superseded_by: []
 blocked_on:
-  - Trusted server integration and destructive-action atomic audit
+  - Trusted server integration and refusal archive
   - Actor-view integration covering every observation and mutation surface
   - Time-sensitive pre-effect validation and crash qualification
 ---
@@ -24,7 +24,7 @@ blocked_on:
 Extend OmniGraph with explicit action, evidence, decision and external-commitment
 contracts. Preserve the accepted schema and manifest as the only graph authority.
 The experimental `omnigraph-ontology` crate implements deterministic contract
-evaluators and an optional embedded host that publishes constructive effects
+evaluators and an optional embedded host that publishes constructive or destructive effects
 with their dossier and consumes proposals using native uniqueness. It does not
 install a new server, CLI or MCP authorization boundary.
 
@@ -91,9 +91,41 @@ Clock conditions require their own publication contract. An unchanged graph head
 does not imply that evidence remains fresh. Waiting for a write gate must not
 extend an expired approval. A client timeout is not a publication deadline.
 
-The constructive/destructive mutation split stays intact. An implementation of
-delete plus dossier publication needs an explicit typed engine changeset design;
-it cannot concatenate queries or acknowledge two independent commits as atomic.
+#### Native admission contract
+
+The native mutation protocol accepts one trusted, bounded synchronous
+`MutationAdmission` instance with an explicit expected head. The same instance
+checks validity before staging, under the schema/branch/table gates after their
+wait and authority revalidation, and immediately before submitting the publisher.
+It performs no I/O, acquires no engine lock and cannot widen native permissions.
+The embedded action host reuses its readiness and approval-lifetime evaluator at
+those boundaries. A clock moving backwards is a refusal, not extra validity.
+
+The boundary is admission to effects/publication, not the time a remote object
+store durably finishes an already-submitted request. Crossing expiry while that
+request is in flight cannot retroactively cancel a successful CAS. An uncertain
+storage completion remains uncertain and resolves through the durable request id.
+No timeout or expiry is reported as proof of rollback. Refusal after staging or
+detached commits leaves unreachable garbage, never visible partial business state.
+
+#### Typed append envelope
+
+The business query remains constructive or destructive under the existing D2
+compiler check. A `MutationEnvelope` may attach a separately compiled
+`MutationAppend` containing 1..256 strict inserts into unkeyed node tables.
+The append is not another publication. Both sets execute over the same captured
+transaction, enter one combined changeset/integrity check and share the existing
+stage/commit/publish tail. Every append table must be disjoint from the complete
+business effect set, including cascade effects, before append execution. Staging
+also refuses overlapping pending-write and delete tables before durable I/O.
+There is no in-query delete view, same-table write/delete ordering or second
+commit. Keyed upserts, updates, deletes and edge inserts are refused in the tail.
+
+The embedded host uses this envelope to append its exact dossier for delete-only
+actions; existing constructive bindings keep their explicit host-bound append.
+Audit uniqueness/integrity failure prevents both the deletion and dossier from
+becoming visible. The root-shared gates and exact publisher remain the only
+native publication mechanism.
 
 ### Coverage matrix
 
@@ -108,14 +140,14 @@ it cannot concatenate queries or acknowledge two independent commits as atomic.
 | 5: links | Typed directed relations, cardinality, provenance | Existing edges/constraints | Governed entity resolution and source authority |
 | 6: interfaces | Reusable declarations and stable identity | Existing property reuse | Runtime polymorphism per upstream #884 |
 | 7: business time | Separate valid time, recorded time and retention | Evaluator business interval and evidence timestamps | Temporal queries and corrections over retained state |
-| 7: evidence readiness | Required, current, missing, unknown and N/A remain distinct | Evaluator readiness checks | Trusted capture and pre-effect clock enforcement |
+| 7: evidence readiness | Required, current, missing, unknown and N/A remain distinct | Evaluator readiness checks | Native admission revalidation; source qualification and remote in-flight timing remain explicit |
 | 7: provenance | Every consumed fact names its source and producer version | Evaluator records and explicit embedded read-column bindings | General automatic capture and evidence retention |
 | 8: functions/models | Pin logic/model versions and applicability | Evaluator version and prediction records | Governed deployment, invocation and numerical model adapters |
 | 9: action contract | Typed inputs, guards, modes and explicit outcomes | Evaluators and embedded registered read/effect bindings | Trusted server registry and parameter codegen |
-| 9: approval | Separate proposer/confirmer and single consumption | Embedded graph-backed proposals, native uniqueness, service write gate | Shared authenticated transport boundary, escalation and clock gates |
+| 9: approval | Separate proposer/confirmer and single consumption | Embedded graph-backed proposals, native uniqueness, service write gate | Shared authenticated transport boundary and escalation |
 | 9: external effects | Stable identity, bounded attempts and ambiguity | Evaluator delivery transitions | Durable CAS, receiver adapter, reconciliation and compensation |
 | 10: access | Type/entity/property restrictions and non-interference | Application ACL evaluator only | Native actor views across every access path |
-| 10: audit | Dossier includes evidence, versions, checks and actors | Embedded constructive effects/audit and business refusal audit | Destructive effects, authorization-refusal archive and integrity controls |
+| 10: audit | Dossier includes evidence, versions, checks and actors | Embedded constructive/destructive effects/audit and business refusal audit | Authorization-refusal archive and integrity/retention controls |
 | 10: rule lifecycle | Propose, review, release and shadow differences | Existing content branches/diffs | Governed rule registry and shadow comparison workflow |
 | 10: override | Structured disagreement with accountable disposition | Pending | Override actions, routing and linked alternatives |
 | 11: agents | Authenticated principal, client and bounded capabilities | Existing MCP and coarse policy | Delegation, client attribution and action-only capabilities |
@@ -173,7 +205,7 @@ still requires its own reproduction at the owning test boundary.
 
 ## Compatibility and reversibility
 
-The crate is non-publishable and adds no engine field, protocol route,
+The crate is non-publishable and adds no persisted engine field, protocol route,
 storage stamp, raw writer or native policy vocabulary. `query_observed` adds an
 embedded read result containing the accepted SchemaIR hash. Existing read calls
 keep their storage path and do not compute that extra digest. The host uses
@@ -203,14 +235,14 @@ reopen/replay, invalid effects, registered append validation, exact read observa
 and the native coarse service-write gate. The service identity is trusted; this
 does not qualify server-side authentication or native actor views.
 
-The existing DST cost owner adds `OntologyPropose`, `OntologyConfirm` and
-`OntologyReplay`, each over a reopened handle. Setup/verification use underscore
+The existing DST cost owner covers `OntologyPropose`, `OntologyConfirm`,
+`OntologyReplay`, `OntologyDelete` and `OntologyDeleteReplay`, each over a reopened handle. Setup/verification use underscore
 labels and the existing golden's two deterministic passes must agree. Propose
 measures request lookup, evidence capture and dossier append; confirm adds the
 stored-proposal read and the atomic effect; replay reads the existing dossier
 without publishing. Existing golden rows must remain unchanged.
 
-Native integration must extend existing owners: `policy_engine_chassis.rs`,
+Native integration extends existing owners: `policy_engine_chassis.rs`,
 `writes.rs`, `integration/point_in_time.rs`, `integration/merge_truth_table.rs`,
 `detached_commit_matrix.rs`, server `auth_policy`/`data_routes`/`mcp`, and GQT for
 rows/errors. Mechanism and concurrency assertions belong in Rust. Update the DST
@@ -238,8 +270,6 @@ have evidence. Open work is tracked in the
 
 ## Unresolved questions
 
-- Which typed changeset extension combines destructive actions and dossier append
-  without weakening the accepted D2 mutation split?
 - Which native authority records action releases, revocation and one-time approval
   consumption while preserving historical rule replay?
 - What bounded clock contract applies between pre-effect validation and durable

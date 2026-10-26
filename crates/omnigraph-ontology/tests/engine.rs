@@ -485,3 +485,144 @@ async fn changed_schema_refuses_registered_actions_before_any_effect() {
         session.schema_contract_digest().schema_ir_hash
     );
 }
+
+#[tokio::test]
+async fn freshness_is_rechecked_after_native_staging_and_before_publication() {
+    use std::sync::atomic::AtomicUsize;
+    struct ExpiringClock {
+        calls: AtomicUsize,
+        expire_on: usize,
+    }
+    impl Clock for ExpiringClock {
+        fn now_ms(&self) -> omnigraph_ontology::Result<i64> {
+            Ok(
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= self.expire_on {
+                    1401
+                } else {
+                    1000
+                },
+            )
+        }
+    }
+    // Capture and evaluation see fresh evidence; each later native boundary
+    // must reject once time advances, even though no graph head changes.
+    for expire_on in [2, 3, 4] {
+        let (_dir, session, _runtime, _clock) = setup().await;
+        let mut contract = action();
+        contract.mode = omnigraph_ontology::action::Mode::Automatic;
+        let runtime = EngineAction::new(
+            session.clone(),
+            contract,
+            binding(),
+            "main",
+            "service:ontology",
+            Arc::new(ExpiringClock {
+                calls: AtomicUsize::new(0),
+                expire_on,
+            }),
+        )
+        .unwrap();
+        let before = session.list_commits(None).await.unwrap().len();
+        assert!(
+            runtime
+                .submit("expired", actor("alice", "buyer"), params())
+                .await
+                .is_err(),
+            "native boundary {expire_on} allowed stale evidence"
+        );
+        assert_eq!(session.list_commits(None).await.unwrap().len(), before);
+        assert_eq!(
+            rows(
+                &session,
+                "query q() { match { $p: Purchase } return { $p.approved as approved } }"
+            )
+            .await,
+            json!([{"approved":false}])
+        );
+        assert_eq!(
+            rows(
+                &session,
+                "query q() { match { $d: OntologyDecision } return { $d.decision_id as id } }"
+            )
+            .await,
+            json!([])
+        );
+    }
+}
+
+#[tokio::test]
+async fn destructive_action_and_dossier_publish_once_and_replay_after_reopen() {
+    let (dir, session, _runtime, clock) = setup().await;
+    let mut destructive = binding();
+    destructive.effect = Query {
+        source: r#"query remove($amount: I64) { delete Purchase where id = "purchase:1" }"#.into(),
+        name: "remove".into(),
+    };
+    let runtime = EngineAction::new(
+        session.clone(),
+        action(),
+        destructive.clone(),
+        "main",
+        "service:ontology",
+        clock.clone(),
+    )
+    .unwrap();
+    runtime
+        .submit("remove-proposal", actor("alice", "buyer"), params())
+        .await
+        .unwrap();
+    let before = session.list_commits(None).await.unwrap().len();
+    let decision = runtime
+        .confirm(
+            "remove-decision",
+            "remove-proposal",
+            actor("bob", "manager"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(decision.decision.outcome, Outcome::Allowed);
+    assert_eq!(session.list_commits(None).await.unwrap().len(), before + 1);
+    assert_eq!(
+        rows(
+            &session,
+            "query q() { match { $p: Purchase } return { $p.id as id } }"
+        )
+        .await,
+        json!([])
+    );
+    assert_eq!(
+        rows(
+            &session,
+            "query q() { match { $d: OntologyDecision } return { $d.decision_id as id } }"
+        )
+        .await
+        .as_array()
+        .unwrap()
+        .len(),
+        2
+    );
+    let reopened = Session::from_defaults(
+        Arc::new(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap()),
+        Default::default(),
+    );
+    let runtime = EngineAction::new(
+        reopened.clone(),
+        action(),
+        destructive,
+        "main",
+        "service:ontology",
+        clock,
+    )
+    .unwrap();
+    let replay = runtime
+        .confirm(
+            "remove-decision",
+            "remove-proposal",
+            actor("bob", "manager"),
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.decision, decision.decision);
+    assert_eq!(reopened.list_commits(None).await.unwrap().len(), before + 1);
+}

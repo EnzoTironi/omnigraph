@@ -28,7 +28,7 @@ fn actor(id: &str, role: &str) -> Principal {
     }
 }
 
-fn runtime(session: Session) -> EngineAction {
+fn runtime(session: Session, destructive: bool) -> EngineAction {
     let action = Action {
         id: "approve_case".into(),
         versions: Versions {
@@ -56,7 +56,7 @@ fn runtime(session: Session) -> EngineAction {
         confirmer_roles: ["confirmer".into()].into(),
         proposal_ttl_ms: 1000,
     };
-    let binding = Binding {
+    let mut binding = Binding {
         evidence: Query {
             name: "evidence".into(),
             source: r#"
@@ -89,6 +89,12 @@ query approve($approved: Bool, $og_id: String, $og_record: String, $og_consumes:
             },
         )]),
     };
+    if destructive {
+        binding.effect = Query {
+            name: "remove".into(),
+            source: r#"query remove($approved: Bool) { delete Case where id = "one" }"#.into(),
+        };
+    }
     EngineAction::new(
         session,
         action,
@@ -134,7 +140,10 @@ node Case {{
             let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
                 .await
                 .unwrap();
-            let service = runtime(Session::from_defaults(Arc::new(db), Default::default()));
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                false,
+            );
             omnigraph_dst::cost::set_label("OntologyPropose");
             let proposal = service
                 .submit(
@@ -150,7 +159,10 @@ node Case {{
             let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
                 .await
                 .unwrap();
-            let service = runtime(Session::from_defaults(Arc::new(db), Default::default()));
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                false,
+            );
             omnigraph_dst::cost::set_label("OntologyConfirm");
             let confirmed = service
                 .confirm("d1", "p1", actor("bob", "confirmer"))
@@ -162,7 +174,10 @@ node Case {{
             let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
                 .await
                 .unwrap();
-            let service = runtime(Session::from_defaults(Arc::new(db), Default::default()));
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                false,
+            );
             omnigraph_dst::cost::set_label("OntologyReplay");
             let replayed = service
                 .confirm("d1", "p1", actor("bob", "confirmer"))
@@ -171,11 +186,72 @@ node Case {{
             omnigraph_dst::cost::set_label("_ontology_verify");
             assert!(replayed.replayed);
             assert_eq!(replayed.decision, confirmed.decision);
+            drop(service);
+            let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                .await
+                .unwrap();
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                true,
+            );
+            service
+                .submit(
+                    "remove-proposal",
+                    actor("alice", "proposer"),
+                    BTreeMap::from([("approved".into(), json!(true))]),
+                )
+                .await
+                .unwrap();
+            drop(service);
+            let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                .await
+                .unwrap();
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                true,
+            );
+            omnigraph_dst::cost::set_label("OntologyDelete");
+            let removed = service
+                .confirm(
+                    "remove-decision",
+                    "remove-proposal",
+                    actor("bob", "confirmer"),
+                )
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ontology_verify");
+            assert_eq!(removed.decision.outcome, Outcome::Allowed);
+            drop(service);
+            let db = Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                .await
+                .unwrap();
+            let service = runtime(
+                Session::from_defaults(Arc::new(db), Default::default()),
+                true,
+            );
+            omnigraph_dst::cost::set_label("OntologyDeleteReplay");
+            let replayed = service
+                .confirm(
+                    "remove-decision",
+                    "remove-proposal",
+                    actor("bob", "confirmer"),
+                )
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ontology_verify");
+            assert!(replayed.replayed);
+            assert_eq!(replayed.decision, removed.decision);
         }
     }
     super::labeled_cost_rows_of(
         format!("shared-memory://dst-ontology-cost-{replay}"),
         &OntologyCost,
-        &["OntologyPropose", "OntologyConfirm", "OntologyReplay"],
+        &[
+            "OntologyPropose",
+            "OntologyConfirm",
+            "OntologyReplay",
+            "OntologyDelete",
+            "OntologyDeleteReplay",
+        ],
     )
 }

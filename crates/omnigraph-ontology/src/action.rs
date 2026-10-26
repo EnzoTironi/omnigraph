@@ -289,6 +289,33 @@ impl Action {
         Ok(decision)
     }
 
+    /// Reuse the evaluator at native admission boundaries. This checks the
+    /// materialized evidence, not a fresh independently captured snapshot.
+    #[cfg(feature = "engine")]
+    pub(crate) fn revalidate_at(&self, decision: &Decision, now_ms: i64) -> Result<()> {
+        require(
+            now_ms >= decision.evaluated_at_ms,
+            "admission clock moved backwards",
+        )?;
+        require(
+            decision.action_digest == digest(self)?,
+            "action changed before admission",
+        )?;
+        decision.inputs.validate(now_ms)?;
+        require(
+            failed_checks(&self.evaluate(&decision.inputs, &decision.parameters, now_ms)).is_none(),
+            "evidence expired before admission",
+        )?;
+        if decision.previous.is_some() || decision.outcome == Outcome::Review {
+            let age = i128::from(now_ms) - i128::from(decision.proposed_at_ms);
+            require(
+                age >= 0 && age < i128::from(self.proposal_ttl_ms),
+                "proposal expired before admission",
+            )?;
+        }
+        Ok(())
+    }
+
     /// A confirmation produces a new record and re-evaluates current evidence.
     /// The host must load `proposal` from authoritative storage and atomically
     /// consume it with the decision and business effects. A client-supplied

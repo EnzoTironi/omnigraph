@@ -1,4 +1,4 @@
-//! Embedded reference host for constructive actions. This adapter has no HTTP
+//! Embedded reference host for governed actions. This adapter has no HTTP
 //! authentication boundary: its caller supplies a previously verified principal.
 
 use std::collections::BTreeMap;
@@ -106,6 +106,32 @@ pub struct EngineAction {
     writer: String,
     schema_hash: String,
     clock: Arc<dyn Clock>,
+    append_dossier: bool,
+}
+
+struct ActionAdmission {
+    action: Action,
+    decision: Decision,
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for ActionAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActionAdmission")
+    }
+}
+
+impl omnigraph::MutationAdmission for ActionAdmission {
+    fn validate(&self, _stage: omnigraph::MutationAdmissionStage) -> omnigraph::error::Result<()> {
+        self.clock
+            .now_ms()
+            .and_then(|now| self.action.revalidate_at(&self.decision, now))
+            .map_err(|_| {
+                omnigraph::error::OmniError::Policy(
+                    "action validity refused at native admission".into(),
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +178,7 @@ impl EngineAction {
                 name(value)?;
             }
         }
-        validate_effect(&binding.effect)?;
+        let append_dossier = validate_effect(&binding.effect)?;
         let catalog = session.catalog();
         validate_record_schema(&catalog)?;
         let accepted = catalog.bound_schema_ir().ok_or_else(|| {
@@ -187,6 +213,7 @@ impl EngineAction {
             writer: writer.into(),
             schema_hash,
             clock,
+            append_dossier,
         })
     }
 
@@ -449,17 +476,52 @@ impl EngineAction {
         } else {
             (RECORD_MUTATION, "ontology_record")
         };
-        let receipt = self
-            .session
-            .mutate_as_with_expected_head_receipt(
-                &self.branch,
-                source,
-                query,
-                &params,
-                Some(&self.writer),
-                Some(&decision.inputs.pin.commit),
-            )
-            .await?;
+        let receipt = if matches!(decision.outcome, Outcome::Allowed | Outcome::Review) {
+            let admission = Arc::new(ActionAdmission {
+                action: self.action.clone(),
+                decision: decision.clone(),
+                clock: self.clock.clone(),
+            });
+            self.session
+                .mutate_enveloped_as_with_receipt(
+                    &self.branch,
+                    source,
+                    query,
+                    &if decision.allows_effects() && self.append_dossier {
+                        literals(&decision.parameters)?
+                    } else {
+                        params.clone()
+                    },
+                    Some(&self.writer),
+                    &decision.inputs.pin.commit,
+                    &omnigraph::MutationEnvelope {
+                        admission: Some(admission),
+                        append: (decision.allows_effects() && self.append_dossier).then(|| {
+                            omnigraph::MutationAppend {
+                                source: RECORD_MUTATION.into(),
+                                query_name: "ontology_record".into(),
+                                params: params
+                                    .iter()
+                                    .filter(|(key, _)| key.starts_with("og_"))
+                                    .map(|(key, value)| (key.clone(), value.clone()))
+                                    .collect(),
+                            }
+                        }),
+                    },
+                )
+                .await?
+        } else {
+            self.session
+                .mutate_as_with_expected_head_receipt(
+                    &self.branch,
+                    source,
+                    query,
+                    &params,
+                    Some(&self.writer),
+                    Some(&decision.inputs.pin.commit),
+                )
+                .await?
+        };
         let commit = receipt
             .commit
             .ok_or_else(|| ContractError::Invalid("decision append produced no commit".into()))?;
@@ -528,7 +590,7 @@ fn validate_record_schema(catalog: &omnigraph_compiler::catalog::Catalog) -> cra
     Ok(())
 }
 
-fn validate_effect(query: &Query) -> crate::Result<()> {
+fn validate_effect(query: &Query) -> crate::Result<bool> {
     let decl = omnigraph_compiler::find_named_query(&query.source, &query.name)
         .map_err(|error| ContractError::Invalid(error.to_string()))?;
     require(
@@ -567,16 +629,21 @@ fn validate_effect(query: &Query) -> crate::Result<()> {
                 update.type_name != "OntologyDecision",
                 "an action cannot rewrite audit history",
             )?,
-            Mutation::Delete(_) => {
-                return Err(ContractError::Invalid(
-                    "destructive actions need an atomic changeset extension".into(),
-                ));
-            }
+            Mutation::Delete(delete) => require(
+                delete.type_name != "OntologyDecision",
+                "an action cannot delete audit history",
+            )?,
             _ => (),
         }
     }
+    let destructive = !decl.mutations.is_empty()
+        && decl
+            .mutations
+            .iter()
+            .all(|mutation| matches!(mutation, Mutation::Delete(_)));
     require(
-        record_count == 1,
-        "effect must append exactly one decision record",
-    )
+        record_count == 1 || destructive,
+        "effect must append exactly one decision record or be purely destructive",
+    )?;
+    Ok(destructive)
 }

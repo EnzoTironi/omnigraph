@@ -2,7 +2,7 @@
 
 The fork includes an experimental Rust library, `omnigraph-ontology`, for
 evaluating action contracts. With its `engine` feature, an application can store
-proposals, approve or refuse them, and publish constructive business changes with
+proposals, approve or refuse them, and publish business changes with
 their decision dossier in one graph commit.
 
 This library is not mounted in HTTP, CLI or MCP. It does not provide native
@@ -56,7 +56,7 @@ Add `engine::RECORD_SCHEMA` to the application's initial schema. It declares
 ordinary supported schema-deployment procedure.
 
 Register an `EngineAction` with a private `Session`, one evidence read query,
-one constructive effect query, the evidence column mapping, the target branch,
+one effect query, the evidence column mapping, the target branch,
 a service writer identity and a clock. The accepted schema and registered query
 sources are bound into the runtime's identity.
 
@@ -72,8 +72,11 @@ insert OntologyDecision {
 
 Declare those parameters as `String`, `String` and `String?` respectively. The
 host reserves every `og_` action parameter. Registration checks that the append
-uses exactly those fields and parameters, and refuses audit updates, destructive
-actions and unpublished effect modes. The native compiler still validates the
+uses exactly those fields and parameters, and refuses audit rewrites and
+unpublished effect modes. A delete-only effect query omits the append and its
+reserved parameters: the host adds the dossier through a separately compiled
+native append envelope in the same transaction. The engine refuses keyed or
+mutable append targets and any overlap with business effects. The native compiler still validates the
 complete query and assignments before execution.
 
 The evidence query returns at most one row. Each evidence binding names a value
@@ -109,8 +112,10 @@ storage holders subject to an unbypassable sandbox.
 
 ## Current operating boundaries
 
-- Freshness is evaluated at decision evaluation time. Time spent waiting for
-  native staging or publication is not covered by a commit-time clock fence.
+- Freshness and proposal expiry are rechecked before staging, after waiting
+  for native gates and immediately before publication submission. This is an
+  admission contract, not a guarantee that storage finishes an in-flight request
+  before wall-clock expiry; uncertain completion must be reconciled.
 - Authentication/role failures refuse before evidence capture. Validation,
   authorization and publication failures report an error without a separate
   denied-attempt dossier; only evaluated business refusals are appended.
@@ -120,7 +125,7 @@ storage holders subject to an unbypassable sandbox.
   target, not a portable graph identity; moving a graph requires new proposals.
 - Dossiers are ordinary graph data. This library adds no retention lock,
   cryptographic signature, immutable audit privilege or native row/column policy.
-- Destructive actions, verifier services, external delivery and compensation are
+- Verifier services, external delivery and compensation are
   not executed by the adapter. Delivery types describe bounded transitions only.
 - Existing graph concurrency, storage, admission and recovery restrictions remain
   in force. No distributed fencing or external exactly-once guarantee is added.

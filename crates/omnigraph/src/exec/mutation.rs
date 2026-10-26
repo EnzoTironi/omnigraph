@@ -946,11 +946,63 @@ impl Session {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
     ) -> Result<crate::MutationReceipt> {
+        self.mutate_with_envelope(
+            branch,
+            query_source,
+            query_name,
+            params,
+            actor_id,
+            expected_head,
+            None,
+        )
+        .await
+    }
+
+    /// Conditional mutation with trusted operation-local admission. An explicit
+    /// expected head is mandatory so guard evidence cannot silently rebase.
+    /// Policy and all ordinary mutation checks still apply.
+    pub async fn mutate_enveloped_as_with_receipt(
+        &self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: &str,
+        envelope: &crate::MutationEnvelope,
+    ) -> Result<crate::MutationReceipt> {
+        self.mutate_with_envelope(
+            Some(branch),
+            query_source,
+            query_name,
+            params,
+            actor_id,
+            Some(expected_head),
+            Some(envelope),
+        )
+        .await
+    }
+
+    async fn mutate_with_envelope(
+        &self,
+        branch: Option<&str>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: Option<&str>,
+        envelope: Option<&crate::MutationEnvelope>,
+    ) -> Result<crate::MutationReceipt> {
         let decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
         let (route, branch) = self
             .resolve_write_route(&decl.write_mode, branch, params, actor_id)
             .await?;
+        if envelope.is_some() && !matches!(route, WriteRoute::Publish) {
+            return Err(OmniError::manifest(
+                "mutation envelopes require direct publication",
+            ));
+        }
         let settings = self.effective(query_source)?;
         self.mutate_with_current_actor(
             &branch,
@@ -963,6 +1015,7 @@ impl Session {
             HistoryReleaseBytes(settings.history_release_bytes()),
             WriteBudget::from_settings(&settings),
             &route,
+            envelope,
         )
         .await
     }
@@ -1078,6 +1131,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        envelope: Option<&crate::MutationEnvelope>,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -1100,6 +1154,7 @@ impl Omnigraph {
                     &mut retryable,
                     write_budget,
                     route,
+                    envelope,
                 )
                 .await
             {
@@ -1136,6 +1191,7 @@ impl Omnigraph {
         retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        envelope: Option<&crate::MutationEnvelope>,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         let addressed = requested.as_deref().unwrap_or("main").to_string();
@@ -1175,6 +1231,7 @@ impl Omnigraph {
             }
             txn.caller_expected_graph_head = Some(expected.to_string());
         }
+        txn.admission = envelope.and_then(|value| value.admission.clone());
         let mut resolved_params = params.clone();
 
         // Per-query staging accumulator. Inserts and updates push batches into
@@ -1206,6 +1263,38 @@ impl Omnigraph {
             .iter()
             .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
+        let append = match envelope.and_then(|value| value.append.as_ref()) {
+            None => None,
+            Some(append) => {
+                let append_ir =
+                    self.lower_named_mutation(&txn.catalog, &append.source, &append.query_name)?;
+                if append_ir.write_mode
+                    != omnigraph_compiler::query::ast::MutationWriteMode::Publish
+                    || append_ir.ops.is_empty()
+                    || append_ir.ops.len() > 256
+                    || !append_ir.ops.iter().all(|op| match op {
+                        MutationOpIR::Insert {
+                            target: MutationTarget::Node { type_name },
+                            ..
+                        } => txn
+                            .catalog
+                            .node_types
+                            .get(type_name)
+                            .is_some_and(|node| node.key.is_none()),
+                        _ => false,
+                    })
+                {
+                    return Err(OmniError::manifest(
+                        "mutation append must contain 1..256 strict node inserts",
+                    ));
+                }
+                let mut append_params = enrich_mutation_params(&append.params)?;
+                fill_declared_params(&mut append_params, &append_ir.params)?;
+                validate_params(&append_params, &append_ir.params)?;
+                Some((append_ir, append_params))
+            }
+        };
+
         let exec_result = self
             .execute_named_mutation(
                 &ir,
@@ -1215,6 +1304,37 @@ impl Omnigraph {
                 &txn,
             )
             .await;
+
+        let exec_result = match (exec_result, append) {
+            (Ok(mut total), Some((append_ir, append_params))) => {
+                // Complete business effects, including cascades, are known now.
+                // Check every tail target before executing any of the inserts.
+                for op in &append_ir.ops {
+                    let MutationOpIR::Insert { target, .. } = op else {
+                        unreachable!()
+                    };
+                    let table_key = format!("node:{}", target.type_name());
+                    if staging.expected_versions.contains_key(&table_key) {
+                        return Err(OmniError::manifest(
+                            "mutation append overlaps business effects",
+                        ));
+                    }
+                }
+                let appended = self
+                    .execute_named_mutation(
+                        &append_ir,
+                        &append_params,
+                        requested.as_deref(),
+                        &mut staging,
+                        &txn,
+                    )
+                    .await?;
+                total.affected_nodes += appended.affected_nodes;
+                total.affected_edges += appended.affected_edges;
+                Ok(total)
+            }
+            (result, _) => result,
+        };
 
         match exec_result {
             Err(e) => Err(e),
@@ -1278,6 +1398,9 @@ impl Omnigraph {
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         self.validate_staged_mutation(&staging, txn).await?;
+        if let Some(admission) = &txn.admission {
+            admission.validate(crate::MutationAdmissionStage::BeforeStaging)?;
+        }
         // From the first staged file to the publisher call, every durable
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
@@ -1332,6 +1455,11 @@ impl Omnigraph {
         // reclaimable garbage. See
         // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
         fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
+        if let Some(admission) = &txn.admission {
+            admission
+                .validate(crate::MutationAdmissionStage::BeforePublication)
+                .map_err(OmniError::unpublished)?;
+        }
         // RFC 0067: every effect is a detached commit of its pinned base, so a
         // publish failure leaves the graph unchanged; the error is returned as
         // is (a moved head is `ReadSetChanged`). The publisher alone decides

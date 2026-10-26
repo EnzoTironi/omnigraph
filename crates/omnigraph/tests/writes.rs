@@ -2587,7 +2587,8 @@ query set_content($c: Blob?) {
 #[tokio::test]
 async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let schema = format!("{TEST_SCHEMA}\nnode Audit {{ id: String @unique body: String }}\n");
+    let db = init_and_load_with_schema(&dir, &schema).await;
 
     // Capture pre-mutation state on touched tables to confirm no I/O.
     let persons_before = count_rows(&db, "node:Person").await;
@@ -2624,6 +2625,91 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         "D₂ rejection must fire before any write",
     );
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    // A native append envelope cannot be expressed by GQT. Extend this D2
+    // owner with its refusal surface: no keyed upserts, mutable tails, edge
+    // inserts or same-table delete/reinsert. A failed audit constraint must
+    // also leave the destructive business effect invisible.
+    db.load_jsonl(
+        r#"{"type":"Audit","data":{"id":"used","body":"before"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    for (business, business_name, business_params, append) in [
+        (
+            MUTATION_QUERIES,
+            "remove_person",
+            params(&[("$name", "Alice")]),
+            r#"query a() { update Audit set { body: "changed" } where id = "used" }"#,
+        ),
+        (
+            MUTATION_QUERIES,
+            "remove_person",
+            params(&[("$name", "Alice")]),
+            r#"query a() { delete Audit where id = "used" }"#,
+        ),
+        (
+            MUTATION_QUERIES,
+            "remove_person",
+            params(&[("$name", "Alice")]),
+            r#"query a() { insert Person { name: "Eve", age: 1 } }"#,
+        ),
+        (
+            MUTATION_QUERIES,
+            "remove_person",
+            params(&[("$name", "Alice")]),
+            r#"query a() { insert Knows { from: "Alice", to: "Bob" } }"#,
+        ),
+        (
+            r#"query remove() { delete Audit where id = "used" }"#,
+            "remove",
+            Default::default(),
+            r#"query a() { insert Audit { id: "new", body: "after" } }"#,
+        ),
+        (
+            MUTATION_QUERIES,
+            "remove_person",
+            params(&[("$name", "Alice")]),
+            r#"query a() { insert Audit { id: "used", body: "duplicate" } }"#,
+        ),
+    ] {
+        let before = db.list_commits(None).await.unwrap();
+        let observed = db
+            .query_observed(
+                "main",
+                "query q() { match { $p: Person } return { $p.name as name } }",
+                "q",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let envelope = omnigraph::MutationEnvelope {
+            append: Some(omnigraph::MutationAppend {
+                source: append.into(),
+                query_name: "a".into(),
+                params: Default::default(),
+            }),
+            admission: None,
+        };
+        assert!(
+            db.mutate_enveloped_as_with_receipt(
+                "main",
+                business,
+                business_name,
+                &business_params,
+                None,
+                observed.graph_commit_id.as_deref().unwrap(),
+                &envelope
+            )
+            .await
+            .is_err(),
+            "invalid tail published: {append}"
+        );
+        assert_eq!(db.list_commits(None).await.unwrap(), before);
+        assert_eq!(count_rows(&db, "node:Person").await, persons_before);
+        assert_eq!(count_rows(&db, "node:Audit").await, 1);
+    }
 }
 
 /// Overlapping delete predicates within one query must NOT double-count

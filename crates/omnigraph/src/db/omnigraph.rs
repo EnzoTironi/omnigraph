@@ -273,6 +273,8 @@ pub(crate) struct WriteTxn {
     /// the internal authority token, a mismatch is terminal (`PreconditionFailed`),
     /// judged against the revalidated authority under the pre-effect gates.
     pub(crate) caller_expected_graph_head: Option<String>,
+    /// Trusted operation-local admission; never persisted or reused by another attempt.
+    pub(crate) admission: Option<Arc<dyn crate::MutationAdmission>>,
     /// Catalog built from the exact accepted IR whose identity is recorded in
     /// `authority`. Mutation/load planning and validation must use this snapshot,
     /// never the handle-global catalog, which can lag a schema apply performed by
@@ -1594,6 +1596,7 @@ impl Omnigraph {
             authority: identity.write_authority(branch_identifier, graph_head),
             effective_graph_head,
             caller_expected_graph_head: None,
+            admission: None,
             catalog,
             manifest_probe,
             unattached_base: None,
@@ -1656,6 +1659,7 @@ impl Omnigraph {
             authority: identity.write_authority(branch_identifier, graph_head),
             effective_graph_head,
             caller_expected_graph_head: None,
+            admission: None,
             catalog,
             manifest_probe,
             unattached_base: Some(UnattachedTxnBase::of(base)),
@@ -1729,6 +1733,7 @@ impl Omnigraph {
                 authority: identity.write_authority(branch_identifier, graph_head),
                 effective_graph_head,
                 caller_expected_graph_head: None,
+                admission: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
                 unattached_base: None,
@@ -2156,6 +2161,9 @@ impl Omnigraph {
             self.revalidate_unattached_base(pinned).await?;
         }
         validate_bound_catalog_against_snapshot(&txn.catalog, &snapshot)?;
+        if let Some(admission) = &txn.admission {
+            admission.validate(crate::MutationAdmissionStage::BeforeDetachedCommit)?;
+        }
         Ok(snapshot)
     }
 

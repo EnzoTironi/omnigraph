@@ -3,7 +3,7 @@
 This experimental crate evaluates action contracts, evidence readiness,
 confirmation, application access rules, business versions, predictions, and
 external-delivery transitions. Its optional `engine` adapter publishes
-constructive effects with decision dossiers in real OmniGraph commits. It is
+constructive or destructive effects with decision dossiers in real OmniGraph commits. It is
 not installed in HTTP, CLI or MCP and does not enforce native actor views.
 
 Run its executable contract tests from the checkout:
