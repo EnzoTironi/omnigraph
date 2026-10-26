@@ -1,0 +1,27 @@
+[package]
+name = "omnigraph-ontology"
+version = "0.14.1"
+edition = "2024"
+publish = false
+description = "Experimental operational-ontology decision contracts for OmniGraph."
+license = "MIT"
+
+[features]
+default = []
+engine = ["dep:omnigraph", "dep:omnigraph-compiler", "dep:omnigraph-policy", "dep:tokio"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.14.1", optional = true }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1", optional = true }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.1", optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

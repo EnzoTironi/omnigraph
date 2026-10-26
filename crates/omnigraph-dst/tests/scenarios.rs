@@ -19,6 +19,9 @@
 
 use std::sync::Arc;
 
+#[path = "scenarios/ontology_cost.rs"]
+mod ontology_cost;
+
 use omnigraph_dst::fixtures::*;
 use omnigraph_dst::fixtures::{count_rows, dst_seeds, person_rows};
 use omnigraph_dst::harness::{Scenario, run_universe};
@@ -3339,6 +3342,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
+    table.push_str(&ontology_cost::rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3350,6 +3354,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
+    table2.push_str(&ontology_cost::rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

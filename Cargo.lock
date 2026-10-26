@@ -5751,6 +5751,7 @@ dependencies = [
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-ontology",
  "omnigraph-storage",
  "rand 0.9.4",
  "serde_json",
@@ -5890,6 +5891,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "omnigraph-ontology"
+version = "0.14.1"
+dependencies = [
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "omnigraph-policy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

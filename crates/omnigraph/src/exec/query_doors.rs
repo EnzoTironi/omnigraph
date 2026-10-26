@@ -67,8 +67,45 @@ impl Session {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
+        let observed = self
+            .query_observation(target, query_source, query_name, params, false)
+            .await?;
+        Ok((observed.result, observed.graph_commit_id))
+    }
+
+    /// Read rows, graph head, and accepted SchemaIR identity from one capture.
+    /// Historical data still uses the current accepted schema, so the schema
+    /// identity is deliberately independent of the historical commit id.
+    pub async fn query_observed(
+        &self,
+        target: impl Into<ReadTarget>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<crate::QueryObservation> {
+        self.query_observation(target, query_source, query_name, params, true)
+            .await
+    }
+
+    async fn query_observation(
+        &self,
+        target: impl Into<ReadTarget>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        include_schema: bool,
+    ) -> Result<crate::QueryObservation> {
         let settings = self.effective(query_source)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
+
+        let schema_ir_hash = if include_schema {
+            let accepted = catalog.bound_schema_ir().ok_or_else(|| {
+                OmniError::manifest("observed read requires an accepted schema identity")
+            })?;
+            omnigraph_compiler::schema_ir_hash(accepted)?
+        } else {
+            String::new()
+        };
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
         admit_wildcard_target(
@@ -80,7 +117,11 @@ impl Session {
             let rows =
                 engine::explain_rows(query, params, Some(&resolved.snapshot), &catalog, &settings)
                     .await?;
-            return Ok((rows, head));
+            return Ok(crate::QueryObservation {
+                result: rows,
+                graph_commit_id: head,
+                schema_ir_hash,
+            });
         }
         let result = self
             .execute_on_route(
@@ -92,7 +133,11 @@ impl Session {
                 &catalog,
             )
             .await?;
-        Ok((result, head))
+        Ok(crate::QueryObservation {
+            result,
+            graph_commit_id: head,
+            schema_ir_hash,
+        })
     }
 
     /// Run a named query against the graph at a historical snapshot version.

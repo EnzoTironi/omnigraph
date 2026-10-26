@@ -94,6 +94,7 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-storage` | Shared local/S3/Azure control-object access for cluster state, locks, immutable resources and legacy conversion evidence. |
 | Lance | Dataset files, transactions, versions, native refs, secondary indexes, compaction, and version cleanup. |
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |
+| `omnigraph-ontology` | Experimental deterministic decision contracts and an optional embedded engine adapter. It is not installed in the server, CLI or MCP; its service host and identity inputs remain trusted. |
 | `omnigraph-cluster` | Desired configuration, deployment ledger, plan/apply, exact recovery, and immutable serving snapshots. |
 | `omnigraph-api-types` | Shared HTTP contract identifiers, operation inventory and wire DTOs used by server and CLI. |
 | `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Client setup captures operator configuration for ordinary graph commands, aliases and served cluster commands; scope, endpoint, credential matching and direct-write actor selection use those captured values. Query and alias presentation uses the same captured configuration. |

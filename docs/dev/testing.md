@@ -34,6 +34,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-catalog` | In-source tests: `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
+| `omnigraph-ontology` | `tests/contracts.rs`: experimental contract evaluators; `tests/engine.rs` under `engine`: native atomic audit/effects, proposal consumption, reopen/replay, concurrency and the service write gate. CI's feature superset includes this adapter. No native actor-view claim. | `tests/support/` |
 | `omnigraph-cluster` | In-source lifecycle, deployment and admission tests; `tests/failpoints.rs`; `tests/identity_recovery.rs`; `tests/s3_cluster.rs` | Module-local fixtures |
 | `omnigraph-mcp` | In-source protocol, settings, catalog and bounded-result tests | Module-local fixtures |
 | `omnigraph-server` | `crates/omnigraph-server/tests/` | `tests/support/mod.rs` |

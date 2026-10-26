@@ -41,6 +41,24 @@ include the replacement schema-contract row in the same publication as their
 table references. A later `RecoveryRequired` outcome can identify a committed
 publication; it does not leave durable contract files to install.
 
+## Embedded mutation envelopes
+
+`Session::mutate_enveloped_as_with_receipt` retains the normal `change` policy
+check and requires an explicit expected graph head. Its optional trusted
+`MutationAdmission` checks before staging, after native gate acquisition and
+complete authority revalidation, and before publisher submission. The callback
+is synchronous, bounded, performs no I/O and must not re-enter the engine or its
+locks. A refusal after staging/detached commits leaves only unreachable garbage.
+These boundaries do not cancel an object-store request already in flight.
+
+An optional `MutationAppend` is compiled separately from the business query.
+The business query keeps D2; the append contains 1..256 strict unkeyed node
+inserts. Its tables must be disjoint from the complete business effects,
+including cascades. Both enter the same changeset validation and publication,
+so a delete can carry its dossier without same-table write/delete semantics or
+a second commit. The [governed-decisions RFC](../rfcs/2026-10-26-governed-decisions.md)
+records the authority and refusal contract.
+
 ## Captured authority
 
 A write attempt captures one immutable `WriteTxn` containing the accepted

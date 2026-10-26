@@ -58,6 +58,51 @@ pub use omnigraph_compiler::settings;
 pub use session::Session;
 pub use table_store::IndexCoverage;
 
+/// A separately compiled append-only node query for a mutation's dossier or
+/// durable external intents. Its tables must be unkeyed and disjoint from the
+/// business query's complete effect set, including cascades.
+#[derive(Debug, Clone)]
+pub struct MutationAppend {
+    pub source: String,
+    pub query_name: String,
+    pub params: omnigraph_compiler::ir::ParamMap,
+}
+
+/// Trusted embedded controls for one conditional graph mutation.
+#[derive(Debug, Clone, Default)]
+pub struct MutationEnvelope {
+    pub append: Option<MutationAppend>,
+    pub admission: Option<std::sync::Arc<dyn MutationAdmission>>,
+}
+
+/// Native admission boundaries for a trusted, bounded synchronous validator.
+/// These are checks before submitting effects, not a wall-clock guarantee about
+/// when an object store finishes a write already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationAdmissionStage {
+    BeforeStaging,
+    BeforeDetachedCommit,
+    BeforePublication,
+}
+
+/// Trusted embedded admission check. Implementations must be bounded, perform no
+/// I/O and never re-enter the engine or acquire its locks. They may only reject;
+/// they cannot bypass policy, schema, integrity or publication checks. The engine
+/// invokes the same instance after waiting for native gates and before publication.
+pub trait MutationAdmission: std::fmt::Debug + Send + Sync {
+    fn validate(&self, stage: MutationAdmissionStage) -> error::Result<()>;
+}
+
+/// Rows and semantic authority captured by the same accepted read view.
+/// The schema digest identifies the accepted SchemaIR, not schema source text
+/// or the graph's physical storage stamp.
+#[derive(Debug, Clone)]
+pub struct QueryObservation {
+    pub result: omnigraph_compiler::result::QueryResult,
+    pub graph_commit_id: Option<String>,
+    pub schema_ir_hash: String,
+}
+
 /// Result of one mutation together with the exact commit published by it.
 /// `commit` is absent when the mutation changed no entities and published nothing.
 #[derive(Debug, Clone)]

@@ -36,6 +36,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3"
+omnigraph-ontology = { path = "../omnigraph-ontology", version = "0.14.1", features = ["engine"] }
 # The cluster lock's lease protocol, simulated in `scenarios.rs`.
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.14.1", features = ["test-util"] }
 # The control-object adapter that protocol writes through.

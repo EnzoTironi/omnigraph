@@ -352,6 +352,19 @@ async fn mutate_as_denies_when_policy_rejects_actor() {
         )
         .await;
     assert_denied(result, "mutate_as");
+    assert_denied(
+        db.mutate_enveloped_as_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &params,
+            Some("act-denied"),
+            "head-is-not-disclosed-before-policy",
+            &omnigraph::MutationEnvelope::default(),
+        )
+        .await,
+        "mutate_enveloped_as_with_receipt",
+    );
 }
 
 #[tokio::test]
@@ -369,6 +382,26 @@ async fn mutate_as_allows_when_policy_permits_actor() {
     )
     .await
     .expect("act-allowed should be able to Change on main");
+    let observed = db
+        .query_observed(
+            "main",
+            "query q() { match { $p: Person } return { $p.name as name } }",
+            "q",
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    db.mutate_enveloped_as_with_receipt(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Envelope")], &[("$age", 23)]),
+        Some("act-allowed"),
+        observed.graph_commit_id.as_deref().unwrap(),
+        &omnigraph::MutationEnvelope::default(),
+    )
+    .await
+    .expect("enveloped writes preserve the same native Change gate");
 }
 
 /// A Blob put or clear enforces `change` on its branch for the supplied actor

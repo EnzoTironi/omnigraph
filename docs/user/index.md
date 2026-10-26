@@ -47,6 +47,7 @@ deployment.
 - [Deployment](deployment.md)
 - [Storage failures and restart](operations/storage-failures.md)
 - [Authorization and actors](operations/policy.md)
+- [Experimental embedded governed actions](operations/ontology.md)
 - [Maintenance](operations/maintenance.md)
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements
 - [Storage-format upgrades](operations/upgrade.md)
