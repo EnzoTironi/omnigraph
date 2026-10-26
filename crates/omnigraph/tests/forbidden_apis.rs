@@ -350,6 +350,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "list_unattached_commits"),
     ("exec/query_doors.rs", "query"),
     ("exec/query_doors.rs", "query_with_head"),
+    ("exec/query_doors.rs", "query_observed"),
     ("exec/query_doors.rs", "run_query_at"),
     ("exec/query_doors.rs", "explain_query"),
     ("exec/query_doors.rs", "explain_load"),

@@ -58,6 +58,16 @@ pub use omnigraph_compiler::settings;
 pub use session::Session;
 pub use table_store::IndexCoverage;
 
+/// Rows and semantic authority captured by the same accepted read view.
+/// The schema digest identifies the accepted SchemaIR, not schema source text
+/// or the graph's physical storage stamp.
+#[derive(Debug, Clone)]
+pub struct QueryObservation {
+    pub result: omnigraph_compiler::result::QueryResult,
+    pub graph_commit_id: Option<String>,
+    pub schema_ir_hash: String,
+}
+
 /// Result of one mutation together with the exact commit published by it.
 /// `commit` is absent when the mutation changed no entities and published nothing.
 #[derive(Debug, Clone)]

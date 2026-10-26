@@ -21,8 +21,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # The one failpoint feature list `lint` and `test` both compile.
-  FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+  # The one feature superset `lint` and `test` both compile, including the
+  # experimental ontology adapter's real-engine contract tests.
+  FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints,omnigraph-ontology/engine
 
 jobs:
   # One output per set of jobs: `run_full_ci` (engine input: every job),
@@ -779,7 +780,10 @@ jobs:
             system_remote::remote_ingest_reuses_existing_branch_and_merges_updates \
             system_remote::remote_policy_enforces_branch_first_cli_workflow \
             system_remote::graphs_list_against_multi_graph_server \
-            system_remote::mutate_if_commit_lost_cas_exits_4_issue_365
+            system_remote::mutate_if_commit_lost_cas_exits_4_issue_365 \
+            approve_and_audit_publish_together_and_replay_survives_reopen \
+            concurrent_confirmations_have_only_one_business_publication \
+            native_policy_denies_direct_business_writes_by_action_callers
           do
             owners+=(--passed "$test_name")
           done
