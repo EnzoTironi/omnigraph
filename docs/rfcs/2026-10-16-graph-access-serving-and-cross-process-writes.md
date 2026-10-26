@@ -497,9 +497,13 @@ owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
   Windows it opens the link only when the platform names a handler for the
-  scheme (`xdg-mime query default x-scheme-handler/omnigraph-studio`, or the
-  scheme's registry association), because `xdg-open`'s generic path hands an
-  unhandled scheme to a web browser. Without Studio or a handler it prints the
+  scheme. On Linux the CLI launches that handler itself: it finds the desktop
+  entry `xdg-mime query default x-scheme-handler/omnigraph-studio` names
+  under `$XDG_DATA_HOME` and `$XDG_DATA_DIRS`, and runs the entry's `Exec`,
+  without a shell, with the link in place of `%u`. It never runs `xdg-open`,
+  whose generic path, with no display set, skips the registered handler and
+  hands the link to a web browser. On Windows it requires the scheme's
+  registry association. Without Studio or a handler it prints the
   link and how to install Studio, and refuses (`studio_unavailable`), until
   [installing Studio](#installing-studio) ships. It never opens a browser.
 - With `--json` it prints
@@ -1582,6 +1586,7 @@ proposal.
   merge-base tool, and no `blob stat`", the exception "Blob payloads and
   export streams; `blob stat` is a tool", and the stored-mutation change "or
   declare the reason in the table".
+- 2026-10-22: The Linux opener launches the `Exec` of the desktop entry `xdg-mime` names instead of running `xdg-open`, which without a display hands the link to a browser.
 - 2026-10-25: A2 gains one exception. Until the managed control plane enables
   the resource profile and registers Studio, and Studio implements the client,
   Studio may reach a managed cluster that a person selects inside Studio with
